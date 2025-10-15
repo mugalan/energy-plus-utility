@@ -11,10 +11,6 @@ readme = "README.md"
 license = {text = "MIT"}
 authors = [{ name = "Mugalan", email = "mugalan@gmail.com" }]
 dependencies = [
-    "subprocess", 
-    "json", 
-    "pathlib", 
-    "os",
     "numpy>=1.24", 
     "pandas>=2.0", 
     "plotly>=5.0"
