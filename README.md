@@ -264,6 +264,107 @@ PRs welcome! Please:
 2. Add small, focused examples for new features.
 3. Use semantic commit messages (`feat:`, `fix:`, `chore:`).
 
+
+
+# 📁 SQL Explorer: inspect & extract from `eplusout.sql`
+
+This package includes a lightweight helper, `EPlusSqlExplorer`, to quickly **browse**, **search**, and **extract time-series** from EnergyPlus’s `eplusout.sql` without writing raw SQL. It has **no dependency on `pyenergyplus`**—it only needs a finished simulation and the SQLite file.
+
+> Location: `eplus/sql_explorer.py`
+> Import: `from eplus import EPlusSqlExplorer`
+
+## When to use it
+
+* You’ve run a sim (design-day or annual) and have `eplus_out/eplusout.sql`.
+* You want to discover what tables/columns exist and pull a series (e.g., `Electricity:Facility`) **even if you’re not sure where it lives** in the schema.
+
+## Quick start
+
+```python
+from eplus import EPlusSqlExplorer
+
+# Point to your generated SQL (adjust path if needed)
+xp = EPlusSqlExplorer("eplus_out/eplusout.sql")
+
+# 1) What tables are present?
+xp.list_tables()[:10]  # → [('EnvironmentPeriods', 3), ('ReportData', 120000), ... ]
+
+# 2) Peek a table
+xp.peek("ReportData", 5)
+
+# 3) Search for a label anywhere (variables/meters)
+hits = xp.search_value("Electricity:Facility")
+hits  # → {'ReportDataDictionary': [('Name', [rowid,...])], ...}
+
+# 4) Extract a time series (auto-joins Time, filters to weather runs, J→kWh)
+df = xp.auto_extract_series("Electricity:Facility", to_kwh=True)
+df.head()
+```
+
+### Save directly to CSV
+
+```python
+df = xp.auto_extract_series(
+    "Electricity:Facility",
+    to_kwh=True,
+    csv_out="facility_kWh.csv"   # writes a tidy CSV with timestamp + value
+)
+```
+
+## API overview
+
+```python
+xp = EPlusSqlExplorer(sql_path="eplus_out/eplusout.sql", verbose=False)
+
+xp.list_tables()               # -> [(table_name, row_count or None), ...]
+xp.table_schema("ReportData")  # -> PRAGMA table_info(...) rows
+xp.peek("ReportData", 10)      # -> pandas.DataFrame (first N rows)
+
+xp.search_value("Zone Air Temperature")
+# -> {table: [(column, [rowids...]), ...], ...}
+
+xp.auto_extract_series(
+    value="Electricity:Facility",
+    freq_whitelist=("TimeStep", "Hourly"),   # limit to common reporting freqs
+    include_design_days=False,               # exclude sizing periods by default
+    to_kwh=True,                             # convert Joules → kWh when applicable
+    csv_out=None                             # path to write CSV (optional)
+)
+# -> DataFrame with ['timestamp','value'] sorted by time
+```
+
+## Tips & notes
+
+* **Timestamps**: EnergyPlus reports hour as **end-of-interval** (1–24). The extractor shifts to **interval start** for plotting sanity.
+* **Frequencies**: If you get no rows, broaden `freq_whitelist` or set `freq_whitelist=()` and/or `include_design_days=True`.
+* **Not just meters**: Works for variables too (e.g., `"Zone Air Temperature"`); `to_kwh` only affects energy-like series.
+* **Paths**: If your outputs live elsewhere, pass that path: `EPlusSqlExplorer("/content/run/eplusout.sql")`.
+
+## Advanced examples
+
+**Extract a variable hourly, including design days**
+
+```python
+xp.auto_extract_series(
+    "Zone Air Temperature",
+    freq_whitelist=("Hourly",),
+    include_design_days=True,
+    to_kwh=False
+)
+```
+
+**Find where a custom label lives, then inspect its source table**
+
+```python
+hits = xp.search_value("ElectricityPurchased:Facility")
+hits.keys()            # candidate dictionary tables
+list(hits.items())[:1] # (table, [(column, [rowids...])])
+xp.peek("ReportDataDictionary", 5)
+```
+
+Add this section after your “Quick start (Colab)” in the README to give users a clear path from *run* → *inspect* → *export*.
+
+
 ---
 
 ## 📄 License
@@ -275,4 +376,3 @@ MIT © Mugalan. See `LICENSE`.
 ## ❤️ Acknowledgements
 
 Built on top of the excellent [EnergyPlus](https://energyplus.net/) simulation engine and its Python API (`pyenergyplus`).
-
