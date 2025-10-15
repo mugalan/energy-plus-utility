@@ -1,0 +1,30 @@
+[build-system]
+requires = ["hatchling>=1.24"]
+build-backend = "hatchling.build"
+
+[project]
+name = "one-client"
+version = "0.1.0"
+description = "EnergyPlus utilities with a Colab bootstrapper (silent)."
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "MIT" }
+authors = [{ name = "Mugalan", email = "mugalan@gmail.com" }]
+
+dependencies = [
+  "numpy>=1.24",
+  "pandas>=2.0",
+  "plotly>=5.0",
+]
+
+[project.urls]
+Homepage = "https://github.com/mugalan/energy-plus-utility"
+Issues   = "https://github.com/mugalan/energy-plus-utility/issues"
+
+# ← This exposes a CLI you can run after pip install.
+[project.scripts]
+one-client-prepare-colab = "eplus.colab_bootstrap:main"
+
+[tool.hatch.build]
+packages = ["eplus"]
+include  = ["README.md", "LICENSE"]
