@@ -1,7 +1,3 @@
-here’s a drop-in `README.md` you can use. it’s written for your repo name `energy-plus-utility`, exposes the silent Colab bootstrap, and documents the main `EPlusUtil` flows.
-
----
-
 # energy-plus-utility
 
 Utilities and helpers for running [EnergyPlus](https://energyplus.net/) from Python notebooks (Colab-friendly) via `pyenergyplus`.
