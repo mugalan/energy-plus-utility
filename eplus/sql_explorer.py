@@ -1,0 +1,272 @@
+from __future__ import annotations
+
+import os
+import sqlite3
+from typing import Dict, Iterable, List, Optional, Sequence, Tuple
+from collections import defaultdict
+
+import pandas as pd
+
+
+class EPlusSqlExplorer:
+    """
+    Small helper around EnergyPlus's eplusout.sql.
+
+    Example:
+        xp = EPlusSqlExplorer("eplus_out/eplusout.sql")
+        xp.list_tables()
+        xp.peek("ReportData", 5)
+        hits = xp.search_value("Electricity:Facility")
+        df = xp.auto_extract_series("Electricity:Facility", to_kwh=True)
+    """
+
+    def __init__(self, sql_path: str = os.path.join("eplus_out", "eplusout.sql"), *, verbose: bool = False):
+        self.sql_path = sql_path
+        self.verbose = bool(verbose)
+
+    # ---------- internals ----------
+    def _log(self, msg: str):
+        if self.verbose:
+            print(msg)
+
+    def _open_conn(self) -> sqlite3.Connection:
+        if not os.path.exists(self.sql_path):
+            raise FileNotFoundError(self.sql_path)
+        return sqlite3.connect(self.sql_path)
+
+    # ---------- quick views ----------
+    def list_tables(self) -> List[Tuple[str, Optional[int]]]:
+        """Return list of (table_name, row_count)."""
+        conn = self._open_conn()
+        try:
+            tables = [r[0] for r in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' ORDER BY name"
+            )]
+            out: List[Tuple[str, Optional[int]]] = []
+            for t in tables:
+                try:
+                    n = conn.execute(f"SELECT COUNT(*) FROM \"{t}\"").fetchone()[0]
+                except Exception:
+                    n = None
+                out.append((t, n))
+            return out
+        finally:
+            conn.close()
+
+    def table_schema(self, table: str) -> List[Tuple]:
+        """Return PRAGMA table_info for a table: (cid, name, type, notnull, dflt_value, pk)."""
+        conn = self._open_conn()
+        try:
+            return conn.execute(f"PRAGMA table_info(\"{table}\")").fetchall()
+        finally:
+            conn.close()
+
+    def peek(self, table: str, limit: int = 10) -> pd.DataFrame:
+        """Return first rows of a table as a DataFrame."""
+        conn = self._open_conn()
+        try:
+            return pd.read_sql_query(f'SELECT * FROM "{table}" LIMIT {int(limit)}', conn)
+        finally:
+            conn.close()
+
+    # ---------- helpers ----------
+    @staticmethod
+    def _find_text_columns(conn: sqlite3.Connection, table: str) -> List[str]:
+        cols = conn.execute(f"PRAGMA table_info(\"{table}\")").fetchall()
+        textish: List[str] = []
+        for (_cid, name, ctype, *_rest) in cols:
+            t = (ctype or "").upper()
+            if any(k in t for k in ("CHAR", "TEXT", "CLOB")) or t == "" or "NVARCHAR" in t:
+                textish.append(name)
+        return textish
+
+    @staticmethod
+    def _detect_minute_col(conn: sqlite3.Connection) -> str:
+        cols = {r[1] for r in conn.execute("PRAGMA table_info(Time)").fetchall()}
+        if "Minute" in cols: return "Minute"
+        if "Minutes" in cols: return "Minutes"
+        return "Minute"
+
+    # ---------- search ----------
+    def search_value(
+        self,
+        value: str,
+        *,
+        tables: Optional[Sequence[str]] = None,
+        limit_per_table: int = 5
+    ) -> Dict[str, List[Tuple[str, List[int]]]]:
+        """
+        Search a literal value across TEXT-like columns of all (or provided) tables.
+        Returns: {table: [(column, [rowids...]), ...], ...}
+        """
+        conn = self._open_conn()
+        try:
+            all_tables = list(tables) if tables else [
+                r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")
+            ]
+            hits: Dict[str, List[Tuple[str, List[int]]]] = defaultdict(list)
+            for t in all_tables:
+                text_cols = self._find_text_columns(conn, t)
+                for c in text_cols:
+                    q = f'SELECT rowid FROM "{t}" WHERE "{c}" = ? LIMIT ?'
+                    try:
+                        rows = conn.execute(q, (value, int(limit_per_table))).fetchall()
+                    except Exception:
+                        continue
+                    if rows:
+                        hits[t].append((c, [r[0] for r in rows]))
+            return hits
+        finally:
+            conn.close()
+
+    # ---------- series extraction ----------
+    def auto_extract_series(
+        self,
+        value: str = "Electricity:Facility",
+        *,
+        freq_whitelist: Sequence[str] = ("TimeStep", "Hourly"),
+        include_design_days: bool = False,
+        to_kwh: bool = True,
+        csv_out: Optional[str] = None
+    ) -> Optional[pd.DataFrame]:
+        """
+        Locate `value` (e.g., a meter/variable label) in the schema, find its paired data table,
+        join to Time (and EnvironmentPeriods), and return a tidy DataFrame ['timestamp','value'].
+
+        - Converts J→kWh if `to_kwh=True`.
+        - If `csv_out` is provided, writes a wide CSV with an auto-named column.
+        - Returns None if no rows found.
+        """
+        conn = self._open_conn()
+        try:
+            # 1) find candidate dictionary table/column
+            tables = [r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")]
+            hits = self.search_value(value, tables=tables, limit_per_table=1)
+            if not hits:
+                self._log(f"'{value}' not found in any text column.")
+                return None
+
+            dict_table = next(iter(hits.keys()))
+            dict_col   = hits[dict_table][0][0]
+
+            # dictionary index column
+            dict_info = conn.execute(f'PRAGMA table_info("{dict_table}")').fetchall()
+            idx_cols = [name for (_cid, name, _type, _nn, _df, _pk) in dict_info if name.endswith("Index")]
+            if not idx_cols:
+                idx_cols = [
+                    name for (_cid, name, ctype, _n, _d, pk) in dict_info
+                    if pk == 1 and "INT" in (ctype or "").upper()
+                ]
+            if not idx_cols:
+                raise RuntimeError(f"No index column found in {dict_table} (looking for '*Index').")
+            dict_idx_col = idx_cols[0]
+
+            # dictionary index value for this label (if possible)
+            try:
+                res = conn.execute(
+                    f'SELECT "{dict_idx_col}" FROM "{dict_table}" WHERE "{dict_col}" = ?',
+                    (value,)
+                ).fetchone()
+                dict_idx_val = res[0] if res else None
+            except Exception:
+                dict_idx_val = None
+
+            # 2) find a data table that references this dictionary and Time
+            data_table = None
+            for t in tables:
+                cols = {r[1] for r in conn.execute(f'PRAGMA table_info("{t}")').fetchall()}
+                if dict_idx_col in cols and "TimeIndex" in cols:
+                    data_table = t
+                    break
+            if not data_table:
+                raise RuntimeError(f"No data table found referencing '{dict_idx_col}' with TimeIndex.")
+
+            # numeric value column
+            data_info = conn.execute(f'PRAGMA table_info("{data_table}")').fetchall()
+            val_col = "Value" if any(n == "Value" for (_cid, n, _t, *_rest) in data_info) else None
+            if not val_col:
+                for (_cid, n, t, *_rest) in data_info:
+                    tt = (t or "").upper()
+                    if any(k in tt for k in ("REAL", "FLOAT", "DOUBLE", "NUMERIC", "DECIMAL")) and n not in ("TimeIndex", dict_idx_col):
+                        val_col = n
+                        break
+            if not val_col:
+                raise RuntimeError(f"No numeric value column found in {data_table}.")
+
+            # frequency column (optional)
+            freq_col = None
+            dict_cols = {r[1] for r in dict_info}
+            for cand in ("ReportingFrequency", "ReportingInterval", "Interval", "Frequency"):
+                if cand in dict_cols:
+                    freq_col = cand
+                    break
+
+            # environment filter (exclude sizing periods unless requested)
+            env_filter = ""
+            env_params: List = []
+            env_cols = {r[1] for r in conn.execute('PRAGMA table_info("EnvironmentPeriods")').fetchall()}
+            if not include_design_days:
+                if "EnvironmentType" in env_cols:
+                    env_filter = "AND ep.EnvironmentType = ?"
+                    env_params = ["WeatherRunPeriod"]
+                elif "EnvironmentName" in env_cols:
+                    env_filter = "AND ep.EnvironmentName NOT LIKE 'SizingPeriod:%'"
+
+            minute_col = self._detect_minute_col(conn)
+
+            # Build WHERE clauses
+            if dict_idx_val is not None:
+                base_where = f'WHERE d."{dict_col}" = ? AND x."{dict_idx_col}" = ?'
+                base_params: List = [value, dict_idx_val]
+            else:
+                base_where = f'WHERE d."{dict_col}" = ? AND x."{dict_idx_col}" = d."{dict_idx_col}"'
+                base_params = [value]
+
+            freq_clause = ""
+            freq_params: List = []
+            if freq_col and freq_whitelist:
+                ph = ",".join("?" * len(freq_whitelist))
+                freq_clause = f'AND d."{freq_col}" IN ({ph})'
+                freq_params = list(freq_whitelist)
+
+            sql = f"""
+                SELECT
+                  d."{dict_col}" AS name,
+                  t.Year AS y, t.Month AS m, t.Day AS d, t.Hour AS h, t."{minute_col}" AS mi,
+                  x."{val_col}" AS val
+                FROM "{data_table}" x
+                JOIN "{dict_table}" d ON x."{dict_idx_col}" = d."{dict_idx_col}"
+                JOIN "Time" t ON x.TimeIndex = t.TimeIndex
+                LEFT JOIN "EnvironmentPeriods" ep ON t.EnvironmentPeriodIndex = ep.EnvironmentPeriodIndex
+                {base_where}
+                {freq_clause}
+                {env_filter}
+            """
+            params = base_params + freq_params + env_params
+            rows = conn.execute(sql, params).fetchall()
+            if not rows:
+                self._log("Query returned no rows; adjust frequency or include_design_days.")
+                return None
+
+            df = pd.DataFrame(rows, columns=["name", "y", "m", "d", "h", "min", "value"])
+
+            # timestamp (E+ hour is end-of-interval → shift to start; Year 0 → 2002)
+            y = df["y"].replace(0, 2002)
+            df["timestamp"] = pd.to_datetime(
+                dict(year=y, month=df["m"], day=df["d"], hour=(df["h"] - 1).clip(lower=0), minute=df["min"]),
+                errors="coerce"
+            )
+            df = df.dropna(subset=["timestamp"]).sort_values("timestamp")[["timestamp", "value"]]
+
+            if to_kwh:
+                df["value"] = df["value"] / 3.6e6  # J → kWh
+
+            if csv_out:
+                col = value.replace(":", "_") + ("_kWh" if to_kwh else "_J")
+                out = df.rename(columns={"value": col})
+                out.to_csv(csv_out, index=False)
+                self._log(f"Wrote CSV → {csv_out}  shape={out.shape}")
+
+            return df
+        finally:
+            conn.close()
