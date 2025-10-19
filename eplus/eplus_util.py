@@ -3028,6 +3028,7 @@ class EPlusUtil:
         # Set + optional verify
         h = d["_co2_outdoor_sched_handle"]
         self.api.exchange.set_actuator_value(s, h, v)
+        print('CO2',v)
 
         cur = None
         if verify:
