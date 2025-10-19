@@ -3054,3 +3054,259 @@ class EPlusUtil:
                         d["_co2_outdoor_last_log_minute"] = minute
             except Exception:
                 pass
+
+
+    def get_zone_out_door_air_state(self, s, **opts):
+        """
+        Snapshot zone + supply + outdoor air state each system timestep.
+
+        For each Zone:
+        - zone (air) : Dry-bulb [C], Humidity Ratio [kg/kg], CO₂ [ppm]
+        - supply air : Mass Flow Rate [kg/s], Dry-bulb [C], Humidity Ratio [kg/kg], CO₂ [ppm]
+        Outdoor (Environment):
+        - Dry-bulb [C], Humidity Ratio [kg/kg], CO₂ [ppm]
+
+        Kwargs:
+        zones                : list[str] | None = None   # restrict to these zones (case-insensitive); None=all
+        log_every_minutes    : int | None = 60           # heartbeat print period; None = no prints
+        precision            : int = 3                   # print rounding
+        print_missing_once   : bool = True               # warn once per name when a handle isn't found
+        include_units_in_log : bool = False              # append units in log line
+        Returns: dict with keys {"timestamp","outdoor",{ "zones": {Z: {...}} } }
+        """
+        # Skip during warmup
+        if self.api.exchange.warmup_flag(s):
+            return
+
+        d = self.__dict__
+        zones_filter = {z.lower(): z for z in (opts.get("zones") or [])}
+        log_every = opts.get("log_every_minutes", 60)
+        prec = int(opts.get("precision", 3))
+        warn_missing_once = bool(opts.get("print_missing_once", True))
+        include_units = bool(opts.get("include_units_in_log", False))
+
+        # ---------- 1) one-time (per state) handle resolution ----------
+        # (re-resolve if state was reset)
+        need_resolve = (
+            d.get("_probe_state_id") != id(self.state)
+            or not d.get("_probe_zone_handles")
+            or not d.get("_probe_outdoor_handles")
+        )
+        if need_resolve:
+            # Collect zones (live if possible)
+            try:
+                zones_all = list(self.api.exchange.get_object_names(s, "Zone") or [])
+            except Exception:
+                zones_all = self.list_zone_names(preferred_sources=("sql","api","idf"))
+            if zones_filter:
+                zones = [z for z in zones_all if z.lower() in zones_filter]
+            else:
+                zones = zones_all[:]
+
+            # Query live API catalog (your helper enumerates handles nicely)
+            rows = self._variables_from_catalog(
+                s,
+                discover_zone_keys=True,
+                discover_environment_keys=True,
+                verify_handles=True
+            ) or []
+
+            # Build exact LUT: (name_lower, key_lower) -> row
+            lut = {}
+            for r in rows:
+                nm = (r.get("name") or "").strip().lower()
+                ky = (r.get("key") or "").strip().lower()
+                h  = int(r.get("handle", -1))
+                if nm and h != -1:
+                    lut[(nm, ky)] = r
+
+            def _h(candidates, key):
+                """Find first matching handle among candidate names for the given key."""
+                k = (key or "").strip().lower()
+                for nm in candidates:
+                    r = lut.get((nm.strip().lower(), k))
+                    if r:
+                        return r["handle"], (r.get("units") or "")
+                # fuzzy fallback: name contains candidate
+                for (nm_lower, k_lower), r in lut.items():
+                    if k_lower == k and any(c in nm_lower for c in [c.strip().lower() for c in candidates]):
+                        return r["handle"], (r.get("units") or "")
+                return -1, ""
+
+            # canonical candidate names (cover common IDD spellings)
+            C = {
+                "zone_T": [
+                    "Zone Air Temperature",
+                    "Zone Mean Air Temperature",
+                ],
+                "zone_w": [
+                    "Zone Air Humidity Ratio",
+                    "Zone Mean Air Humidity Ratio",
+                ],
+                "zone_co2": [
+                    "Zone Air CO2 Concentration",
+                    "Zone Air Carbon Dioxide Concentration",
+                ],
+                "sup_mdot": [
+                    "Zone Inlet Air Mass Flow Rate",
+                    "Zone Air Inlet Mass Flow Rate",
+                ],
+                "sup_T": [
+                    "Zone Inlet Air Temperature",
+                ],
+                "sup_w": [
+                    "Zone Inlet Air Humidity Ratio",
+                ],
+                "sup_co2": [
+                    "Zone Inlet Air CO2 Concentration",
+                    "Zone Inlet Air Carbon Dioxide Concentration",
+                ],
+                "out_T": [
+                    "Site Outdoor Air Drybulb Temperature",
+                    "Site Outdoor Air Dry Bulb Temperature",
+                ],
+                "out_w": [
+                    "Site Outdoor Air Humidity Ratio",
+                ],
+                "out_co2": [
+                    "Site Outdoor Air CO2 Concentration",
+                    "Site Outdoor Air Carbon Dioxide Concentration",
+                    "Outdoor Air CO2 Concentration",
+                    "Outdoor Air Carbon Dioxide Concentration",
+                ],
+            }
+
+            # Per-zone handles
+            z_handles: dict[str, dict] = {}
+            for z in zones:
+                zH = {}
+                zH["zone_T"]   = _h(C["zone_T"], z)[0]
+                zH["zone_w"]   = _h(C["zone_w"], z)[0]
+                zH["zone_co2"] = _h(C["zone_co2"], z)[0]
+                zH["sup_mdot"] = _h(C["sup_mdot"], z)[0]
+                zH["sup_T"]    = _h(C["sup_T"], z)[0]
+                zH["sup_w"]    = _h(C["sup_w"], z)[0]
+                zH["sup_co2"]  = _h(C["sup_co2"], z)[0]
+                z_handles[z] = zH
+
+            # Outdoor (Environment) handles
+            oH = {}
+            oH["T"], _ = _h(C["out_T"], "Environment")
+            oH["w"], _ = _h(C["out_w"], "Environment")
+            oH["co2"], _ = _h(C["out_co2"], "Environment")
+
+            # If outdoor CO2 variable is absent, fallback to CO₂ schedule actuator (if prepared)
+            if oH["co2"] == -1 and getattr(self, "_co2_outdoor_schedule", None):
+                # resolve once (reuse from co2_set_outdoor_ppm if already set)
+                if d.get("_co2_outdoor_sched_handle", -1) == -1 or d.get("_co2_outdoor_sched_state_id") != id(self.state):
+                    h_sched = -1
+                    for typ in getattr(self, "_SCHEDULE_TYPES", ("Schedule:Compact","Schedule:Constant","Schedule:File","Schedule:Year")):
+                        try:
+                            h_sched = self.api.exchange.get_actuator_handle(s, typ, "Schedule Value", self._co2_outdoor_schedule)
+                        except Exception:
+                            h_sched = -1
+                        if h_sched != -1:
+                            break
+                    d["_co2_outdoor_sched_handle"] = h_sched
+                    d["_co2_outdoor_sched_state_id"] = id(self.state)
+                d["_probe_outdoor_co2_from_sched"] = (d.get("_co2_outdoor_sched_handle", -1) != -1)
+
+            # Save caches
+            d["_probe_zone_handles"] = z_handles
+            d["_probe_outdoor_handles"] = oH
+            d["_probe_missing_warned"] = set()
+            d["_probe_state_id"] = id(self.state)
+
+        # ---------- 2) read values ----------
+        z_handles = d["_probe_zone_handles"]
+        oH = d["_probe_outdoor_handles"]
+
+        def _val(h):
+            try:
+                return float(self.api.exchange.get_variable_value(s, int(h))) if int(h) != -1 else None
+            except Exception:
+                return None
+
+        # timestamp aligned to interval start (matches your other helpers)
+        ts = self._occ_current_timestamp(s)
+
+        # Outdoor values
+        out_T = _val(oH.get("T", -1))
+        out_w = _val(oH.get("w", -1))
+        out_co2 = _val(oH.get("co2", -1))
+        if out_co2 is None and d.get("_probe_outdoor_co2_from_sched", False):
+            try:
+                h_sched = int(d.get("_co2_outdoor_sched_handle", -1))
+                if h_sched != -1:
+                    out_co2 = float(self.api.exchange.get_actuator_value(s, h_sched))
+            except Exception:
+                pass
+
+        data = {
+            "timestamp": ts,
+            "outdoor": {"Tdb_C": out_T, "w_kgperkg": out_w, "co2_ppm": out_co2},
+            "zones": {}
+        }
+
+        # Per-zone values
+        for z, H in z_handles.items():
+            air_T   = _val(H.get("zone_T", -1))
+            air_w   = _val(H.get("zone_w", -1))
+            air_co2 = _val(H.get("zone_co2", -1))
+            sup_m   = _val(H.get("sup_mdot", -1))
+            sup_T   = _val(H.get("sup_T", -1))
+            sup_w   = _val(H.get("sup_w", -1))
+            sup_co2 = _val(H.get("sup_co2", -1))
+
+            data["zones"][z] = {
+                "air":    {"Tdb_C": air_T, "w_kgperkg": air_w, "co2_ppm": air_co2},
+                "supply": {"m_dot_kgs": sup_m, "Tdb_C": sup_T, "w_kgperkg": sup_w, "co2_ppm": sup_co2},
+            }
+
+            # One-time missing-handle warnings (optional)
+            if warn_missing_once:
+                for label, h in {
+                    f"{z}.air.Tdb": H.get("zone_T", -1),
+                    f"{z}.air.w": H.get("zone_w", -1),
+                    f"{z}.air.co2": H.get("zone_co2", -1),
+                    f"{z}.sup.m_dot": H.get("sup_mdot", -1),
+                    f"{z}.sup.Tdb": H.get("sup_T", -1),
+                    f"{z}.sup.w": H.get("sup_w", -1),
+                    f"{z}.sup.co2": H.get("sup_co2", -1),
+                }.items():
+                    if h == -1 and label not in d["_probe_missing_warned"]:
+                        self._log(1, f"[probe] No handle for {label} (variable may not exist for this model).")
+                        d["_probe_missing_warned"].add(label)
+
+        # ---------- 3) rate-limited print ----------
+        if log_every is not None:
+            try:
+                N = max(1, int(self.api.exchange.num_time_steps_in_hour(s)))
+                minute = int(round((self.api.exchange.zone_time_step_number(s) - 1) * (60 / N)))
+                last = d.get("_probe_last_log_minute", None)
+                if (minute % int(log_every) == 0) and (last != minute):
+                    d["_probe_last_log_minute"] = minute
+
+                    def fmt(v, unit=""):
+                        if v is None: return "NA"
+                        return (f"{round(v, prec)}{unit}" if include_units and unit else f"{round(v, prec)}")
+
+                    o = data["outdoor"]
+                    self._log(1, f"[probe] {ts} | Outdoor: T={fmt(o['Tdb_C'],'C')} w={fmt(o['w_kgperkg'])} CO2={fmt(o['co2_ppm'],'ppm')}")
+                    # print first few zones (avoid spam if many)
+                    max_z = min(6, len(data["zones"]))
+                    i = 0
+                    for zn, rec in data["zones"].items():
+                        self._log(1, "         "
+                                f"{zn}: air(T={fmt(rec['air']['Tdb_C'],'C')}, w={fmt(rec['air']['w_kgperkg'])}, CO2={fmt(rec['air']['co2_ppm'],'ppm')}) | "
+                                f"supply(m={fmt(rec['supply']['m_dot_kgs'],' kg/s')}, T={fmt(rec['supply']['Tdb_C'],'C')}, w={fmt(rec['supply']['w_kgperkg'])}, CO2={fmt(rec['supply']['co2_ppm'],'ppm')})")
+                        i += 1
+                        if i >= max_z:
+                            rem = len(data["zones"]) - max_z
+                            if rem > 0:
+                                self._log(1, f"         ... (+{rem} more zones)")
+                            break
+            except Exception:
+                pass
+
+        return data
