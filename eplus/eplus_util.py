@@ -3057,22 +3057,26 @@ class EPlusUtil:
 
 
     def get_zone_out_door_air_state(self, s, **opts):
-        """
+       """
         Snapshot zone + supply + outdoor air state each system timestep.
 
-        For each Zone:
-        - zone (air) : Dry-bulb [C], Humidity Ratio [kg/kg], CO2 [ppm]
-        - supply air : Mass Flow Rate [kg/s], Dry-bulb [C], Humidity Ratio [kg/kg], CO2 [ppm]
-        Outdoor (Environment):
-        - Dry-bulb [C], Humidity Ratio [kg/kg], CO2 [ppm]
+        Uses the following (from your specs) and computes moisture content (w):
+        Zone:  Zone Mean Air Temperature, Zone Air Relative Humidity, (opt) Zone Mean Air Dewpoint Temperature, Zone Air CO2 Concentration
+        Outdoor: Site Outdoor Air Drybulb Temperature, Site Outdoor Air Relative Humidity, (opt) Site Outdoor Air Barometric Pressure, (opt) CO2
+
+        Supply variables (best-effort):
+        Zone Inlet Air {Mass Flow Rate, Temperature, Humidity Ratio, CO2 Concentration}
+        fallback → System Node {Mass Flow Rate, Temperature, Humidity Ratio, CO2 Concentration} (key contains "<zone>" and "inlet")
+        last resort ṁ → Zone Air System Mass Flow Rate
 
         Kwargs:
-        zones                : list[str] | None = None   # subset (case-insensitive) or None=all zones
-        log_every_minutes    : int | None = 60           # 1 => every timestep, None => no prints
+        zones                : list[str] | None = None
+        log_every_minutes    : int | None = 60   # 1 => every timestep; None => no prints
         precision            : int = 3
         print_missing_once   : bool = True
         include_units_in_log : bool = False
-        Returns: dict with keys {"timestamp","outdoor","zones":{...}}
+        p_atm_default_pa     : float = 101325.0  # used if barometric pressure var isn't available
+        Returns dict: {timestamp, outdoor:{Tdb_C,w_kgperkg,co2_ppm}, zones:{Z:{air:{...}, supply:{...}}}}
         """
         if self.api.exchange.warmup_flag(s):
             return
@@ -3083,132 +3087,134 @@ class EPlusUtil:
         prec = int(opts.get("precision", 3))
         warn_missing_once = bool(opts.get("print_missing_once", True))
         include_units = bool(opts.get("include_units_in_log", False))
+        P_ATM_FALLBACK = float(opts.get("p_atm_default_pa", 101325.0))
 
-        # ---------------- 1) Lazy handle resolution (pattern-based) ----------------
+        # --- helpers: psychrometrics ---------------------
+        def _psat_pa(T_C: float) -> float:
+            # ASHRAE-like over water (valid -50..+100C). Return saturation vapor pressure [Pa]
+            T = float(T_C)
+            # 6-parameter Magnus-Tetens (Pa)
+            # Psat = 610.94 * exp(17.625*T/(T+243.04))  (ok for typical range)
+            # convert to Pa with factor already in formula
+            import math
+            return 610.94 * math.exp(17.625 * T / (T + 243.04))
+
+        def _w_from_T_RH_P(T_C: float | None, RH_frac: float | None, P_Pa: float) -> float | None:
+            if T_C is None or RH_frac is None:
+                return None
+            RH = max(0.0, min(1.0, float(RH_frac)))
+            try:
+                Pw = RH * _psat_pa(float(T_C))
+                return 0.621945 * Pw / max(1e-6, (P_Pa - Pw))
+            except Exception:
+                return None
+
+        def _val(h):
+            try:
+                return float(self.api.exchange.get_variable_value(s, int(h))) if int(h) != -1 else None
+            except Exception:
+                return None
+
+        # ------------- 1) Resolve handles lazily (once per state) -----------------
         need_resolve = (
-            d.get("_probe2_state_id") != id(self.state)
-            or not d.get("_probe2_zone_handles")
-            or not d.get("_probe2_outdoor_handles")
+            d.get("_probe3_state_id") != id(self.state)
+            or not d.get("_probe3_zone_handles")
+            or not d.get("_probe3_outdoor_handles")
         )
         if need_resolve:
-            # Zones
+            # zones
             try:
                 zones_all = list(self.api.exchange.get_object_names(s, "Zone") or [])
             except Exception:
                 zones_all = self.list_zone_names(preferred_sources=("sql","api","idf"))
             zones = [z for z in zones_all if not zones_filter or z.lower() in zones_filter]
 
-            # Catalog of available variables (with resolved handles!)
             rows = self._variables_from_catalog(
-                s,
-                discover_zone_keys=True,          # will try zone keys for "zone-ish" variables
-                discover_environment_keys=True,   # picks up Environment for site vars
-                verify_handles=True
+                s, discover_zone_keys=True, discover_environment_keys=True, verify_handles=True
             ) or []
 
-            # Build quick lookups
-            #  - by (name_lower, key_lower)
-            lut_exact = {}
-            #  - list for pattern scans
+            # normalize rows
             rows_norm = []
             for r in rows:
                 nm = (r.get("name") or "").strip()
                 ky = (r.get("key") or "").strip()
                 un = (r.get("units") or "").strip()
                 h  = int(r.get("handle", -1))
-                if not nm or h == -1:
-                    continue
-                nml, kyl = nm.lower(), ky.lower()
-                lut_exact[(nml, kyl)] = (h, un)
-                rows_norm.append((nml, kyl, h, un, nm, ky))
+                if nm and h != -1:
+                    rows_norm.append((nm.lower(), ky.lower(), h, un, nm, ky))
 
-            def find_handle(name_substrs, *, key_exact=None, key_contains=None, prefer_with_tokens=None):
-                """
-                Resolve first handle whose variable name contains *all* substrings (case-insens),
-                with key match either exact (when provided) or 'contains' (when provided).
-                Optionally bias toward names containing any of the 'prefer_with_tokens'.
-                """
-                subs = [s.lower() for s in name_substrs if s]
-                kx   = (key_exact or "").strip().lower() if key_exact is not None else None
-                kc   = (key_contains or "").strip().lower() if key_contains is not None else None
-
-                candidates = []
+            def find_handle(name_exact: str, *, key_exact: str | None = None):
+                nx = name_exact.lower().strip()
+                kx = key_exact.lower().strip() if key_exact is not None else None
                 for nml, kyl, h, un, nm, ky in rows_norm:
-                    if subs and not all(ss in nml for ss in subs):
-                        continue
-                    if kx is not None:
-                        if kyl != kx: continue
-                    if kc is not None:
-                        # allow loose match for node-style keys (e.g. "SPACE1-1 Inlet Node")
-                        if kc not in kyl: continue
-                    candidates.append((nml, kyl, h, un, nm, ky))
+                    if nml == nx and (kx is None or kyl == kx):
+                        return h, un
+                return -1, ""
 
-                if not candidates:
-                    return -1, ""
+            def find_handle_contains(name_sub_tokens, *, key_exact=None, key_contains=None, prefer_tokens=None):
+                subs = [t.lower() for t in name_sub_tokens if t]
+                kx = key_exact.lower().strip() if key_exact is not None else None
+                kc = key_contains.lower().strip() if key_contains is not None else None
+                cand = []
+                for nml, kyl, h, un, nm, ky in rows_norm:
+                    if not all(t in nml for t in subs): continue
+                    if kx is not None and kyl != kx: continue
+                    if kc is not None and kc not in kyl: continue
+                    cand.append((nml, kyl, h, un))
+                if not cand: return -1, ""
+                if prefer_tokens:
+                    prefs = [p.lower() for p in prefer_tokens]
+                    for c in cand:
+                        if any(p in c[0] for p in prefs):
+                            return c[2], c[3]
+                return cand[0][2], cand[0][3]
 
-                if prefer_with_tokens:
-                    prefs = [p.lower() for p in prefer_with_tokens]
-                    for c in candidates:
-                        if any(tok in c[0] for tok in prefs):
-                            return c[2], c[3]  # h, units
-
-                # otherwise first
-                return candidates[0][2], candidates[0][3]
-
-            # ---------------- zone handles ----------------
-            zH_all: dict[str, dict] = {}
+            # ---- per-zone handles (air state via Tdb+RH (+optional Tdp))
+            zH_all = {}
             for z in zones:
                 zl = z.lower()
                 zH = {}
 
-                # Zone air (prefer "mean" variants if present)
-                zH["zone_T"]   = find_handle(["zone", "air", "temperature"], key_exact=zl,
-                                            prefer_with_tokens=["mean"])[0]
-                zH["zone_w"]   = find_handle(["zone", "air", "humidity", "ratio"], key_exact=zl,
-                                            prefer_with_tokens=["mean"])[0]
-                zH["zone_co2"] = find_handle(["zone", "air", "co2", "concentration"], key_exact=zl)[0]
+                # Zone Tdb / RH / DewPoint / CO2 (exact names from your specs)
+                zH["zone_T"]   = find_handle("Zone Mean Air Temperature",              key_exact=zl)[0]
+                zH["zone_rh"]  = find_handle("Zone Air Relative Humidity",             key_exact=zl)[0]
+                zH["zone_tdp"] = find_handle("Zone Mean Air Dewpoint Temperature",     key_exact=zl)[0]
+                zH["zone_co2"] = find_handle("Zone Air CO2 Concentration",             key_exact=zl)[0]
 
-                # Supply air — strategy:
-                #   (A) prefer zone-scoped "Zone Inlet Air ..." with key = zone
-                #   (B) fallback to node-scoped "System Node ..." with key CONTAINING the zone name
-                #       and preferring names that contain "inlet"
-                # (A) zone-scoped
-                h_m  = find_handle(["zone", "inlet", "air", "mass", "flow", "rate"], key_exact=zl)[0]
-                h_T  = find_handle(["zone", "inlet", "air", "temperature"], key_exact=zl)[0]
-                h_w  = find_handle(["zone", "inlet", "air", "humidity", "ratio"], key_exact=zl)[0]
-                h_c  = find_handle(["zone", "inlet", "air", "co2", "concentration"], key_exact=zl)[0]
+                # Supply preferred (zone-scoped) then node fallback:
+                # A) Zone Inlet Air ...
+                zH["sup_mdot"] = find_handle("Zone Inlet Air Mass Flow Rate",          key_exact=zl)[0]
+                zH["sup_T"]    = find_handle("Zone Inlet Air Temperature",             key_exact=zl)[0]
+                zH["sup_w"]    = find_handle("Zone Inlet Air Humidity Ratio",          key_exact=zl)[0]
+                zH["sup_co2"]  = find_handle("Zone Inlet Air CO2 Concentration",       key_exact=zl)[0]
 
-                # (B) node fallbacks (keys that include the zone token)
-                if h_m == -1:
-                    h_m = find_handle(["system", "node", "mass", "flow", "rate"], key_contains=zl,
-                                    prefer_with_tokens=["inlet"])[0]
-                if h_T == -1:
-                    h_T = find_handle(["system", "node", "temperature"], key_contains=zl,
-                                    prefer_with_tokens=["inlet"])[0]
-                if h_w == -1:
-                    h_w = find_handle(["system", "node", "humidity", "ratio"], key_contains=zl,
-                                    prefer_with_tokens=["inlet"])[0]
-                if h_c == -1:
-                    h_c = find_handle(["system", "node", "co2", "concentration"], key_contains=zl,
-                                    prefer_with_tokens=["inlet"])[0]
+                # B) Node fallback (key contains zone and likely 'inlet')
+                if zH["sup_mdot"] == -1:
+                    zH["sup_mdot"] = find_handle_contains(["system", "node", "mass", "flow", "rate"],
+                                                        key_contains=zl, prefer_tokens=["inlet"])[0]
+                if zH["sup_T"] == -1:
+                    zH["sup_T"] = find_handle_contains(["system", "node", "temperature"],
+                                                    key_contains=zl, prefer_tokens=["inlet"])[0]
+                if zH["sup_w"] == -1:
+                    zH["sup_w"] = find_handle_contains(["system", "node", "humidity", "ratio"],
+                                                    key_contains=zl, prefer_tokens=["inlet"])[0]
+                if zH["sup_co2"] == -1:
+                    zH["sup_co2"] = find_handle_contains(["system", "node", "co2", "concentration"],
+                                                        key_contains=zl, prefer_tokens=["inlet"])[0]
 
-                zH["sup_mdot"] = h_m
-                zH["sup_T"]    = h_T
-                zH["sup_w"]    = h_w
-                zH["sup_co2"]  = h_c
+                # C) last-resort ṁ at zone level
+                if zH["sup_mdot"] == -1:
+                    zH["sup_mdot"] = find_handle("Zone Air System Mass Flow Rate", key_exact=zl)[0]
+
                 zH_all[z] = zH
 
-            # ---------------- outdoor (Environment) ----------------
+            # ---- outdoor handles
             oH = {}
-            oH["T"]   = find_handle(["site", "outdoor", "air", "dry", "bulb"], key_exact="environment")[0]
-            if oH["T"] == -1:
-                # tolerate "drybulb" tokenization
-                oH["T"] = find_handle(["site", "outdoor", "air", "drybulb"], key_exact="environment")[0]
-
-            oH["w"]   = find_handle(["site", "outdoor", "air", "humidity", "ratio"], key_exact="environment")[0]
-            oH["co2"] = find_handle(["site", "outdoor", "air", "co2", "concentration"], key_exact="environment")[0]
-
-            # CO2 fallback to actuated schedule (if prepared)
+            oH["T"]   = find_handle("Site Outdoor Air Drybulb Temperature", key_exact="environment")[0]
+            oH["rh"]  = find_handle("Site Outdoor Air Relative Humidity",   key_exact="environment")[0]
+            oH["p"]   = find_handle("Site Outdoor Air Barometric Pressure", key_exact="environment")[0]
+            # CO2 (if present) or actuator schedule fallback
+            oH["co2"] = find_handle_contains(["outdoor", "air", "co2", "concentration"], key_exact="environment")[0]
             if oH["co2"] == -1 and getattr(self, "_co2_outdoor_schedule", None):
                 if d.get("_co2_outdoor_sched_handle", -1) == -1 or d.get("_co2_outdoor_sched_state_id") != id(self.state):
                     h_sched = -1
@@ -3220,75 +3226,77 @@ class EPlusUtil:
                         if h_sched != -1: break
                     d["_co2_outdoor_sched_handle"] = h_sched
                     d["_co2_outdoor_sched_state_id"] = id(self.state)
-                d["_probe2_outdoor_co2_from_sched"] = (d.get("_co2_outdoor_sched_handle", -1) != -1)
+                d["_probe3_outdoor_co2_from_sched"] = (d.get("_co2_outdoor_sched_handle", -1) != -1)
 
-            # cache
-            d["_probe2_zone_handles"] = zH_all
-            d["_probe2_outdoor_handles"] = oH
-            d["_probe2_missing_warned"] = set()
-            d["_probe2_state_id"] = id(self.state)
+            d["_probe3_zone_handles"] = zH_all
+            d["_probe3_outdoor_handles"] = oH
+            d["_probe3_missing_warned"] = set()
+            d["_probe3_state_id"] = id(self.state)
 
-        # ---------------- 2) read values ----------------
-        z_handles = d["_probe2_zone_handles"]; oH = d["_probe2_outdoor_handles"]
-
-        def _val(h):
-            try:
-                return float(self.api.exchange.get_variable_value(s, int(h))) if int(h) != -1 else None
-            except Exception:
-                return None
+        # ------------- 2) read + compute -----------------
+        zH_all = d["_probe3_zone_handles"]; oH = d["_probe3_outdoor_handles"]
 
         ts = self._occ_current_timestamp(s)
 
-        out_T = _val(oH.get("T", -1))
-        out_w = _val(oH.get("w", -1))
+        # Outdoor
+        T_out = _val(oH.get("T", -1))
+        RH_out_pct = _val(oH.get("rh", -1))
+        P_out = _val(oH.get("p", -1)) or P_ATM_FALLBACK
+        RH_out = (RH_out_pct / 100.0) if RH_out_pct is not None else None
+
+        out_w = _w_from_T_RH_P(T_out, RH_out, P_out)
         out_co2 = _val(oH.get("co2", -1))
-        if out_co2 is None and d.get("_probe2_outdoor_co2_from_sched", False):
+        if out_co2 is None and d.get("_probe3_outdoor_co2_from_sched", False):
             try:
-                h_sched = int(d.get("_co2_outdoor_sched_handle", -1))
-                if h_sched != -1:
-                    out_co2 = float(self.api.exchange.get_actuator_value(s, h_sched))
+                hs = int(d.get("_co2_outdoor_sched_handle", -1))
+                if hs != -1: out_co2 = float(self.api.exchange.get_actuator_value(s, hs))
             except Exception:
                 pass
 
-        data = {"timestamp": ts, "outdoor": {"Tdb_C": out_T, "w_kgperkg": out_w, "co2_ppm": out_co2}, "zones": {}}
+        data = {"timestamp": ts, "outdoor": {"Tdb_C": T_out, "w_kgperkg": out_w, "co2_ppm": out_co2}, "zones": {}}
 
-        for z, H in z_handles.items():
-            air_T   = _val(H.get("zone_T", -1))
-            air_w   = _val(H.get("zone_w", -1))
-            air_co2 = _val(H.get("zone_co2", -1))
+        # Zones
+        for z, H in zH_all.items():
+            Tz = _val(H.get("zone_T", -1))
+            RHz_pct = _val(H.get("zone_rh", -1))
+            RHz = (RHz_pct / 100.0) if RHz_pct is not None else None
+            # If RH missing but dewpoint present, you could add a dewpoint→w path here if needed.
+            wz = _w_from_T_RH_P(Tz, RHz, P_out)  # use outdoor baro as proxy unless you add "Zone Air Pressure"
+
+            co2z = _val(H.get("zone_co2", -1))
+
             sup_m   = _val(H.get("sup_mdot", -1))
             sup_T   = _val(H.get("sup_T", -1))
             sup_w   = _val(H.get("sup_w", -1))
             sup_co2 = _val(H.get("sup_co2", -1))
 
             data["zones"][z] = {
-                "air":    {"Tdb_C": air_T, "w_kgperkg": air_w, "co2_ppm": air_co2},
+                "air":    {"Tdb_C": Tz, "w_kgperkg": wz, "co2_ppm": co2z},
                 "supply": {"m_dot_kgs": sup_m, "Tdb_C": sup_T, "w_kgperkg": sup_w, "co2_ppm": sup_co2},
             }
 
             if warn_missing_once:
                 for label, h in {
-                    f"{z}.air.Tdb": H.get("zone_T", -1),
-                    f"{z}.air.w": H.get("zone_w", -1),
-                    f"{z}.air.co2": H.get("zone_co2", -1),
+                    f"{z}.air.RH": H.get("zone_rh", -1),
+                    f"{z}.air.CO2": H.get("zone_co2", -1),
                     f"{z}.sup.m_dot": H.get("sup_mdot", -1),
                     f"{z}.sup.Tdb": H.get("sup_T", -1),
                     f"{z}.sup.w": H.get("sup_w", -1),
-                    f"{z}.sup.co2": H.get("sup_co2", -1),
+                    f"{z}.sup.CO2": H.get("sup_co2", -1),
                 }.items():
-                    if h == -1 and label not in d["_probe2_missing_warned"]:
+                    if h == -1 and label not in d["_probe3_missing_warned"]:
                         self._log(1, f"[probe] No handle for {label} (variable not exposed in this model).")
-                        d["_probe2_missing_warned"].add(label)
+                        d["_probe3_missing_warned"].add(label)
 
-        # ---------------- 3) rate-limited print (per-timestep capable) ----------------
+        # ------------- 3) rate-limited print (per timestep capable) ---------------
         if log_every is not None:
             try:
                 N = max(1, int(self.api.exchange.num_time_steps_in_hour(s)))
                 minute = int(round((self.api.exchange.zone_time_step_number(s) - 1) * (60 / N)))
                 if int(minute) % int(log_every) == 0:
-                    last_ts = d.get("_probe2_last_log_ts")
+                    last_ts = d.get("_probe3_last_log_ts")
                     if last_ts != ts:
-                        d["_probe2_last_log_ts"] = ts
+                        d["_probe3_last_log_ts"] = ts
 
                         def fmt(v, unit=""):
                             if v is None: return "NA"
