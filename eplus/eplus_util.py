@@ -3057,7 +3057,7 @@ class EPlusUtil:
 
 
     def get_zone_out_door_air_state(self, s, **opts):
-       """
+        """
         Snapshot zone + supply + outdoor air state each system timestep.
 
         Uses the following (from your specs) and computes moisture content (w):
@@ -3320,4 +3320,4 @@ class EPlusUtil:
             except Exception:
                 pass
 
-        return data
+        return data        
