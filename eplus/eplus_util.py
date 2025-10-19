@@ -3283,29 +3283,33 @@ class EPlusUtil:
             try:
                 N = max(1, int(self.api.exchange.num_time_steps_in_hour(s)))
                 minute = int(round((self.api.exchange.zone_time_step_number(s) - 1) * (60 / N)))
-                last = d.get("_probe_last_log_minute", None)
-                if (minute % int(log_every) == 0) and (last != minute):
-                    d["_probe_last_log_minute"] = minute
 
-                    def fmt(v, unit=""):
-                        if v is None: return "NA"
-                        return (f"{round(v, prec)}{unit}" if include_units and unit else f"{round(v, prec)}")
+                # print when minute aligns with the requested cadence (e.g., 1 => every timestep)
+                if int(minute) % int(log_every) == 0:
+                    last_ts = d.get("_probe_last_log_ts")
+                    if last_ts != ts:  # <-- compare full timestamp, not just minute
+                        d["_probe_last_log_ts"] = ts
 
-                    o = data["outdoor"]
-                    self._log(1, f"[probe] {ts} | Outdoor: T={fmt(o['Tdb_C'],'C')} w={fmt(o['w_kgperkg'])} CO2={fmt(o['co2_ppm'],'ppm')}")
-                    # print first few zones (avoid spam if many)
-                    max_z = min(6, len(data["zones"]))
-                    i = 0
-                    for zn, rec in data["zones"].items():
-                        self._log(1, "         "
+                        def fmt(v, unit=""):
+                            if v is None: return "NA"
+                            return (f"{round(v, prec)}{unit}" if include_units and unit else f"{round(v, prec)}")
+
+                        o = data["outdoor"]
+                        self._log(1, f"[probe] {ts} | Outdoor: T={fmt(o['Tdb_C'],'C')} w={fmt(o['w_kgperkg'])} CO2={fmt(o['co2_ppm'],'ppm')}")
+                        # print first few zones (avoid spam if many)
+                        max_z = min(6, len(data["zones"]))
+                        for i, (zn, rec) in enumerate(data["zones"].items()):
+                            if i >= max_z:
+                                rem = len(data["zones"]) - max_z
+                                if rem > 0:
+                                    self._log(1, f"         ... (+{rem} more zones)")
+                                break
+                            self._log(1,
+                                "         "
                                 f"{zn}: air(T={fmt(rec['air']['Tdb_C'],'C')}, w={fmt(rec['air']['w_kgperkg'])}, CO2={fmt(rec['air']['co2_ppm'],'ppm')}) | "
-                                f"supply(m={fmt(rec['supply']['m_dot_kgs'],' kg/s')}, T={fmt(rec['supply']['Tdb_C'],'C')}, w={fmt(rec['supply']['w_kgperkg'])}, CO2={fmt(rec['supply']['co2_ppm'],'ppm')})")
-                        i += 1
-                        if i >= max_z:
-                            rem = len(data["zones"]) - max_z
-                            if rem > 0:
-                                self._log(1, f"         ... (+{rem} more zones)")
-                            break
+                                f"supply(m={fmt(rec['supply']['m_dot_kgs'],' kg/s')}, T={fmt(rec['supply']['Tdb_C'],'C')}, "
+                                f"w={fmt(rec['supply']['w_kgperkg'])}, CO2={fmt(rec['supply']['co2_ppm'],'ppm')})"
+                            )
             except Exception:
                 pass
 
