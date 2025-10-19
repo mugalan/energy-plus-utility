@@ -2971,7 +2971,7 @@ class EPlusUtil:
             # set People actuators for this zone
             for h in hlist:
                 self.api.exchange.set_actuator_value(s, h, per)
-                print('Occupants',per)
+                # print('Occupants',per)
 
             # record the zone headcount once per zone (for CO₂ follower)
             if not hasattr(self, "_occ_rand_last_counts"):
