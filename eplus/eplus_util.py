@@ -3754,7 +3754,7 @@ class EPlusUtil:
                 mode = "carry"
 
             # Insert into SQL
-            _ins(ts, z, y.reshape(-1), yhat_k, d["_kf_mu"][z])
+            # _ins(ts, z, y.reshape(-1), yhat_k, d["_kf_mu"][z])
 
             # Logging
             if do_log:
