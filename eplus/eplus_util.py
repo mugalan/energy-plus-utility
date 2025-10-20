@@ -3132,7 +3132,6 @@ class EPlusUtil:
         # Drop empties
         return {z: ks for z, ks in zmap.items() if ks}
 
-
     def probe_zone_air_and_supply(self, s, **opts):
         """
         Callback (fast): per zone snapshot of air state + supply aggregate.
@@ -3172,6 +3171,13 @@ class EPlusUtil:
             if not z2nodes:
                 zones = self.list_zone_names(preferred_sources=("sql","api","idf"))
                 z2nodes = {z: [f"{z} IN NODE", f"{z} ATU IN NODE"] for z in zones}
+
+            pref_single = True  # set False to keep aggregating when multiple nodes exist
+            if pref_single:
+                z2nodes = {
+                    z: ([n for n in nodes if n.upper() == f"{z.upper()} IN NODE"] or nodes)
+                    for z, nodes in z2nodes.items()
+                }
             d["_probe_zone_nodes"] = z2nodes
 
             # Request ZONE variables (use correct names)
