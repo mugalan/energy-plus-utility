@@ -3498,19 +3498,14 @@ class EPlusUtil:
 
     def probe_zone_air_and_supply_with_kf(self, s, **opts):
         """
-        Probe + Kalman filter + SQL persistence (no extra API reads).
-        Skips zones that look like plenums by default.
+        Probe + Kalman filter + SQL persistence (uses probe payload only).
+        Skips plenums; carries forward the previous estimate when m_sa≈0.
 
-        Options (in addition to your probe kwargs):
-        kf_sigma_P_diag     : iterable[5]   default [1e-6, 1e-3, 1e-6, 1e-6, 1e-4]
-        kf_sigma_R_diag     : iterable[3]   default [0.2**2, (2e-4)**2, 30.0**2]
-        kf_init_mu          : iterable[5]   default [0.0, 20.0, 0.0, 0.008, 400.0]
-        kf_init_cov_diag    : iterable[5]   default [1.0, 25.0, 1e0, 1e-3, 1e3]
-        kf_sql_table        : str           default "KalmanEstimates"
-        kf_sql_commit_every : int           default 200
-        kf_zones            : list[str] | None  # if given, only these zones
-        kf_exclude_patterns : tuple[str,...]    # default ("PLENUM",)
-        kf_log              : bool          default True (logs yhat + state per update)
+        Extra opts:
+        kf_sigma_P_diag, kf_sigma_R_diag, kf_init_mu, kf_init_cov_diag
+        kf_sql_table="KalmanEstimates", kf_sql_commit_every=200
+        kf_zones=None, kf_exclude_patterns=("PLENUM",), kf_log=True
+        kf_zero_mass_eps=1e-6
         """
         ex = self.api.exchange
         if ex.warmup_flag(s):
@@ -3519,10 +3514,11 @@ class EPlusUtil:
         import os, sqlite3
         import numpy as _np
 
-        # ---- run your working probe unchanged (uses only zone/supply/outdoor already) ----
+        # ---- run your working probe (unchanged) ----
         probe_kwargs = {k:v for k,v in opts.items() if k not in {
             "kf_sigma_P_diag","kf_sigma_R_diag","kf_init_mu","kf_init_cov_diag",
-            "kf_sql_table","kf_sql_commit_every","kf_zones","kf_exclude_patterns","kf_log"}}
+            "kf_sql_table","kf_sql_commit_every","kf_zones","kf_exclude_patterns","kf_log",
+            "kf_zero_mass_eps"}}
         payload = self.probe_zone_air_and_supply(s, **probe_kwargs)
         if not payload or "zones" not in payload:
             return payload
@@ -3539,9 +3535,10 @@ class EPlusUtil:
         kf_zones     = opts.get("kf_zones", None)
         excl_pats    = tuple(opts.get("kf_exclude_patterns", ("PLENUM",)))
         do_log       = bool(opts.get("kf_log", True))
+        eps_m        = float(opts.get("kf_zero_mass_eps", 1e-6))
 
         Sigma_P = _np.diag(Sigma_P_diag)
-        Sigma_R_full = _np.diag(Sigma_R_diag)  # for slicing per active rows
+        Sigma_R_full = _np.diag(Sigma_R_diag)
 
         # ---- Per-state init (per EP state & per zone) ----
         if d.get("_kf_state_id") != id(self.state):
@@ -3567,20 +3564,23 @@ class EPlusUtil:
             d["_kf_sql_conn"] = conn
             d["_kf_sql_cur"]  = cur
 
-        def _ins(ts, z, y, yhat, mu):
+        def _ins(ts, z, y_vec, yhat_vec, mu_vec):
+            """Safe insert with clean types."""
+            ts_str = str(ts)
+            z_str  = str(z)
+            def at(vec, i):
+                return float(vec[i]) if vec is not None and len(vec) > i and _np.isfinite(vec[i]) else None
             cur = d["_kf_sql_cur"]
             cur.execute(f"""
                 INSERT INTO {table_name}
                 (Timestamp, Zone, y_T, y_w, y_c, yhat_T, yhat_w, yhat_c,
                 alpha_T, beta_T, alpha_m, beta_w, beta_c)
                 VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)
-            """, (ts, z, float(y[0]) if len(y)>0 else None,
-                    float(y[1]) if len(y)>1 else None,
-                    float(y[2]) if len(y)>2 else None,
-                    float(yhat[0]) if len(yhat)>0 else None,
-                    float(yhat[1]) if len(yhat)>1 else None,
-                    float(yhat[2]) if len(yhat)>2 else None,
-                    float(mu[0]), float(mu[1]), float(mu[2]), float(mu[3]), float(mu[4])))
+            """, (ts_str, z_str,
+                at(y_vec,0), at(y_vec,1), at(y_vec,2),
+                at(yhat_vec,0), at(yhat_vec,1), at(yhat_vec,2),
+                float(mu_vec[0]), float(mu_vec[1]), float(mu_vec[2]),
+                float(mu_vec[3]), float(mu_vec[4])))
             d["_kf_inserts"] += 1
             if d["_kf_inserts"] % commit_every == 0:
                 d["_kf_sql_conn"].commit()
@@ -3594,13 +3594,13 @@ class EPlusUtil:
             zup = str(zone_name).upper()
             return any(p in zup for p in excl_pats)
 
-        # zone list to process (filter out plenums, unless user passed explicit list)
+        # Which zones to process
         if kf_zones:
             zones_use = [z for z in kf_zones if z in payload["zones"]]
         else:
             zones_use = [z for z in payload["zones"].keys() if not _is_excluded(z)]
 
-        ts = str(payload["timestamp"])
+        ts = payload["timestamp"]
         oT = payload["outdoor"].get("Tdb_C")
         ow = payload["outdoor"].get("w_kgperkg")
         oc = payload["outdoor"].get("co2_ppm")
@@ -3614,13 +3614,14 @@ class EPlusUtil:
             sT = Z["supply"].get("Tdb_C")
             sw = Z["supply"].get("w_kgperkg")
             sc = Z["supply"].get("co2_ppm")
+            m_sa = Z["supply"].get("m_dot_kgs")
 
-            # Build φ / y with whatever rows are available (T, w, CO2)
+            # Build φ rows based on available measurements
             rows = []
             y_vals = []
-            names = []  # for logging which rows are used
+            names = []
 
-            def _fin(x): 
+            def _fin(x):
                 try: return _np.isfinite(float(x))
                 except Exception: return False
 
@@ -3636,52 +3637,65 @@ class EPlusUtil:
 
             if not rows:
                 if do_log:
-                    self._log(1, f"[kf] {ts} {z}: skipped (need rows; have none)")
+                    self._log(1, f"[kf] {ts} {z}: skipped (missing T/w/CO₂ rows)")
                 continue
 
             phi = _np.asarray(rows, dtype=float)                 # (m,5)
             y   = _np.asarray(y_vals, dtype=float).reshape(-1,1) # (m,1)
 
             _ensure_zone(z)
-            mu_minus = d["_kf_mu"][z].reshape(5,1)               # (5,1)
-            S_minus  = d["_kf_Sigma"][z] + Sigma_P               # (5,5)
+            mu_prev = d["_kf_mu"][z].reshape(5,1)                # (5,1)
+            S_prev  = d["_kf_Sigma"][z]                          # (5,5)
 
-            # Innovation covariance with per-row R slice
-            m = phi.shape[0]
-            R = Sigma_R_full[:m, :m]
-            S_innov = phi @ S_minus @ phi.T + R
-            K = S_minus @ phi.T @ _np.linalg.pinv(S_innov)
+            # Carry-forward if no supply flow
+            do_update = (_fin(m_sa) and float(m_sa) > eps_m)
 
-            yhat_minus = phi @ mu_minus
-            mu_k = mu_minus + K @ (y - yhat_minus)               # (5,1)
-            S_k  = ( _np.eye(5) - K @ phi ) @ S_minus
+            if do_update:
+                # Predict
+                mu_minus = mu_prev
+                S_minus  = S_prev + Sigma_P
+                # Innovation
+                m = phi.shape[0]
+                R = Sigma_R_full[:m, :m]
+                S_innov = phi @ S_minus @ phi.T + R
+                K = S_minus @ phi.T @ _np.linalg.pinv(S_innov)
+                # Update
+                yhat_minus = phi @ mu_minus
+                mu_k = mu_minus + K @ (y - yhat_minus)
+                S_k  = ( _np.eye(5) - K @ phi ) @ S_minus
+                yhat_k = (phi @ mu_k).reshape(-1)
+                d["_kf_mu"][z]    = mu_k.reshape(-1)
+                d["_kf_Sigma"][z] = S_k
+                mode = "update"
+            else:
+                # Carry forward previous estimate; compute yhat from previous state
+                mu_k   = mu_prev
+                S_k    = S_prev
+                yhat_k = (phi @ mu_prev).reshape(-1)
+                d["_kf_mu"][z]    = mu_prev.reshape(-1)
+                d["_kf_Sigma"][z] = S_prev
+                mode = "carry"
 
-            d["_kf_mu"][z]    = mu_k.reshape(-1)
-            d["_kf_Sigma"][z] = S_k
-
-            yhat_k = (phi @ mu_k).reshape(-1)  # only for the rows we used
-
-            # Persist
+            # Insert into SQL
             _ins(ts, z, y.reshape(-1), yhat_k, d["_kf_mu"][z])
 
-            # Log (compact, only rows included)
+            # Logging
             if do_log:
-                # expand yhat to T/w/CO2 positions (None if row not used)
                 name_to_idx = {nm:i for i,nm in enumerate(names)}
-                def pick(arr, nm): 
+                def pick(arr, nm):
                     return arr[name_to_idx[nm]] if nm in name_to_idx else None
-                aT,bT,am,bw,bc = d["_kf_mu"][z]  # alpha_T, beta_T, alpha_m, beta_w, beta_c
-                self._log(1, "[kf] %s %s | rows=%s | "
-                            "yhat_T=%s yhat_w=%s yhat_c=%s | "
-                            "alpha_T=%s beta_T=%s alpha_m=%s beta_w=%s beta_c=%s" % (
-                    ts, z, ",".join(names) or "-",
+                aT,bT,am,bw,bc = d["_kf_mu"][z]
+                self._log(
+                    1,
+                    "[kf] %s %s | %s rows=%s | yhat_T=%s yhat_w=%s yhat_c=%s | "
+                    "alpha_T=%s beta_T=%s alpha_m=%s beta_w=%s beta_c=%s"
+                    % (ts, z, mode, ",".join(names) or "-",
                     (f"{pick(yhat_k,'T'):.3f}"   if pick(yhat_k,'T')   is not None else "NA"),
                     (f"{pick(yhat_k,'w'):.5f}"   if pick(yhat_k,'w')   is not None else "NA"),
                     (f"{pick(yhat_k,'CO2'):.1f}" if pick(yhat_k,'CO2') is not None else "NA"),
-                    f"{aT:.4f}", f"{bT:.4f}", f"{am:.4f}", f"{bw:.6f}", f"{bc:.2f}"
-                ))
-
-        # commit cheaply/often
+                    f"{aT:.4f}", f"{bT:.4f}", f"{am:.4f}", f"{bw:.6f}", f"{bc:.2f}")
+                )
+        # Commit frequently (cheap)
         try:
             d["_kf_sql_conn"].commit()
         except Exception:
