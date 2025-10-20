@@ -249,6 +249,142 @@ class EPlusUtil:
             out.append({"method_name": nm, "kwargs": dict(kw)})
         return out
 
+
+    # --- unified "after-HVAC-reporting" callback registry (with kwargs) ---
+
+    def _init_after_hvac_registry(self):
+        if not hasattr(self, "_after_hvac_enabled"):
+            self._after_hvac_enabled: bool = True
+            self._after_hvac_run_during_warmup: bool = False
+            self._after_hvac_names: list[str] = []
+            self._after_hvac_specs: list[tuple[callable, dict]] = []
+
+    def _after_hvac_dispatcher(self, s):
+        """Master dispatcher right AFTER HVAC reporting each system timestep (node data finalized)."""
+        ex = self.api.exchange
+        if not getattr(self, "_after_hvac_run_during_warmup", False) and ex.warmup_flag(s):
+            return
+        if not getattr(self, "_after_hvac_enabled", True):
+            return
+        # snapshot to avoid mutation during iteration
+        specs = list(getattr(self, "_after_hvac_specs", []))
+        for func, kw in specs:
+            try:
+                func(s, **kw)   # NOTE: bound method; signature def method(self, state, **kwargs)
+            except Exception as e:
+                try:
+                    nm = getattr(func, "__name__", "handler")
+                    self._log(1, f"[after-hvac] {nm} failed: {e}")
+                except Exception:
+                    pass
+
+    def _ensure_after_hvac_registered(self):
+        self._init_after_hvac_registry()
+        if not hasattr(self, "_extra_callbacks"):
+            self._extra_callbacks = []
+        pair = (self.api.runtime.callback_end_system_timestep_after_hvac_reporting, self._after_hvac_dispatcher)
+        if pair not in self._extra_callbacks:
+            self._extra_callbacks.append(pair)
+        if getattr(self, "state", None):
+            try:
+                self.api.runtime.callback_end_system_timestep_after_hvac_reporting(self.state, self._after_hvac_dispatcher)
+            except Exception:
+                pass
+
+    def register_after_hvac_reporting(self, methods, *, clear: bool = False,
+                                    enable: bool = True,
+                                    run_during_warmup: bool | None = None) -> list[str]:
+        """
+        Register handlers to run AFTER HVAC reporting (system timestep).
+
+        Accepts EITHER:
+        • Sequence[str]: ["probe_zone_air_and_supply", "my_logger"]
+        • Sequence[dict]: [{"method_name": "...", "key_wargs": {...}}]
+            (also accepts keys "kwargs", "key_kwargs", or "params" for the dict)
+
+        Each method is invoked as: method(self, state, **kwargs)
+        """
+        self._init_after_hvac_registry()
+        if clear:
+            self._after_hvac_names = []
+            self._after_hvac_specs = []
+
+        def _extract(method_item):
+            # returns (name: str, func: callable, kwargs: dict)
+            if isinstance(method_item, str):
+                name, kwargs = method_item.strip(), {}
+            elif isinstance(method_item, dict):
+                name = str(method_item.get("method_name") or method_item.get("name") or "").strip()
+                kwargs = (method_item.get("key_wargs")
+                        or method_item.get("kwargs")
+                        or method_item.get("key_kwargs")
+                        or method_item.get("params")
+                        or {})
+                if not isinstance(kwargs, dict):
+                    raise TypeError(f"kwargs for '{name}' must be a dict")
+            else:
+                raise TypeError(f"Unsupported method spec: {method_item!r}")
+
+            if not name:
+                raise ValueError(f"Invalid method name in spec: {method_item!r}")
+
+            func = getattr(self, name, None)
+            if func is None or not callable(func):
+                raise AttributeError(f"No callable '{name}' found on {self.__class__.__name__}")
+            return name, func, dict(kwargs)
+
+        # de-dupe by method name (last wins)
+        seen = {nm: (fn, kw) for nm, (fn, kw) in zip(self._after_hvac_names, self._after_hvac_specs)}
+        for item in methods:
+            nm, fn, kw = _extract(item)
+            seen[nm] = (fn, kw)
+
+        # rebuild ordered list: keep existing order, then append any new ones
+        ordered = []
+        for nm in self._after_hvac_names:
+            if nm in seen and nm not in ordered:
+                ordered.append(nm)
+        for item in methods:
+            nm = item if isinstance(item, str) else (item.get("method_name") or item.get("name"))
+            nm = str(nm).strip()
+            if nm and nm not in ordered:
+                ordered.append(nm)
+
+        self._after_hvac_names = ordered
+        self._after_hvac_specs = [seen[nm] for nm in ordered]
+
+        self._after_hvac_enabled = bool(enable)
+        if run_during_warmup is not None:
+            self._after_hvac_run_during_warmup = bool(run_during_warmup)
+
+        self._ensure_after_hvac_registered()
+        return list(self._after_hvac_names)
+
+    def unregister_after_hvac_reporting(self, method_names: list[str] | None = None) -> list[str]:
+        """Remove one/more handlers by name. If None, remove all."""
+        self._init_after_hvac_registry()
+        if method_names is None:
+            self._after_hvac_names, self._after_hvac_specs = [], []
+            return []
+        remove = {str(n).strip() for n in method_names}
+        # map current -> specs to preserve kwargs
+        current = {nm: spec for nm, spec in zip(self._after_hvac_names, self._after_hvac_specs)}
+        new_names = [nm for nm in self._after_hvac_names if nm not in remove]
+        self._after_hvac_names = new_names
+        self._after_hvac_specs = [current[nm] for nm in new_names]
+        return list(self._after_hvac_names)
+
+    def enable_after_hvac_reporting(self):  self._init_after_hvac_registry(); self._after_hvac_enabled = True
+    def disable_after_hvac_reporting(self): self._init_after_hvac_registry(); self._after_hvac_enabled = False
+
+    def list_after_hvac_reporting(self) -> list[dict]:
+        """Return the ordered list of registered handlers with kwargs."""
+        self._init_after_hvac_registry()
+        out = []
+        for nm, (fn, kw) in zip(self._after_hvac_names, self._after_hvac_specs):
+            out.append({"method_name": nm, "kwargs": dict(kw)})
+        return out
+
     # ---------- common SQL helpers ----------
     def _sql_minute_col(self, conn) -> str:
         """Detect the minute column name in the Time table ('Minute' vs 'Minutes')."""
