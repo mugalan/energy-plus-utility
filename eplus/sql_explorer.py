@@ -304,8 +304,7 @@ class EPlusSqlExplorer:
         # Include sizing/design days too
         df = util.list_sql_variables(name_like="System Node %", include_design_days=True)
         """
-        assert self.out_dir, "Call set_model(...) first."
-        sql_path = os.path.join(self.out_dir, "eplusout.sql")
+        sql_path = self.sql_path
         if not os.path.exists(sql_path):
             raise FileNotFoundError(f"{sql_path} not found. Run a simulation with Output:SQLite enabled.")
 
