@@ -3627,15 +3627,18 @@ class EPlusUtil:
 
         def _ins(ts, zone_name: str, names, y_vec, yhat_vec, mu_vec):
             """
-            Robust insert using named parameters; supports partial rows.
-            `names` is a list like ['T'] or ['T','w'] or ['T','w','CO2'].
+            Robust insert using labels. `names` is a list like ['T'] or ['T','w'] or
+            ['T','w','CO2']. Missing components are written as NULL.
             """
-            def _get(names, vec, nm):
+            import sqlite3
+
+            # map helper: label -> numeric (or None)
+            def _get(_names, _vec, lbl):
                 try:
-                    i = names.index(nm)
-                    return _to_num(vec[i])
+                    i = _names.index(lbl)
+                    return _to_num(_vec[i])
                 except Exception:
-                    return None  # will write NULL
+                    return None
 
             row = {
                 "ts":      _to_iso_ts(ts),
@@ -3656,23 +3659,32 @@ class EPlusUtil:
                 "beta_c":  _to_num(mu_vec[4]),
             }
 
-            d["_kf_sql_cur"].execute(
-                f"""INSERT INTO {table_name}
-                    (Timestamp, Zone,
-                    y_T, y_w, y_c,
-                    yhat_T, yhat_w, yhat_c,
-                    alpha_T, beta_T, alpha_m, beta_w, beta_c)
+            sql = f"""
+                INSERT INTO {table_name}
+                (Timestamp, Zone,
+                y_T, y_w, y_c,
+                yhat_T, yhat_w, yhat_c,
+                alpha_T, beta_T, alpha_m, beta_w, beta_c)
                 VALUES
-                    (:ts, :zone,
-                    :y_T, :y_w, :y_c,
-                    :yhat_T, :yhat_w, :yhat_c,
-                    :alpha_T, :beta_T, :alpha_m, :beta_w, :beta_c)
-                """,
-                row
-            )
-            d["_kf_inserts"] += 1
-            if d["_kf_inserts"] % commit_every == 0:
-                d["_kf_sql_conn"].commit()
+                (:ts, :zone,
+                :y_T, :y_w, :y_c,
+                :yhat_T, :yhat_w, :yhat_c,
+                :alpha_T, :beta_T, :alpha_m, :beta_w, :beta_c)
+            """
+
+            try:
+                d["_kf_sql_cur"].execute(sql, row)
+                d["_kf_inserts"] += 1
+                if d["_kf_inserts"] % commit_every == 0:
+                    d["_kf_sql_conn"].commit()
+            except sqlite3.DatabaseError as e:
+                # Do not attempt recovery; just log once per tick to avoid spam
+                if not d.get("_kf_sql_last_err_logged"):
+                    try:
+                        self._log(1, f"[kf-sql] insert failed: {e}")
+                    except Exception:
+                        pass
+                    d["_kf_sql_last_err_logged"] = True
 
         def _ensure_zone(z):
             if z not in d["_kf_mu"]:
