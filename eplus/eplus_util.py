@@ -3498,19 +3498,20 @@ class EPlusUtil:
 
     def probe_zone_air_and_supply_with_kf(self, s, **opts):
         """
-        Drop-in probe + Kalman filter + SQL persistence + (now) logging.
+        Probe + Kalman filter + SQL persistence (no extra API reads).
+        Skips zones that look like plenums by default.
 
-        Uses the runtime probe (zone/supply/outdoor) to build:
-        y_k = [Tz*, w_z*, c_z*]^T
-        phi_k rows:
-            [ (To - Tsa), 1, 0, 0, 0 ]
-            [ 0, 0, (wo - wsa), 1, 0 ]
-            [ 0, 0, (co - csa), 0, 1 ]
-        State: beta_k = [alpha_T, beta_T, alpha_m, beta_w, beta_c]^T
-
-        Stores per-zone rows into eplusout.sql table <kf_sql_table>.
+        Options (in addition to your probe kwargs):
+        kf_sigma_P_diag     : iterable[5]   default [1e-6, 1e-3, 1e-6, 1e-6, 1e-4]
+        kf_sigma_R_diag     : iterable[3]   default [0.2**2, (2e-4)**2, 30.0**2]
+        kf_init_mu          : iterable[5]   default [0.0, 20.0, 0.0, 0.008, 400.0]
+        kf_init_cov_diag    : iterable[5]   default [1.0, 25.0, 1e0, 1e-3, 1e3]
+        kf_sql_table        : str           default "KalmanEstimates"
+        kf_sql_commit_every : int           default 200
+        kf_zones            : list[str] | None  # if given, only these zones
+        kf_exclude_patterns : tuple[str,...]    # default ("PLENUM",)
+        kf_log              : bool          default True (logs yhat + state per update)
         """
-
         ex = self.api.exchange
         if ex.warmup_flag(s):
             return
@@ -3518,33 +3519,29 @@ class EPlusUtil:
         import os, sqlite3
         import numpy as _np
 
-        # ---- run your working probe (pass through non-KF opts only) ----
-        payload = self.probe_zone_air_and_supply(s, **{k: v for k, v in opts.items() if k not in {
+        # ---- run your working probe unchanged (uses only zone/supply/outdoor already) ----
+        probe_kwargs = {k:v for k,v in opts.items() if k not in {
             "kf_sigma_P_diag","kf_sigma_R_diag","kf_init_mu","kf_init_cov_diag",
-            "kf_sql_table","kf_sql_commit_every",
-            "kf_log_every_minutes","kf_log_top_n","kf_log_include_phi","kf_log_precision"
-        }})
+            "kf_sql_table","kf_sql_commit_every","kf_zones","kf_exclude_patterns","kf_log"}}
+        payload = self.probe_zone_air_and_supply(s, **probe_kwargs)
         if not payload or "zones" not in payload:
             return payload
 
         d = self.__dict__
 
-        # ---- KF config (defaults can be overridden via **opts) ----
-        Sigma_P_diag = _np.asarray(opts.get("kf_sigma_P_diag", [1e-6, 1e-3, 1e-6, 1e-6, 1e-4]), dtype=float)  # 5
-        Sigma_R_diag = _np.asarray(opts.get("kf_sigma_R_diag", [0.2**2, 2e-4**2, 30.0**2]), dtype=float)       # 3
-        mu0          = _np.asarray(opts.get("kf_init_mu",      [0.0, 20.0, 0.0, 0.008, 400.0]), dtype=float)   # 5
-        S0_diag      = _np.asarray(opts.get("kf_init_cov_diag",[1.0, 25.0, 1.0, 1e-3, 1e3]), dtype=float)     # 5
+        # ---- KF config ----
+        Sigma_P_diag = _np.asarray(opts.get("kf_sigma_P_diag", [1e-6, 1e-3, 1e-6, 1e-6, 1e-4]), dtype=float)
+        Sigma_R_diag = _np.asarray(opts.get("kf_sigma_R_diag", [0.2**2, (2e-4)**2, 30.0**2]), dtype=float)
+        mu0          = _np.asarray(opts.get("kf_init_mu",      [0.0, 20.0, 0.0, 0.008, 400.0]), dtype=float)
+        S0_diag      = _np.asarray(opts.get("kf_init_cov_diag",[1.0, 25.0, 1.0, 1e-3, 1e3]), dtype=float)
         table_name   = str(opts.get("kf_sql_table", "KalmanEstimates"))
         commit_every = int(opts.get("kf_sql_commit_every", 200))
-
-        # ---- Logging options ----
-        kf_log_every = opts.get("kf_log_every_minutes", 1)
-        kf_log_top_n = int(opts.get("kf_log_top_n", 2))
-        kf_log_phi   = bool(opts.get("kf_log_include_phi", False))
-        kf_prec      = int(opts.get("kf_log_precision", 3))
+        kf_zones     = opts.get("kf_zones", None)
+        excl_pats    = tuple(opts.get("kf_exclude_patterns", ("PLENUM",)))
+        do_log       = bool(opts.get("kf_log", True))
 
         Sigma_P = _np.diag(Sigma_P_diag)
-        Sigma_R = _np.diag(Sigma_R_diag)
+        Sigma_R_full = _np.diag(Sigma_R_diag)  # for slicing per active rows
 
         # ---- Per-state init (per EP state & per zone) ----
         if d.get("_kf_state_id") != id(self.state):
@@ -3552,9 +3549,7 @@ class EPlusUtil:
             d["_kf_mu"]    = {}  # zone -> (5,)
             d["_kf_Sigma"] = {}  # zone -> (5,5)
             d["_kf_inserts"] = 0
-            d["_kf_last_log_ts"] = None
 
-            # open/create SQL and table once
             assert self.out_dir, "set_model(...) first so out_dir is available."
             sql_path = os.path.join(self.out_dir, "eplusout.sql")
             conn = sqlite3.connect(sql_path, timeout=30.0)
@@ -3572,7 +3567,6 @@ class EPlusUtil:
             d["_kf_sql_conn"] = conn
             d["_kf_sql_cur"]  = cur
 
-        # ---- helpers ----
         def _ins(ts, z, y, yhat, mu):
             cur = d["_kf_sql_cur"]
             cur.execute(f"""
@@ -3580,9 +3574,13 @@ class EPlusUtil:
                 (Timestamp, Zone, y_T, y_w, y_c, yhat_T, yhat_w, yhat_c,
                 alpha_T, beta_T, alpha_m, beta_w, beta_c)
                 VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)
-            """, (ts, z, float(y[0]), float(y[1]), float(y[2]),
-                float(yhat[0]), float(yhat[1]), float(yhat[2]),
-                float(mu[0]), float(mu[1]), float(mu[2]), float(mu[3]), float(mu[4])))
+            """, (ts, z, float(y[0]) if len(y)>0 else None,
+                    float(y[1]) if len(y)>1 else None,
+                    float(y[2]) if len(y)>2 else None,
+                    float(yhat[0]) if len(yhat)>0 else None,
+                    float(yhat[1]) if len(yhat)>1 else None,
+                    float(yhat[2]) if len(yhat)>2 else None,
+                    float(mu[0]), float(mu[1]), float(mu[2]), float(mu[3]), float(mu[4])))
             d["_kf_inserts"] += 1
             if d["_kf_inserts"] % commit_every == 0:
                 d["_kf_sql_conn"].commit()
@@ -3592,105 +3590,98 @@ class EPlusUtil:
                 d["_kf_mu"][z]    = mu0.copy()
                 d["_kf_Sigma"][z] = _np.diag(S0_diag)
 
-        def F(x, suf=""):
-            return f"{x:.{kf_prec}f}{suf}" if (x == x) else "NA"
+        def _is_excluded(zone_name: str) -> bool:
+            zup = str(zone_name).upper()
+            return any(p in zup for p in excl_pats)
 
-        # ---- get site values (used for φ deltas) ----
-        ts = payload["timestamp"]
+        # zone list to process (filter out plenums, unless user passed explicit list)
+        if kf_zones:
+            zones_use = [z for z in kf_zones if z in payload["zones"]]
+        else:
+            zones_use = [z for z in payload["zones"].keys() if not _is_excluded(z)]
+
+        ts = str(payload["timestamp"])
         oT = payload["outdoor"].get("Tdb_C")
         ow = payload["outdoor"].get("w_kgperkg")
         oc = payload["outdoor"].get("co2_ppm")
 
-        # pick zones to log this tick (first N alphabetical)
-        zones_all = sorted(payload["zones"].keys())
-        zones_to_log = set(zones_all[:max(1, kf_log_top_n)])
+        for z in zones_use:
+            Z  = payload["zones"][z]
+            yT = Z["air"].get("Tdb_C")
+            yw = Z["air"].get("w_kgperkg")
+            yc = Z["air"].get("co2_ppm")
 
-        # ---- iterate zones: build y, φ, do KF update, store ----
-        for z, Z in payload["zones"].items():
-            # Observations y_k (zone air)
-            yT = Z["air"]["Tdb_C"]
-            yw = Z["air"]["w_kgperkg"]
-            yc = Z["air"]["co2_ppm"]
+            sT = Z["supply"].get("Tdb_C")
+            sw = Z["supply"].get("w_kgperkg")
+            sc = Z["supply"].get("co2_ppm")
 
-            # Supply (aggregated) for that zone
-            sT = Z["supply"]["Tdb_C"]
-            sw = Z["supply"]["w_kgperkg"]
-            sc = Z["supply"]["co2_ppm"]
+            # Build φ / y with whatever rows are available (T, w, CO2)
+            rows = []
+            y_vals = []
+            names = []  # for logging which rows are used
 
-            vals = [oT, ow, oc, sT, sw, sc, yT, yw, yc]
-            if any((_np.isnan(v) or v is None) for v in vals):
-                # Optional: log skip
-                if (kf_log_every is not None) and (z in zones_to_log):
-                    try:
-                        N = max(1, int(ex.num_time_steps_in_hour(s)))
-                        minute = int(round((ex.zone_time_step_number(s) - 1) * (60 / N)))
-                        if (kf_log_every is not None) and (minute % int(kf_log_every) == 0) and (d.get("_kf_last_log_ts") != ts):
-                            d["_kf_last_log_ts"] = ts
-                            self._log(1, f"[kf] {ts} {z}: skipped (missing data to build φ or y)")
-                    except Exception:
-                        pass
+            def _fin(x): 
+                try: return _np.isfinite(float(x))
+                except Exception: return False
+
+            if _fin(yT) and _fin(oT) and _fin(sT):
+                rows.append([ (oT - sT), 1.0, 0.0, 0.0, 0.0 ])
+                y_vals.append(float(yT)); names.append("T")
+            if _fin(yw) and _fin(ow) and _fin(sw):
+                rows.append([ 0.0, 0.0, (ow - sw), 1.0, 0.0 ])
+                y_vals.append(float(yw)); names.append("w")
+            if _fin(yc) and _fin(oc) and _fin(sc):
+                rows.append([ 0.0, 0.0, (oc - sc), 0.0, 1.0 ])
+                y_vals.append(float(yc)); names.append("CO2")
+
+            if not rows:
+                if do_log:
+                    self._log(1, f"[kf] {ts} {z}: skipped (need rows; have none)")
                 continue
 
-            # Build φ_k (3x5)
-            phi = _np.zeros((3, 5), dtype=float)
-            phi[0,0] = (oT - sT); phi[0,1] = 1.0
-            phi[1,2] = (ow - sw); phi[1,3] = 1.0
-            phi[2,2] = (oc - sc); phi[2,4] = 1.0
+            phi = _np.asarray(rows, dtype=float)                 # (m,5)
+            y   = _np.asarray(y_vals, dtype=float).reshape(-1,1) # (m,1)
 
-            y = _np.array([yT, yw, yc], dtype=float)
-
-            # Ensure per-zone state
             _ensure_zone(z)
-            mu_prev = d["_kf_mu"][z]
-            S_prev  = d["_kf_Sigma"][z]
+            mu_minus = d["_kf_mu"][z].reshape(5,1)               # (5,1)
+            S_minus  = d["_kf_Sigma"][z] + Sigma_P               # (5,5)
 
-            # Predict
-            mu_minus = mu_prev
-            S_minus  = S_prev + Sigma_P
-
-            # Gain
-            S_innov = phi @ S_minus @ phi.T + Sigma_R
+            # Innovation covariance with per-row R slice
+            m = phi.shape[0]
+            R = Sigma_R_full[:m, :m]
+            S_innov = phi @ S_minus @ phi.T + R
             K = S_minus @ phi.T @ _np.linalg.pinv(S_innov)
 
-            # Update
             yhat_minus = phi @ mu_minus
-            mu_k = mu_minus + K @ (y - yhat_minus)
-            S_k  = (_np.eye(5) - K @ phi) @ S_minus
+            mu_k = mu_minus + K @ (y - yhat_minus)               # (5,1)
+            S_k  = ( _np.eye(5) - K @ phi ) @ S_minus
 
-            d["_kf_mu"][z]    = _np.asarray(mu_k).reshape(-1)
-            d["_kf_Sigma"][z] = _np.asarray(S_k)
+            d["_kf_mu"][z]    = mu_k.reshape(-1)
+            d["_kf_Sigma"][z] = S_k
 
-            # Current estimate of y
-            yhat_k = phi @ mu_k
+            yhat_k = (phi @ mu_k).reshape(-1)  # only for the rows we used
 
-            # Insert into SQL
-            _ins(str(ts), z, y, yhat_k, mu_k)
+            # Persist
+            _ins(ts, z, y.reshape(-1), yhat_k, d["_kf_mu"][z])
 
-            # ---------- Logging (throttled) ----------
-            if kf_log_every is not None and z in zones_to_log:
-                try:
-                    N = max(1, int(ex.num_time_steps_in_hour(s)))
-                    minute = int(round((ex.zone_time_step_number(s) - 1) * (60 / N)))
-                    if (minute % int(kf_log_every) == 0) and (d.get("_kf_last_log_ts") != ts):
-                        d["_kf_last_log_ts"] = ts
-                        eT = (y[0] - yhat_k[0]); ew = (y[1] - yhat_k[1]); ec = (y[2] - yhat_k[2])
+            # Log (compact, only rows included)
+            if do_log:
+                # expand yhat to T/w/CO2 positions (None if row not used)
+                name_to_idx = {nm:i for i,nm in enumerate(names)}
+                def pick(arr, nm): 
+                    return arr[name_to_idx[nm]] if nm in name_to_idx else None
+                aT,bT,am,bw,bc = d["_kf_mu"][z]  # alpha_T, beta_T, alpha_m, beta_w, beta_c
+                self._log(1, "[kf] %s %s | rows=%s | "
+                            "yhat_T=%s yhat_w=%s yhat_c=%s | "
+                            "alpha_T=%s beta_T=%s alpha_m=%s beta_w=%s beta_c=%s" % (
+                    ts, z, ",".join(names) or "-",
+                    (f"{pick(yhat_k,'T'):.3f}"   if pick(yhat_k,'T')   is not None else "NA"),
+                    (f"{pick(yhat_k,'w'):.5f}"   if pick(yhat_k,'w')   is not None else "NA"),
+                    (f"{pick(yhat_k,'CO2'):.1f}" if pick(yhat_k,'CO2') is not None else "NA"),
+                    f"{aT:.4f}", f"{bT:.4f}", f"{am:.4f}", f"{bw:.6f}", f"{bc:.2f}"
+                ))
 
-                        # explicit, parse-friendly names you asked for:
-                        msg = (
-                            f"[kf] {ts} {z} | "
-                            f"y_T={F(y[0],'C')}, y_w={F(y[1])}, y_c={F(y[2],'ppm')} | "
-                            f"yhat_T={F(yhat_k[0],'C')}, yhat_w={F(yhat_k[1])}, yhat_c={F(yhat_k[2],'ppm')} | "
-                            f"alpha_T={F(mu_k[0])}, beta_T={F(mu_k[1])}, alpha_m={F(mu_k[2])}, "
-                            f"beta_w={F(mu_k[3])}, beta_c={F(mu_k[4])} | "
-                            f"err_T={F(eT)}, err_w={F(ew)}, err_c={F(ec)}"
-                        )
-                        if kf_log_phi:
-                            msg += f" | phi_dT={F(oT - sT)}, phi_dW={F(ow - sw)}, phi_dC={F(oc - sc)}"
-                        self._log(1, msg)
-                except Exception:
-                    pass
-
-        # Commit often (cheap); also call _kf_sql_conn.commit() at end of sim if you want.
+        # commit cheaply/often
         try:
             d["_kf_sql_conn"].commit()
         except Exception:
