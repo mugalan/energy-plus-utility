@@ -3139,64 +3139,101 @@ class EPlusUtil:
         Prints at a configurable interval and returns a dict snapshot.
 
         Kwargs:
-        log_every_minutes: int | None = 1  (1 => each timestep; None => no prints)
+        log_every_minutes: int | None = 1   # 1 => each timestep; None => no prints
         precision: int = 3
         """
         ex = self.api.exchange
         if ex.warmup_flag(s):
             return
 
+        import math
         import numpy as _np
 
         d = self.__dict__
         log_every = opts.get("log_every_minutes", 1)
         prec = int(opts.get("precision", 3))
 
-        # ---------- one-time setup per state ----------
-        if d.get("_probe_state_id") != id(self.state):
-            d["_probe_state_id"] = id(self.state)
+        # --- tiny psychro helper: w from T[°C], RH[%], P[Pa] (Tetens)
+        def _w_from_T_RH_P(Tc, RH_pct, P_pa):
+            if not (_np.isfinite(Tc) and _np.isfinite(RH_pct) and _np.isfinite(P_pa) and P_pa > 1000.0):
+                return _np.nan
+            # Tetens saturation pressure (Pa), adequate for runtime display
+            psat = 610.94 * math.exp(17.625 * Tc / (Tc + 243.04))
+            pw = max(0.0, min(1.0, RH_pct / 100.0)) * psat
+            denom = max(1.0, P_pa - pw)
+            return 0.62198 * pw / denom  # kg/kg dry air
 
-            # Node discovery (single quick SQL pass)
+        # ---------- one-time REQUESTS per state (no handle resolution yet) ----------
+        if d.get("_probe_req_state_id") != id(self.state):
+            d["_probe_req_state_id"] = id(self.state)
+
+            # Discover inlet nodes via SQL once (fast path)
             z2nodes = self._discover_zone_inlet_nodes_from_sql()
             if not z2nodes:
-                # fallback: heuristic names if discovery yields nothing
                 zones = self.list_zone_names(preferred_sources=("sql","api","idf"))
                 z2nodes = {z: [f"{z} IN NODE", f"{z} ATU IN NODE"] for z in zones}
             d["_probe_zone_nodes"] = z2nodes
 
-            # Request variables (once). If a var doesn't exist, handle will be -1 and ignored.
+            # Request ZONE variables (use correct names)
             for z in z2nodes:
-                for nm in ("Zone Mean Air Temperature", "Zone Mean Air Humidity Ratio", "Zone Air CO2 Concentration"):
+                for nm in ("Zone Mean Air Temperature", "Zone Air Humidity Ratio", "Zone Air CO2 Concentration"):
                     try: ex.request_variable(s, nm, z)
                     except Exception: pass
-            for nm in ("Site Outdoor Air Drybulb Temperature",
-                    "Site Outdoor Air Humidity Ratio",
-                    "Site Outdoor Air CO2 Concentration"):
+
+            # Request SITE variables (with fallbacks to compute w)
+            for nm in (
+                "Site Outdoor Air Drybulb Temperature",
+                "Site Outdoor Air Humidity Ratio",
+                "Site Outdoor Air Relative Humidity",
+                "Site Outdoor Air Barometric Pressure",
+                "Site Outdoor Air CO2 Concentration",
+            ):
                 try: ex.request_variable(s, nm, "Environment")
                 except Exception: pass
-            node_vars = ("System Node Mass Flow Rate", "System Node Temperature",
-                        "System Node Humidity Ratio", "System Node CO2 Concentration")
+
+            # Request NODE variables (and RH as fallback for w)
+            node_vars = (
+                "System Node Mass Flow Rate",
+                "System Node Temperature",
+                "System Node Humidity Ratio",       # may not exist on all nodes
+                "System Node Relative Humidity",    # fallback to compute w
+                "System Node CO2 Concentration",    # may not exist
+            )
             for nodes in z2nodes.values():
                 for n in nodes:
                     for nm in node_vars:
                         try: ex.request_variable(s, nm, n)
                         except Exception: pass
 
-            # Resolve handles ONCE and pre-build aligned lists for fast ticking
+            # mark: handles not resolved yet
+            d["_probe_handles_ready"] = False
+
+            # CO2 schedule fallback info
+            d["_probe_use_co2_sched"] = getattr(self, "_co2_outdoor_sched_handle", -1) != -1
+
+        # ---------- resolve HANDLES once when data are fully ready ----------
+        if not d.get("_probe_handles_ready", False):
+            if not ex.api_data_fully_ready(s):
+                return  # wait; handles not reliable yet
+
             def H(nm, key):
                 try: return ex.get_variable_handle(s, nm, key)
                 except Exception: return -1
 
+            z2nodes = d["_probe_zone_nodes"]
             zones = list(z2nodes.keys())
-            d["_probe_h_zone_T"]   = {z: H("Zone Mean Air Temperature", z)    for z in zones}
-            d["_probe_h_zone_w"]   = {z: H("Zone Mean Air Humidity Ratio", z) for z in zones}
-            d["_probe_h_zone_CO2"] = {z: H("Zone Air CO2 Concentration", z)   for z in zones}
 
-            d["_probe_h_site_T"]   = H("Site Outdoor Air Drybulb Temperature", "Environment")
-            d["_probe_h_site_w"]   = H("Site Outdoor Air Humidity Ratio",      "Environment")
-            d["_probe_h_site_CO2"] = H("Site Outdoor Air CO2 Concentration",   "Environment")
+            d["_probe_h_zone_T"]   = {z: H("Zone Mean Air Temperature", z)   for z in zones}
+            d["_probe_h_zone_w"]   = {z: H("Zone Air Humidity Ratio",   z)   for z in zones}
+            d["_probe_h_zone_CO2"] = {z: H("Zone Air CO2 Concentration", z)  for z in zones}
 
-            # Per-zone aligned handle arrays: [(m_h, T_h, w_h, CO2_h), ...]
+            d["_probe_h_site_T"]   = H("Site Outdoor Air Drybulb Temperature",   "Environment")
+            d["_probe_h_site_w"]   = H("Site Outdoor Air Humidity Ratio",        "Environment")
+            d["_probe_h_site_RH"]  = H("Site Outdoor Air Relative Humidity",     "Environment")
+            d["_probe_h_site_P"]   = H("Site Outdoor Air Barometric Pressure",   "Environment")
+            d["_probe_h_site_CO2"] = H("Site Outdoor Air CO2 Concentration",     "Environment")
+
+            # Per-zone node handle tuples (m, T, w, RH, CO2)
             znode_handles = {}
             for z, nodes in z2nodes.items():
                 tuples = []
@@ -3205,36 +3242,43 @@ class EPlusUtil:
                         H("System Node Mass Flow Rate",    n),
                         H("System Node Temperature",       n),
                         H("System Node Humidity Ratio",    n),
+                        H("System Node Relative Humidity", n),
                         H("System Node CO2 Concentration", n),
                     ))
                 znode_handles[z] = tuples
             d["_probe_znode_handles"] = znode_handles
 
-            # Allow fallback to outdoor CO2 schedule if site var is absent
-            d["_probe_use_co2_sched"] = getattr(self, "_co2_outdoor_sched_handle", -1) != -1
-
-            # one-shot debug
+            # debug once
             for z, tuples in znode_handles.items():
-                bits = []
-                for (hm, hT, hw, hc), nname in zip(tuples, z2nodes[z]):
-                    bits.append(f"{nname}: m={'ok' if hm!=-1 else 'NA'}, "
-                                f"T={'ok' if hT!=-1 else 'NA'}, "
-                                f"w={'ok' if hw!=-1 else 'NA'}, "
-                                f"CO2={'ok' if hc!=-1 else 'NA'}")
-                self._log(1, f"[probe] {z} inlet nodes → " + ("; ".join(bits) if bits else "none"))
+                parts = []
+                for (hm, hT, hw, hRH, hC), nname in zip(tuples, z2nodes[z]):
+                    parts.append(
+                        f"{nname}: m={'ok' if hm!=-1 else 'NA'}, "
+                        f"T={'ok' if hT!=-1 else 'NA'}, "
+                        f"w={'ok' if hw!=-1 else ('rh' if hRH!=-1 else 'NA')}, "
+                        f"CO2={'ok' if hC!=-1 else 'NA'}"
+                    )
+                self._log(1, f"[probe] {z} inlet nodes → " + ("; ".join(parts) if parts else "none"))
 
-        # ---------- fast tick ----------
-        def val(h):
+            d["_probe_handles_ready"] = True
+            # proceed to read this same tick
+
+        # ---------- fast READ path ----------
+        def v(h):
             if h == -1: return _np.nan
             try: return float(ex.get_variable_value(s, h))
             except Exception: return _np.nan
 
         ts = self._occ_current_timestamp(s)
 
-        # Outdoor
-        oT = val(d["_probe_h_site_T"])
-        ow = val(d["_probe_h_site_w"])
-        oC = val(d["_probe_h_site_CO2"])
+        # Site/outdoor (compute w if direct var missing)
+        oT = v(d["_probe_h_site_T"])
+        ow = v(d["_probe_h_site_w"])
+        if ow != ow:
+            oRH = v(d["_probe_h_site_RH"])
+            oP  = v(d["_probe_h_site_P"])
+            ow  = _w_from_T_RH_P(oT, oRH, oP)
+        oC = v(d["_probe_h_site_CO2"])
         if (oC != oC) and d.get("_probe_use_co2_sched"):
             try: oC = float(ex.get_actuator_value(s, self._co2_outdoor_sched_handle))
             except Exception: pass
@@ -3243,21 +3287,30 @@ class EPlusUtil:
         # Zones
         zones_data = {}
         for z, tuples in d["_probe_znode_handles"].items():
-            zT = val(d["_probe_h_zone_T"].get(z, -1))
-            zw = val(d["_probe_h_zone_w"].get(z, -1))
-            zC = val(d["_probe_h_zone_CO2"].get(z, -1))
+            zT = v(d["_probe_h_zone_T"].get(z, -1))
+            zw = v(d["_probe_h_zone_w"].get(z, -1))  # this now uses 'Zone Air Humidity Ratio'
+            zC = v(d["_probe_h_zone_CO2"].get(z, -1))
 
             m_list = []
             T_list = []
             w_list = []
             C_list = []
-            for hm, hT, hw, hC in tuples:
-                m = val(hm)
+            # Use site P for node psychro fallback
+            P_site = v(d["_probe_h_site_P"])
+
+            for (hm, hT, hw, hRH, hC) in tuples:
+                m  = v(hm)
                 if m == m:  # only weight with valid m_dot
+                    Tn = v(hT)
+                    wn = v(hw)
+                    if wn != wn:  # compute from RH if needed
+                        RHn = v(hRH)
+                        wn  = _w_from_T_RH_P(Tn, RHn, P_site)
+                    Cn = v(hC)
                     m_list.append(m)
-                    T_list.append(val(hT))
-                    w_list.append(val(hw))
-                    C_list.append(val(hC))
+                    T_list.append(Tn)
+                    w_list.append(wn)
+                    C_list.append(Cn)
 
             m_sum = float(_np.nansum(m_list)) if m_list else _np.nan
             if m_list:
@@ -3271,14 +3324,14 @@ class EPlusUtil:
                 sT = sw = sC = _np.nan
 
             zones_data[z] = {
-                "air": {"Tdb_C": zT, "w_kgperkg": zw, "co2_ppm": zC},
-                "supply": {"m_dot_kgs": m_sum, "Tdb_C": sT, "w_kgperkg": sw, "co2_ppm": sC},
+                "air":     {"Tdb_C": zT, "w_kgperkg": zw, "co2_ppm": zC},
+                "supply":  {"m_dot_kgs": m_sum, "Tdb_C": sT, "w_kgperkg": sw, "co2_ppm": sC},
                 "inlet_nodes": list(self._probe_zone_nodes.get(z, [])),
             }
 
         payload = {"timestamp": ts, "outdoor": outdoor, "zones": zones_data}
 
-        # Printing (cheap): throttle by simulated minute & avoid duplicate ts prints
+        # prints
         if log_every is not None:
             try:
                 N = max(1, int(ex.num_time_steps_in_hour(s)))
