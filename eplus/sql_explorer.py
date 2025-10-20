@@ -270,3 +270,167 @@ class EPlusSqlExplorer:
             return df
         finally:
             conn.close()
+
+    def list_sql_variables(
+        self,
+        *,
+        name: str | None = None,          # exact variable name (e.g., "System Node Mass Flow Rate")
+        name_like: str | None = None,     # SQL LIKE pattern (e.g., "System Node %")
+        key: str | None = None,           # exact KeyValue (e.g., "SPACE1-1 In Node")
+        key_like: str | None = None,      # SQL LIKE pattern for KeyValue (e.g., "%In Node%")
+        reporting_freq: tuple[str, ...] | None = None,  # e.g., ("TimeStep","Zone Timestep")
+        include_design_days: bool = False,
+        is_meter: bool | None = False,    # None → both; False → variables only; True → meters only
+        limit: int | None = None
+    ) -> pd.DataFrame:
+        """
+        Return a DataFrame of what’s actually in eplusout.sql (from ReportData/ReportDataDictionary).
+
+        Columns: [Name, KeyValue, Units, ReportingFrequency, IsMeter, n_rows]
+
+        Examples:
+        # All system-node entries (any variable under "System Node ...")
+        df = util.list_sql_variables(name_like="System Node %")
+
+        # Where do we have "System Node Mass Flow Rate" and for which nodes?
+        df = util.list_sql_variables(name="System Node Mass Flow Rate")
+
+        # Narrow to node keys that look like SPACE1-1 "In Node"
+        df = util.list_sql_variables(name="System Node Mass Flow Rate", key_like="%SPACE1-1%In Node%")
+
+        # See all Zone variables that have rows (useful sanity check)
+        df = util.list_sql_variables(name_like="Zone %")
+
+        # Include sizing/design days too
+        df = util.list_sql_variables(name_like="System Node %", include_design_days=True)
+        """
+        assert self.out_dir, "Call set_model(...) first."
+        sql_path = os.path.join(self.out_dir, "eplusout.sql")
+        if not os.path.exists(sql_path):
+            raise FileNotFoundError(f"{sql_path} not found. Run a simulation with Output:SQLite enabled.")
+
+        # Build WHERE clauses
+        where = ["1=1"]
+        params: list = []
+
+        if is_meter is True:
+            where.append("(d.IsMeter = 1)")
+        elif is_meter is False:
+            where.append("(d.IsMeter = 0 OR d.IsMeter IS NULL)")
+
+        if name is not None:
+            where.append("d.Name = ?")
+            params.append(name)
+        elif name_like is not None:
+            where.append("UPPER(d.Name) LIKE UPPER(?)")
+            params.append(name_like)
+
+        if key is not None:
+            where.append("(d.KeyValue = ?)")
+            params.append(key)
+        elif key_like is not None:
+            where.append("(UPPER(COALESCE(d.KeyValue,'')) LIKE UPPER(?))")
+            params.append(key_like)
+
+        if reporting_freq:
+            # allow tolerant matches (LIKE %HOUR% etc.) similar to your helpers
+            rf_map = {
+                "TIMESTEP": ["%TIMESTEP%", "DETAILED"],
+                "HOURLY":   ["%HOUR%"],
+                "DAILY":    ["%DAY%"],
+                "MONTHLY":  ["%MONTH%"],
+                "RUNPERIOD":["%RUN%PERIOD%"],
+                "ZONE TIMESTEP": ["%ZONE%TIMESTEP%"],
+                "SYSTEM TIMESTEP": ["%SYSTEM%TIMESTEP%"],
+            }
+            sub_ors = []
+            for f in reporting_freq:
+                fkey = str(f).upper()
+                pats = rf_map.get(fkey, [fkey])
+                terms = []
+                for p in pats:
+                    if p.startswith("%"):
+                        terms.append("UPPER(d.ReportingFrequency) LIKE ?")
+                        params.append(p)
+                    else:
+                        terms.append("UPPER(d.ReportingFrequency) = ?")
+                        params.append(p)
+                sub_ors.append("(" + " OR ".join(terms) + ")")
+            if sub_ors:
+                where.append("(" + " OR ".join(sub_ors) + ")")
+
+        env_clause = "" if include_design_days else \
+            "AND (ep.EnvironmentName IS NULL OR ep.EnvironmentName NOT LIKE 'SizingPeriod:%')"
+
+        q = f"""
+            SELECT
+                d.Name,
+                COALESCE(d.KeyValue,'') AS KeyValue,
+                COALESCE(d.Units,'') AS Units,
+                COALESCE(d.ReportingFrequency,'') AS ReportingFrequency,
+                COALESCE(d.IsMeter, 0) AS IsMeter,
+                COUNT(*) AS n_rows
+            FROM ReportData r
+            JOIN ReportDataDictionary d
+                ON r.ReportDataDictionaryIndex = d.ReportDataDictionaryIndex
+            JOIN Time t ON r.TimeIndex = t.TimeIndex
+            LEFT JOIN EnvironmentPeriods ep
+                ON t.EnvironmentPeriodIndex = ep.EnvironmentPeriodIndex
+            WHERE {" AND ".join(where)}
+            {env_clause}
+            GROUP BY d.Name, d.KeyValue, d.Units, d.ReportingFrequency, d.IsMeter
+            ORDER BY n_rows DESC, d.Name, d.KeyValue
+        """
+
+        conn = sqlite3.connect(sql_path)
+        try:
+            df = pd.read_sql_query(q, conn, params=params)
+            if limit is not None and limit > 0:
+                df = df.head(int(limit))
+            return df
+        finally:
+            conn.close()
+
+
+    def list_sql_distinct_names(
+        self,
+        *,
+        name_like: str | None = None,
+        is_meter: bool | None = False
+    ) -> pd.DataFrame:
+        """
+        Quick list of distinct variable (or meter) names that actually have rows in SQL.
+
+        Example:
+        util.list_sql_distinct_names(name_like="System Node %")
+        """
+        assert self.out_dir, "Call set_model(...) first."
+        sql_path = os.path.join(self.out_dir, "eplusout.sql")
+        if not os.path.exists(sql_path):
+            raise FileNotFoundError(f"{sql_path} not found.")
+
+        where = ["1=1"]
+        params: list = []
+        if is_meter is True:
+            where.append("(d.IsMeter = 1)")
+        elif is_meter is False:
+            where.append("(d.IsMeter = 0 OR d.IsMeter IS NULL)")
+        if name_like:
+            where.append("UPPER(d.Name) LIKE UPPER(?)")
+            params.append(name_like)
+
+        q = f"""
+            SELECT d.Name, COUNT(*) AS n_rows
+            FROM ReportData r
+            JOIN ReportDataDictionary d
+                ON r.ReportDataDictionaryIndex = d.ReportDataDictionaryIndex
+            WHERE {" AND ".join(where)}
+            GROUP BY d.Name
+            ORDER BY n_rows DESC, d.Name
+        """
+
+        conn = sqlite3.connect(sql_path)
+        try:
+            return pd.read_sql_query(q, conn, params=params)
+        finally:
+            conn.close()
