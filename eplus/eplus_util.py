@@ -3625,21 +3625,29 @@ class EPlusUtil:
             except Exception:
                 return None
 
-        def _ins(ts, zone_name: str, y_vec, yhat_vec, mu_vec):
+        def _ins(ts, zone_name: str, names, y_vec, yhat_vec, mu_vec):
             """
-            Robust insert using named parameters; avoids column-order bugs and NaN writes.
+            Robust insert using named parameters; supports partial rows.
+            `names` is a list like ['T'] or ['T','w'] or ['T','w','CO2'].
             """
+            def _get(names, vec, nm):
+                try:
+                    i = names.index(nm)
+                    return _to_num(vec[i])
+                except Exception:
+                    return None  # will write NULL
+
             row = {
                 "ts":      _to_iso_ts(ts),
                 "zone":    str(zone_name),
 
-                "y_T":     _to_num(y_vec[0]),
-                "y_w":     _to_num(y_vec[1]),
-                "y_c":     _to_num(y_vec[2]),
+                "y_T":     _get(names, y_vec,   "T"),
+                "y_w":     _get(names, y_vec,   "w"),
+                "y_c":     _get(names, y_vec,   "CO2"),
 
-                "yhat_T":  _to_num(yhat_vec[0]),
-                "yhat_w":  _to_num(yhat_vec[1]),
-                "yhat_c":  _to_num(yhat_vec[2]),
+                "yhat_T":  _get(names, yhat_vec, "T"),
+                "yhat_w":  _get(names, yhat_vec, "w"),
+                "yhat_c":  _get(names, yhat_vec, "CO2"),
 
                 "alpha_T": _to_num(mu_vec[0]),
                 "beta_T":  _to_num(mu_vec[1]),
@@ -3650,10 +3658,14 @@ class EPlusUtil:
 
             d["_kf_sql_cur"].execute(
                 f"""INSERT INTO {table_name}
-                    (Timestamp, Zone, y_T, y_w, y_c, yhat_T, yhat_w, yhat_c,
+                    (Timestamp, Zone,
+                    y_T, y_w, y_c,
+                    yhat_T, yhat_w, yhat_c,
                     alpha_T, beta_T, alpha_m, beta_w, beta_c)
                 VALUES
-                    (:ts, :zone, :y_T, :y_w, :y_c, :yhat_T, :yhat_w, :yhat_c,
+                    (:ts, :zone,
+                    :y_T, :y_w, :y_c,
+                    :yhat_T, :yhat_w, :yhat_c,
                     :alpha_T, :beta_T, :alpha_m, :beta_w, :beta_c)
                 """,
                 row
@@ -3754,7 +3766,7 @@ class EPlusUtil:
                 mode = "carry"
 
             # Insert into SQL
-            # _ins(ts, z, y.reshape(-1), yhat_k, d["_kf_mu"][z])
+            _ins(ts, z, names, y.reshape(-1), yhat_k, d["_kf_mu"][z])
 
             # Logging
             if do_log:
