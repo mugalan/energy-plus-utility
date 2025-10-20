@@ -3055,43 +3055,42 @@ class EPlusUtil:
             except Exception:
                 pass
 
-
-    def get_zone_out_door_air_state(self, s, **opts):
+    def probe_zone_air_state(self, s, **opts):
         """
-        Snapshot zone + supply + outdoor air state each system timestep.
+        Snapshot zone+outdoor air state and zone supply (via System Node variables).
 
-        Zone air (from your available variables):
-        - Zone Mean Air Temperature   [C]
-        - Zone Air Relative Humidity  [%]  → used to compute w
-        - Zone Air CO2 Concentration  [ppm]
+        Zone (per zone key):
+        - Zone Mean Air Temperature [C]          (fallback: Zone Air Temperature)
+        - Zone Mean Air Humidity Ratio [kg/kg]   (fallback: Zone Air Humidity Ratio)
+        - Zone Air CO2 Concentration [ppm]
 
-        Outdoor (Environment):
+        Outdoor (Environment key):
         - Site Outdoor Air Drybulb Temperature [C]
-        - Site Outdoor Air Relative Humidity   [%]  → used to compute w
-        - (opt) Site Outdoor Air Barometric Pressure [Pa]; fallback 101325 Pa
-        - (opt) Outdoor CO2 from variable; else fallback to the actuated schedule created by prepare_run_with_co2()
+        - Site Outdoor Air Humidity Ratio [kg/kg] (fallback: compute from RH if needed)
+        - CO2 [ppm] via Site var if available else via your actuated schedule
 
-        Supply air (per Zone):
-        - Aggregated over *all* inlet nodes parsed from IDF (ZoneHVAC:EquipmentConnections → NodeList)
-        - System Node Mass Flow Rate           [kg/s] (summed)
-        - System Node Temperature              [C]    (ṁ-weighted)
-        - System Node Humidity Ratio           [kg/kg] (ṁ-weighted)
-        - System Node CO2 Concentration        [ppm]  (ṁ-weighted, if available)
+        Supply (aggregated over inlet node(s) discovered via IDF: ZoneHVAC:EquipmentConnections → NodeList):
+        - System Node Mass Flow Rate [kg/s]       (sum of inlet nodes)
+        - System Node Temperature [C]             (ṁ-weighted)
+        - System Node Humidity Ratio [kg/kg]      (ṁ-weighted)
+        - System Node CO2 Concentration [ppm]     (ṁ-weighted; only if available)
 
         Kwargs:
-        zones                : list[str] | None = None   # restrict to these zones (case-insensitive); None=all
+        zones                : list[str] | None = None   # restrict; None = all zones
         log_every_minutes    : int | None = 60           # 1 => every timestep; None => no prints
         precision            : int = 3
         include_units_in_log : bool = False
         print_missing_once   : bool = True
-        p_atm_default_pa     : float = 101325.0          # used if site baro pressure not available
+        p_atm_default_pa     : float = 101325.0          # used only if we must compute w from T/RH
 
-        Returns dict: {"timestamp", "outdoor": {...}, "zones": {zone: {"air": {...}, "supply": {...}}}}
-        Also stores the last snapshot on self._probe_last_snapshot
+        Returns: dict with keys {"timestamp","outdoor", "zones": {...}}
+        Stores the last snapshot on self._probe_last_snapshot.
         """
-        # skip during warmup
+        # Skip during warmup
         if self.api.exchange.warmup_flag(s):
             return
+
+        import os, re, pathlib, math
 
         d = self.__dict__
         zones_filter = {str(z).lower(): str(z) for z in (opts.get("zones") or [])}
@@ -3102,114 +3101,113 @@ class EPlusUtil:
         P_ATM_FALLBACK = float(opts.get("p_atm_default_pa", 101325.0))
 
         # ---------- helpers ----------
+        def _psat_pa(T_C: float) -> float:
+            # Magnus-Tetens over water
+            return 610.94 * math.exp(17.625 * float(T_C) / (float(T_C) + 243.04))
+
+        def _w_from_T_RH_P(T_C, RH_frac, P_Pa):
+            if T_C is None or RH_frac is None: return None
+            RH = max(0.0, min(1.0, float(RH_frac)))
+            Pw = RH * _psat_pa(float(T_C))
+            return 0.621945 * Pw / max(1e-6, (P_Pa - Pw))
+
+        def _request_and_handle(var_name: str, key: str):
+            """Ask E+ for a variable and fetch a handle; tolerant to retries."""
+            try:
+                h = self.api.exchange.get_variable_handle(s, var_name, key)
+                if h == -1:
+                    self.api.exchange.request_variable(s, var_name, key)
+                    h = self.api.exchange.get_variable_handle(s, var_name, key)
+                return h if h != -1 else -1
+            except Exception:
+                return -1
+
         def _val(h):
             try:
                 return float(self.api.exchange.get_variable_value(s, int(h))) if int(h) != -1 else None
             except Exception:
                 return None
 
-        def _psat_pa(T_C: float) -> float:
-            # Magnus-Tetens over water, typical E+ range
-            import math
-            return 610.94 * math.exp(17.625 * float(T_C) / (float(T_C) + 243.04))
-
-        def _w_from_T_RH_P(T_C, RH_frac, P_Pa) -> float | None:
-            if T_C is None or RH_frac is None:
-                return None
-            RH = max(0.0, min(1.0, float(RH_frac)))
-            try:
-                Pw = RH * _psat_pa(float(T_C))
-                return 0.621945 * Pw / max(1e-6, (P_Pa - Pw))
-            except Exception:
-                return None
-
-        # ---------- 1) One-time IDF parse: Zone → inlet node(s) ----------
+        # ---------- 1) Parse IDF once per file-change → Zone → inlet node(s) ----------
         need_parse = (
             d.get("_probe_idf_path") != (self.idf or "") or
             d.get("_probe_idf_mtime") != (os.path.getmtime(self.idf) if self.idf and os.path.exists(self.idf) else None)
         )
         if need_parse:
-            import re, pathlib
-            text = pathlib.Path(self.idf).read_text(errors="ignore")
-
-            # Clean comments
+            text = pathlib.Path(self.idf).read_text(errors="ignore") if (self.idf and os.path.exists(self.idf)) else ""
             text_nc = re.sub(r'!.*$', '', text, flags=re.MULTILINE)
 
-            # Parse NodeList: name -> [nodes...]
+            # NodeList name -> [node1, node2, ...]
             nodelists: dict[str, list[str]] = {}
             for m in re.finditer(r'(?is)^\s*NodeList\s*,\s*(?P<body>.*?);', text_nc, flags=re.MULTILINE):
-                body = m.group("body")
-                parts = [p.strip().strip('"').strip("'") for p in body.split(",")]
-                if not parts:
-                    continue
-                name = parts[0]
-                nodes = [p for p in parts[1:] if p]
-                nodelists[name] = nodes
+                parts = [p.strip().strip('"').strip("'") for p in m.group("body").split(",")]
+                if parts:
+                    nodelists[parts[0]] = [p for p in parts[1:] if p]
 
-            # Parse ZoneHVAC:EquipmentConnections → zone name & inlet node/nodelist name
+            # Zone → inlet node(s)
             z_to_inlets: dict[str, list[str]] = {}
             for m in re.finditer(r'(?is)^\s*ZoneHVAC\s*:\s*EquipmentConnections\s*,\s*(?P<body>.*?);', text_nc, flags=re.MULTILINE):
-                body = m.group("body")
-                # split, but keep order; many files keep field labels; we don't rely on them
-                parts = [p.strip().strip('"').strip("'") for p in body.split(",")]
-                if not parts:
-                    continue
+                parts = [p.strip().strip('"').strip("'") for p in m.group("body").split(",")]
+                if not parts: continue
                 zone_name = parts[0] if len(parts) > 0 else ""
-                inlet_field = parts[2] if len(parts) > 2 else ""  # Field 3 per IDD: "Zone Air Inlet Node or NodeList Name"
-                if not zone_name or not inlet_field:
-                    continue
-                if inlet_field in nodelists:
-                    z_to_inlets[zone_name] = list(nodelists[inlet_field])
-                else:
-                    z_to_inlets[zone_name] = [inlet_field]
+                inlet_field = parts[2] if len(parts) > 2 else ""  # Field 3: Zone Air Inlet Node or NodeList Name
+                if zone_name and inlet_field:
+                    if inlet_field in nodelists:
+                        z_to_inlets[zone_name] = list(nodelists[inlet_field])
+                    else:
+                        z_to_inlets[zone_name] = [inlet_field]
 
-            # store parse cache
             d["_probe_zone_inlet_nodes"] = z_to_inlets
             d["_probe_idf_path"] = self.idf or ""
             d["_probe_idf_mtime"] = os.path.getmtime(self.idf) if self.idf and os.path.exists(self.idf) else None
 
-        # ---------- 2) One-time handle resolution (per E+ state) ----------
-        need_handles = (d.get("_probe_state_id") != id(self.state) or
-                        not d.get("_probe_zone_handles") or
-                        not d.get("_probe_outdoor_handles") or
-                        not d.get("_probe_node_handles"))
+        # ---------- 2) Resolve handles once per E+ state ----------
+        need_handles = (
+            d.get("_probe_state_id") != id(self.state)
+            or not d.get("_probe_zone_handles")
+            or not d.get("_probe_outdoor_handles")
+            or not d.get("_probe_node_handles")
+        )
         if need_handles:
-            # zones (live from API if possible)
+            # Zones (live from API if possible)
             try:
                 zones_all = list(self.api.exchange.get_object_names(s, "Zone") or [])
             except Exception:
                 zones_all = self.list_zone_names(preferred_sources=("sql","api","idf"))
             zones = [z for z in zones_all if not zones_filter or z.lower() in zones_filter]
 
-            # --- zone air handles (use exact names you have) ---
+            # --- zone air handles (exact, per docs) ---
             zH: dict[str, dict] = {}
             for z in zones:
-                zl = z  # exact key required
-                h_T   = self.api.exchange.get_variable_handle(s, "Zone Mean Air Temperature", zl)
-                h_rh  = self.api.exchange.get_variable_handle(s, "Zone Air Relative Humidity", zl)
-                h_co2 = self.api.exchange.get_variable_handle(s, "Zone Air CO2 Concentration", zl)
+                # Prefer "Mean" (zone timestep); fallback to HVAC/system-timestep variants
+                h_T_mean = _request_and_handle("Zone Mean Air Temperature", z)
+                h_T_hvac = _request_and_handle("Zone Air Temperature", z) if h_T_mean == -1 else -1
+                h_w_mean = _request_and_handle("Zone Mean Air Humidity Ratio", z)
+                h_w_hvac = _request_and_handle("Zone Air Humidity Ratio", z) if h_w_mean == -1 else -1
+                h_co2    = _request_and_handle("Zone Air CO2 Concentration", z)
+
                 zH[z] = {
-                    "T":   h_T if h_T != -1 else -1,
-                    "RH":  h_rh if h_rh != -1 else -1,
-                    "CO2": h_co2 if h_co2 != -1 else -1,
+                    "T":   h_T_mean if h_T_mean != -1 else h_T_hvac,
+                    "w":   h_w_mean if h_w_mean != -1 else h_w_hvac,
+                    "CO2": h_co2,
                 }
 
-            # --- outdoor handles ---
+            # --- outdoor handles (Environment key) ---
             oH = {}
-            oH["T"]  = self.api.exchange.get_variable_handle(s, "Site Outdoor Air Drybulb Temperature", "Environment")
-            oH["RH"] = self.api.exchange.get_variable_handle(s, "Site Outdoor Air Relative Humidity",   "Environment")
-            h_p = self.api.exchange.get_variable_handle(s, "Site Outdoor Air Barometric Pressure", "Environment")
-            oH["P"] = h_p if h_p != -1 else -1
-            # outdoor CO2 variable name variants
-            for nm in ("Site Outdoor Air CO2 Concentration", "Outdoor Air CO2 Concentration"):
-                h = self.api.exchange.get_variable_handle(s, nm, "Environment")
-                if h != -1:
-                    oH["CO2"] = h
-                    break
-            else:
-                oH["CO2"] = -1
-            # schedule fallback prepared by prepare_run_with_co2()
+            oH["T"]  = _request_and_handle("Site Outdoor Air Drybulb Temperature", "Environment")
+            # We prefer direct humidity ratio if available; fallback to RH for computed w
+            oH["w"]  = _request_and_handle("Site Outdoor Air Humidity Ratio", "Environment")
+            oH["RH"] = _request_and_handle("Site Outdoor Air Relative Humidity", "Environment") if oH["w"] == -1 else -1
+            oH["P"]  = _request_and_handle("Site Outdoor Air Barometric Pressure", "Environment")
+            # Outdoor CO2 variable may not exist; fallback to actuated schedule prepared earlier
+            co2_names = ("Site Outdoor Air CO2 Concentration", "Outdoor Air CO2 Concentration")
+            h_co2_out = -1
+            for nm in co2_names:
+                h_co2_out = _request_and_handle(nm, "Environment")
+                if h_co2_out != -1: break
+            oH["CO2"] = h_co2_out
             if oH["CO2"] == -1 and getattr(self, "_co2_outdoor_schedule", None):
+                # resolve schedule actuator once
                 if d.get("_co2_outdoor_sched_handle", -1) == -1 or d.get("_co2_outdoor_sched_state_id") != id(self.state):
                     h_sched = -1
                     for typ in getattr(self, "_SCHEDULE_TYPES", ("Schedule:Compact","Schedule:Constant","Schedule:File","Schedule:Year")):
@@ -3224,26 +3222,25 @@ class EPlusUtil:
             else:
                 d["_probe_outdoor_co2_from_sched"] = False
 
-            # --- node handles (System Node ...), aggregated per zone ---
+            # --- node handles (System Node …) per zone inlet node(s) ---
             node_vars = {
-                "m":  "System Node Mass Flow Rate",
-                "T":  "System Node Temperature",
-                "w":  "System Node Humidity Ratio",
-                "CO2":"System Node CO2 Concentration",
+                "m":  ("System Node Mass Flow Rate",),
+                "T":  ("System Node Temperature",),
+                "w":  ("System Node Humidity Ratio",),
+                "CO2":("System Node CO2 Concentration","System Node Carbon Dioxide Concentration"),
             }
             z_to_nodes: dict[str, list[str]] = d.get("_probe_zone_inlet_nodes") or {}
-            nH: dict[str, dict] = {}  # per zone: node_name -> {var_name: handle}
+            nH: dict[str, dict] = {}
             for z in zones:
-                nodes = z_to_nodes.get(z, [])
                 per_node = {}
-                for node in nodes:
+                for node in (z_to_nodes.get(z, []) or []):
                     entry = {}
-                    for key, vname in node_vars.items():
-                        try:
-                            h = self.api.exchange.get_variable_handle(s, vname, node)
-                        except Exception:
-                            h = -1
-                        entry[key] = h if h != -1 else -1
+                    for key, vnames in node_vars.items():
+                        h = -1
+                        for vname in vnames:
+                            h = _request_and_handle(vname, node)
+                            if h != -1: break
+                        entry[key] = h
                     per_node[node] = entry
                 nH[z] = per_node
 
@@ -3253,90 +3250,75 @@ class EPlusUtil:
             d["_probe_missing_warned"] = set()
             d["_probe_state_id"] = id(self.state)
 
-        # ---------- 3) Read + compute ----------
-        zH = d["_probe_zone_handles"]
-        oH = d["_probe_outdoor_handles"]
-        nH = d["_probe_node_handles"]
+        # ---------- 3) Read + aggregate ----------
+        zH = d["_probe_zone_handles"]; oH = d["_probe_outdoor_handles"]; nH = d["_probe_node_handles"]
 
-        # timestamp aligned to interval start (matches your other helpers)
+        # time stamp aligned to start-of-interval (your convention)
         ts = self._occ_current_timestamp(s)
 
         # Outdoor
         T_out  = _val(oH.get("T", -1))
-        RH_out = _val(oH.get("RH", -1))
-        P_out  = _val(oH.get("P", -1)) or P_ATM_FALLBACK
-        RH_out_frac = (RH_out / 100.0) if RH_out is not None else None
-        w_out = _w_from_T_RH_P(T_out, RH_out_frac, P_out)
-
+        w_out  = _val(oH.get("w", -1))
+        if w_out is None:
+            RH_out = _val(oH.get("RH", -1))
+            P_out  = _val(oH.get("P", -1)) or P_ATM_FALLBACK
+            w_out  = _w_from_T_RH_P(T_out, (RH_out/100.0) if RH_out is not None else None, P_out)
         co2_out = _val(oH.get("CO2", -1))
         if co2_out is None and d.get("_probe_outdoor_co2_from_sched", False):
             try:
                 hs = int(d.get("_co2_outdoor_sched_handle", -1))
-                if hs != -1:
-                    co2_out = float(self.api.exchange.get_actuator_value(s, hs))
+                if hs != -1: co2_out = float(self.api.exchange.get_actuator_value(s, hs))
             except Exception:
                 pass
 
-        data = {
-            "timestamp": ts,
-            "outdoor": {"Tdb_C": T_out, "w_kgperkg": w_out, "co2_ppm": co2_out},
-            "zones": {}
-        }
+        data = {"timestamp": ts, "outdoor": {"Tdb_C": T_out, "w_kgperkg": w_out, "co2_ppm": co2_out}, "zones": {}}
 
         # Zones
         for z, zh in zH.items():
             Tz   = _val(zh["T"])
-            RHz  = _val(zh["RH"])
-            RHzf = (RHz / 100.0) if RHz is not None else None
-            wz   = _w_from_T_RH_P(Tz, RHzf, P_out)
+            wz   = _val(zh["w"])
             co2z = _val(zh["CO2"])
 
-            # Aggregate supply over inlet nodes
+            # Aggregate supply over inlet nodes (mass-flow weighting)
             nodes = nH.get(z, {})
             m_sum = 0.0
             w_T = w_w = w_CO2 = 0.0
             any_T = any_w = any_CO2 = False
-
             for node_name, nh in nodes.items():
-                m  = _val(nh["m"])
-                Tn = _val(nh["T"])
-                wn = _val(nh["w"])
-                c2 = _val(nh["CO2"])
-
+                m  = _val(nh.get("m", -1))
+                Tn = _val(nh.get("T", -1))
+                wn = _val(nh.get("w", -1))
+                c2 = _val(nh.get("CO2", -1))
                 if m is not None and m > 0:
                     m_sum += m
-                    if Tn is not None:
-                        w_T += m * Tn; any_T = True
-                    if wn is not None:
-                        w_w += m * wn; any_w = True
-                    if c2 is not None:
-                        w_CO2 += m * c2; any_CO2 = True
+                    if Tn is not None:  w_T  += m * Tn; any_T  = True
+                    if wn is not None:  w_w  += m * wn; any_w  = True
+                    if c2 is not None:  w_CO2+= m * c2; any_CO2= True
 
             sup_m = m_sum if m_sum > 0 else None
-            sup_T = (w_T / m_sum) if (m_sum > 0 and any_T) else None
-            sup_w = (w_w / m_sum) if (m_sum > 0 and any_w) else None
-            sup_c = (w_CO2 / m_sum) if (m_sum > 0 and any_CO2) else None
+            sup_T = (w_T / m_sum) if (m_sum > 0 and any_T)  else None
+            sup_w = (w_w / m_sum) if (m_sum > 0 and any_w)  else None
+            sup_c = (w_CO2/ m_sum) if (m_sum > 0 and any_CO2) else None
 
             data["zones"][z] = {
                 "air":    {"Tdb_C": Tz, "w_kgperkg": wz, "co2_ppm": co2z},
                 "supply": {"m_dot_kgs": sup_m, "Tdb_C": sup_T, "w_kgperkg": sup_w, "co2_ppm": sup_c},
             }
 
-            # optional one-time warnings
+            # One-time missing warnings (optional)
             if warn_missing_once:
-                def _warn(tag, found):
+                def _warn(tag, ok):
                     key = f"{z}:{tag}"
-                    if not found and key not in d["_probe_missing_warned"]:
+                    if not ok and key not in d["_probe_missing_warned"]:
                         self._log(1, f"[probe] No handle for {key} (not exposed)")
                         d["_probe_missing_warned"].add(key)
-
-                _warn("Zone RH", zh["RH"] != -1)
-                _warn("Zone CO2", zh["CO2"] != -1)
-                # for supply, warn if none of the nodes had a handle for each metric
-                _warn("Supply m_dot", any(nh["m"] != -1 for nh in nodes.values()))
-                _warn("Supply T",     any(nh["T"] != -1 for nh in nodes.values()))
-                _warn("Supply w",     any(nh["w"] != -1 for nh in nodes.values()))
-                _warn("Supply CO2",   any(nh["CO2"] != -1 for nh in nodes.values()))
+                _warn("Zone T",  zh["T"]  != -1)
+                _warn("Zone w",  zh["w"]  != -1)
+                _warn("Zone CO2",zh["CO2"]!= -1)
+                _warn("Supply m_dot", any((nh.get("m",-1)  != -1) for nh in nodes.values()))
+                _warn("Supply T",     any((nh.get("T",-1)  != -1) for nh in nodes.values()))
+                _warn("Supply w",     any((nh.get("w",-1)  != -1) for nh in nodes.values()))
+                _warn("Supply CO2",   any((nh.get("CO2",-1)!= -1) for nh in nodes.values()))
 
         # ---------- 4) rate-limited print (per-timestep capable) ----------
         if log_every is not None:
@@ -3354,7 +3336,6 @@ class EPlusUtil:
 
                         o = data["outdoor"]
                         self._log(1, f"[probe] {ts} | Outdoor: T={fmt(o['Tdb_C'],'C')} w={fmt(o['w_kgperkg'])} CO2={fmt(o['co2_ppm'],'ppm')}")
-                        # print first few zones to avoid log spam
                         max_z = min(6, len(data["zones"]))
                         for i, (zn, rec) in enumerate(data["zones"].items()):
                             if i >= max_z:
@@ -3371,7 +3352,6 @@ class EPlusUtil:
             except Exception:
                 pass
 
-        # keep the last snapshot handy
         self._probe_last_snapshot = data
         return data
 
