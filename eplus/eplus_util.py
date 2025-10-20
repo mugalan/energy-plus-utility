@@ -3498,7 +3498,7 @@ class EPlusUtil:
 
     def probe_zone_air_and_supply_with_kf(self, s, **opts):
         """
-        Drop-in probe + Kalman filter + SQL persistence.
+        Drop-in probe + Kalman filter + SQL persistence + (now) logging.
 
         Uses the runtime probe (zone/supply/outdoor) to build:
         y_k = [Tz*, w_z*, c_z*]^T
@@ -3518,10 +3518,12 @@ class EPlusUtil:
         import os, sqlite3
         import numpy as _np
 
-        # ---- run your working probe (no changes) ----
-        payload = self.probe_zone_air_and_supply(s, **{k:v for k,v in opts.items() if k not in {
+        # ---- run your working probe (pass through non-KF opts only) ----
+        payload = self.probe_zone_air_and_supply(s, **{k: v for k, v in opts.items() if k not in {
             "kf_sigma_P_diag","kf_sigma_R_diag","kf_init_mu","kf_init_cov_diag",
-            "kf_sql_table","kf_sql_commit_every"}})
+            "kf_sql_table","kf_sql_commit_every",
+            "kf_log_every_minutes","kf_log_top_n","kf_log_include_phi","kf_log_precision"
+        }})
         if not payload or "zones" not in payload:
             return payload
 
@@ -3535,6 +3537,12 @@ class EPlusUtil:
         table_name   = str(opts.get("kf_sql_table", "KalmanEstimates"))
         commit_every = int(opts.get("kf_sql_commit_every", 200))
 
+        # ---- Logging options ----
+        kf_log_every = opts.get("kf_log_every_minutes", 1)
+        kf_log_top_n = int(opts.get("kf_log_top_n", 2))
+        kf_log_phi   = bool(opts.get("kf_log_include_phi", False))
+        kf_prec      = int(opts.get("kf_log_precision", 3))
+
         Sigma_P = _np.diag(Sigma_P_diag)
         Sigma_R = _np.diag(Sigma_R_diag)
 
@@ -3544,11 +3552,11 @@ class EPlusUtil:
             d["_kf_mu"]    = {}  # zone -> (5,)
             d["_kf_Sigma"] = {}  # zone -> (5,5)
             d["_kf_inserts"] = 0
+            d["_kf_last_log_ts"] = None
 
             # open/create SQL and table once
             assert self.out_dir, "set_model(...) first so out_dir is available."
             sql_path = os.path.join(self.out_dir, "eplusout.sql")
-            # open with a generous timeout; EnergyPlus also writes this
             conn = sqlite3.connect(sql_path, timeout=30.0)
             cur  = conn.cursor()
             cur.execute(f"""
@@ -3584,13 +3592,20 @@ class EPlusUtil:
                 d["_kf_mu"][z]    = mu0.copy()
                 d["_kf_Sigma"][z] = _np.diag(S0_diag)
 
-        # ---- get site values (used for ϕ deltas) ----
+        def F(x, suf=""):
+            return f"{x:.{kf_prec}f}{suf}" if (x == x) else "NA"
+
+        # ---- get site values (used for φ deltas) ----
         ts = payload["timestamp"]
         oT = payload["outdoor"].get("Tdb_C")
         ow = payload["outdoor"].get("w_kgperkg")
         oc = payload["outdoor"].get("co2_ppm")
 
-        # ---- iterate zones: build y, ϕ, do KF update, store ----
+        # pick zones to log this tick (first N alphabetical)
+        zones_all = sorted(payload["zones"].keys())
+        zones_to_log = set(zones_all[:max(1, kf_log_top_n)])
+
+        # ---- iterate zones: build y, φ, do KF update, store ----
         for z, Z in payload["zones"].items():
             # Observations y_k (zone air)
             yT = Z["air"]["Tdb_C"]
@@ -3602,14 +3617,22 @@ class EPlusUtil:
             sw = Z["supply"]["w_kgperkg"]
             sc = Z["supply"]["co2_ppm"]
 
-            # Need all pieces to form phi and y
             vals = [oT, ow, oc, sT, sw, sc, yT, yw, yc]
             if any((_np.isnan(v) or v is None) for v in vals):
-                # Skip update if we can’t form y or phi (we’ll still keep last mu/Sigma)
+                # Optional: log skip
+                if (kf_log_every is not None) and (z in zones_to_log):
+                    try:
+                        N = max(1, int(ex.num_time_steps_in_hour(s)))
+                        minute = int(round((ex.zone_time_step_number(s) - 1) * (60 / N)))
+                        if (kf_log_every is not None) and (minute % int(kf_log_every) == 0) and (d.get("_kf_last_log_ts") != ts):
+                            d["_kf_last_log_ts"] = ts
+                            self._log(1, f"[kf] {ts} {z}: skipped (missing data to build φ or y)")
+                    except Exception:
+                        pass
                 continue
 
-            # Build phi_k (3x5) per your definition (shared alpha_m in col=2)
-            phi = _np.zeros((3,5), dtype=float)
+            # Build φ_k (3x5)
+            phi = _np.zeros((3, 5), dtype=float)
             phi[0,0] = (oT - sT); phi[0,1] = 1.0
             phi[1,2] = (ow - sw); phi[1,3] = 1.0
             phi[2,2] = (oc - sc); phi[2,4] = 1.0
@@ -3622,21 +3645,18 @@ class EPlusUtil:
             S_prev  = d["_kf_Sigma"][z]
 
             # Predict
-            mu_minus = mu_prev  # random walk
+            mu_minus = mu_prev
             S_minus  = S_prev + Sigma_P
 
             # Gain
-            # S_innov = phi S- phi^T + R
             S_innov = phi @ S_minus @ phi.T + Sigma_R
-            # Use pinv for numerical safety
             K = S_minus @ phi.T @ _np.linalg.pinv(S_innov)
 
             # Update
             yhat_minus = phi @ mu_minus
             mu_k = mu_minus + K @ (y - yhat_minus)
-            S_k  = ( _np.eye(5) - K @ phi ) @ S_minus
+            S_k  = (_np.eye(5) - K @ phi) @ S_minus
 
-            # Cache back
             d["_kf_mu"][z]    = _np.asarray(mu_k).reshape(-1)
             d["_kf_Sigma"][z] = _np.asarray(S_k)
 
@@ -3646,10 +3666,29 @@ class EPlusUtil:
             # Insert into SQL
             _ins(str(ts), z, y, yhat_k, mu_k)
 
-        # Make sure we commit at the end of the simulation too (cheap to do often)
+            # ---------- Logging (throttled) ----------
+            if kf_log_every is not None and z in zones_to_log:
+                try:
+                    N = max(1, int(ex.num_time_steps_in_hour(s)))
+                    minute = int(round((ex.zone_time_step_number(s) - 1) * (60 / N)))
+                    if (minute % int(kf_log_every) == 0) and (d.get("_kf_last_log_ts") != ts):
+                        d["_kf_last_log_ts"] = ts
+                        eT = (y[0] - yhat_k[0]); ew = (y[1] - yhat_k[1]); ec = (y[2] - yhat_k[2])
+                        msg = (f"[kf] {ts} {z}: "
+                            f"y(T={F(y[0],'C')}, w={F(y[1])}, c={F(y[2],'ppm')}) | "
+                            f"ŷ(T={F(yhat_k[0],'C')}, w={F(yhat_k[1])}, c={F(yhat_k[2],'ppm')}) | "
+                            f"err(T={F(eT)}, w={F(ew)}, c={F(ec)}) | "
+                            f"β[aT={F(mu_k[0])}, bT={F(mu_k[1])}, aM={F(mu_k[2])}, bW={F(mu_k[3])}, bC={F(mu_k[4])}]")
+                        if kf_log_phi:
+                            msg += f" | φΔ(dT={F(oT - sT)}, dW={F(ow - sw)}, dC={F(oc - sc)})"
+                        self._log(1, msg)
+                except Exception:
+                    pass
+
+        # Commit often (cheap); also call _kf_sql_conn.commit() at end of sim if you want.
         try:
             d["_kf_sql_conn"].commit()
         except Exception:
             pass
 
-        return payload  # unchanged return (still gives probe snapshot)        
+        return payload
