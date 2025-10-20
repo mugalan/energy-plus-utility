@@ -3055,7 +3055,7 @@ class EPlusUtil:
             except Exception:
                 pass
 
-    def probe_zone_air_state(self, s, **opts):
+    def get_zone_out_door_air_state(self, s, **opts):
         """
         Snapshot zone+outdoor air state and zone supply (via System Node variables).
 
