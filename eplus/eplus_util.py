@@ -148,6 +148,100 @@ class EPlusUtil:
             except Exception:
                 pass
 
+    # ---------- Shared helper to parse method specs ----------
+    def _parse_method_specs(self, methods):
+        """
+        Accepts:
+        • Sequence[str] → ["method_a", "method_b"]
+        • Sequence[dict] → [{"method_name": "...", "kwargs": {...}}, ...]
+            (also accepts keys "key_wargs", "key_kwargs", "params" for kwargs)
+        Returns: Ordered (names, mapping[name] = (callable, kwargs))
+        """
+        if not isinstance(methods, (list, tuple)):
+            raise TypeError("methods must be a sequence of str or dict")
+
+        def _extract(item):
+            if isinstance(item, str):
+                name, kwargs = item.strip(), {}
+            elif isinstance(item, dict):
+                name = str(item.get("method_name") or item.get("name") or "").strip()
+                kwargs = (
+                    item.get("key_wargs")
+                    or item.get("kwargs")
+                    or item.get("key_kwargs")
+                    or item.get("params")
+                    or {}
+                )
+                if not isinstance(kwargs, dict):
+                    raise TypeError(f"kwargs for '{name}' must be a dict")
+            else:
+                raise TypeError(f"Unsupported method spec: {item!r}")
+
+            if not name:
+                raise ValueError(f"Invalid method name in spec: {item!r}")
+
+            func = getattr(self, name, None)
+            if func is None or not callable(func):
+                raise AttributeError(f"No callable '{name}' found on {self.__class__.__name__}")
+            return name, func, dict(kwargs)
+
+        # de-dupe by name; later specs win
+        seen = {}
+        for it in methods:
+            nm, fn, kw = _extract(it)
+            seen[nm] = (fn, kw)
+
+        # preserve prior order + append new in given order
+        ordered = []
+        for it in methods:
+            nm = it if isinstance(it, str) else (it.get("method_name") or it.get("name"))
+            nm = str(nm).strip()
+            if nm and nm not in ordered:
+                ordered.append(nm)
+
+        return ordered, seen
+
+
+    # ---------- BEGIN-ITERATION REGISTRY ----------
+    def _init_begin_tick_registry(self):
+        if not hasattr(self, "_begin_tick_names"):
+            self._begin_tick_names = []
+            self._begin_tick_specs = []  # list of (callable, kwargs)
+        if not hasattr(self, "_begin_tick_enabled"):
+            self._begin_tick_enabled = True
+        if not hasattr(self, "_begin_tick_run_during_warmup"):
+            self._begin_tick_run_during_warmup = False
+        if not hasattr(self, "_begin_tick_registered"):
+            self._begin_tick_registered = False
+
+    def _ensure_begin_tick_registered(self):
+        if self._begin_tick_registered:
+            return
+        rt = self.api.runtime
+        ex = self.api.exchange
+
+        def _cb(state):
+            if not self._begin_tick_enabled:
+                return
+            if ex.warmup_flag(state) and not self._begin_tick_run_during_warmup:
+                return
+            # iterate in stored order
+            for name, (fn, kw) in zip(self._begin_tick_names, self._begin_tick_specs):
+                try:
+                    fn(state, **kw)  # your methods are bound: method(self, state, **kwargs)
+                except Exception as e:
+                    try:
+                        self._log(1, f"[begin-callback:{name}] error: {e}")
+                    except Exception:
+                        pass
+
+        rt.callback_begin_zone_timestep_after_init_heat_balance(self.state, _cb)
+        self._begin_tick_registered = True
+        try:
+            self._log(1, "[register] begin_zone_timestep_after_init_heat_balance registered")
+        except Exception:
+            pass
+
     def register_begin_iteration(self, methods, *, clear: bool = False,
                                 enable: bool = True,
                                 run_during_warmup: bool | None = None):
@@ -156,8 +250,8 @@ class EPlusUtil:
 
         Accepts EITHER:
         • Sequence[str]: ["occupancy_counter", "tick_hvac_kill"]
-        • Sequence[dict]: [{"method_name": "...", "key_wargs": {...}}]
-            (also accepts keys "kwargs", "key_kwargs", or "params" for the dict)
+        • Sequence[dict]: [{"method_name": "...", "kwargs": {...}}]
+            (also accepts keys "key_wargs", "key_kwargs", or "params")
 
         Each method will be called as: method(self, state, **kwargs)
         """
@@ -166,50 +260,20 @@ class EPlusUtil:
             self._begin_tick_names = []
             self._begin_tick_specs = []
 
-        def _extract(method_item):
-            # returns (name: str, func: callable, kwargs: dict)
-            if isinstance(method_item, str):
-                name, kwargs = method_item.strip(), {}
-            elif isinstance(method_item, dict):
-                name = str(method_item.get("method_name") or method_item.get("name") or "").strip()
-                # tolerate 'key_wargs' typo and a few aliases
-                kwargs = (method_item.get("key_wargs")
-                        or method_item.get("kwargs")
-                        or method_item.get("key_kwargs")
-                        or method_item.get("params")
-                        or {})
-                if not isinstance(kwargs, dict):
-                    raise TypeError(f"kwargs for '{name}' must be a dict")
-            else:
-                raise TypeError(f"Unsupported method spec: {method_item!r}")
+        new_names, new_map = self._parse_method_specs(methods)
 
-            if not name:
-                raise ValueError(f"Invalid method name in spec: {method_item!r}")
+        # merge with existing, last spec wins
+        existing = {nm: (fn, kw) for nm, (fn, kw) in zip(self._begin_tick_names, self._begin_tick_specs)}
+        existing.update({nm: new_map[nm] for nm in new_names})
 
-            func = getattr(self, name, None)
-            if func is None or not callable(func):
-                raise AttributeError(f"No callable '{name}' found on {self.__class__.__name__}")
-            return name, func, dict(kwargs)
-
-        # dedupe by method name (last one wins for kwargs)
-        seen = {nm: (fn, kw) for nm, (fn, kw) in zip(self._begin_tick_names, self._begin_tick_specs)}
-        for item in methods:
-            nm, fn, kw = _extract(item)
-            seen[nm] = (fn, kw)
-
-        # re-materialize ordered lists (preserve prior order, append new names at end)
-        ordered = []
-        for nm in self._begin_tick_names:
-            if nm in seen and nm not in ordered:
-                ordered.append(nm)
-        for item in methods:
-            nm = item if isinstance(item, str) else (item.get("method_name") or item.get("name"))
-            nm = str(nm).strip()
-            if nm and nm not in ordered:
+        # rebuild ordered list: keep prior order first, then any new names in given order
+        ordered = [nm for nm in self._begin_tick_names if nm in existing]
+        for nm in new_names:
+            if nm not in ordered:
                 ordered.append(nm)
 
         self._begin_tick_names = ordered
-        self._begin_tick_specs = [seen[nm] for nm in ordered]
+        self._begin_tick_specs = [existing[nm] for nm in ordered]
 
         self._begin_tick_enabled = bool(enable)
         if run_during_warmup is not None:
@@ -217,6 +281,81 @@ class EPlusUtil:
 
         self._ensure_begin_tick_registered()
         return list(self._begin_tick_names)
+
+
+    # ---------- AFTER-HVAC-REPORTING REGISTRY ----------
+    def _init_after_hvac_registry(self):
+        if not hasattr(self, "_after_hvac_names"):
+            self._after_hvac_names = []
+            self._after_hvac_specs = []  # list of (callable, kwargs)
+        if not hasattr(self, "_after_hvac_enabled"):
+            self._after_hvac_enabled = True
+        if not hasattr(self, "_after_hvac_run_during_warmup"):
+            self._after_hvac_run_during_warmup = False
+        if not hasattr(self, "_after_hvac_registered"):
+            self._after_hvac_registered = False
+
+    def _ensure_after_hvac_registered(self):
+        if self._after_hvac_registered:
+            return
+        rt = self.api.runtime
+        ex = self.api.exchange
+
+        def _cb(state):
+            if not self._after_hvac_enabled:
+                return
+            if ex.warmup_flag(state) and not self._after_hvac_run_during_warmup:
+                return
+            for name, (fn, kw) in zip(self._after_hvac_names, self._after_hvac_specs):
+                try:
+                    fn(state, **kw)
+                except Exception as e:
+                    try:
+                        self._log(1, f"[after-hvac-callback:{name}] error: {e}")
+                    except Exception:
+                        pass
+
+        rt.callback_end_system_timestep_after_hvac_reporting(self.state, _cb)
+        self._after_hvac_registered = True
+        try:
+            self._log(1, "[register] end_system_timestep_after_hvac_reporting registered")
+        except Exception:
+            pass
+
+    def register_after_hvac_reporting(self, methods, *, clear: bool = False,
+                                    enable: bool = True,
+                                    run_during_warmup: bool | None = None):
+        """
+        Register handlers to run AFTER HVAC reporting each system timestep
+        (when node mass flows/temperatures are finalized).
+
+        Same method spec format as register_begin_iteration.
+        Each method will be called as: method(self, state, **kwargs)
+        """
+        self._init_after_hvac_registry()
+        if clear:
+            self._after_hvac_names = []
+            self._after_hvac_specs = []
+
+        new_names, new_map = self._parse_method_specs(methods)
+
+        existing = {nm: (fn, kw) for nm, (fn, kw) in zip(self._after_hvac_names, self._after_hvac_specs)}
+        existing.update({nm: new_map[nm] for nm in new_names})
+
+        ordered = [nm for nm in self._after_hvac_names if nm in existing]
+        for nm in new_names:
+            if nm not in ordered:
+                ordered.append(nm)
+
+        self._after_hvac_names = ordered
+        self._after_hvac_specs = [existing[nm] for nm in ordered]
+
+        self._after_hvac_enabled = bool(enable)
+        if run_during_warmup is not None:
+            self._after_hvac_run_during_warmup = bool(run_during_warmup)
+
+        self._ensure_after_hvac_registered()
+        return list(self._after_hvac_names)
 
     def unregister_begin_iteration(self, method_names: Sequence[str] | None = None) -> list[str]:
         """Remove one/more handlers by name. If None, remove all."""
