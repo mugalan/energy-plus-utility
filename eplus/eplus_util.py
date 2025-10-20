@@ -3674,13 +3674,18 @@ class EPlusUtil:
                     if (minute % int(kf_log_every) == 0) and (d.get("_kf_last_log_ts") != ts):
                         d["_kf_last_log_ts"] = ts
                         eT = (y[0] - yhat_k[0]); ew = (y[1] - yhat_k[1]); ec = (y[2] - yhat_k[2])
-                        msg = (f"[kf] {ts} {z}: "
-                            f"y(T={F(y[0],'C')}, w={F(y[1])}, c={F(y[2],'ppm')}) | "
-                            f"ŷ(T={F(yhat_k[0],'C')}, w={F(yhat_k[1])}, c={F(yhat_k[2],'ppm')}) | "
-                            f"err(T={F(eT)}, w={F(ew)}, c={F(ec)}) | "
-                            f"β[aT={F(mu_k[0])}, bT={F(mu_k[1])}, aM={F(mu_k[2])}, bW={F(mu_k[3])}, bC={F(mu_k[4])}]")
+
+                        # explicit, parse-friendly names you asked for:
+                        msg = (
+                            f"[kf] {ts} {z} | "
+                            f"y_T={F(y[0],'C')}, y_w={F(y[1])}, y_c={F(y[2],'ppm')} | "
+                            f"yhat_T={F(yhat_k[0],'C')}, yhat_w={F(yhat_k[1])}, yhat_c={F(yhat_k[2],'ppm')} | "
+                            f"alpha_T={F(mu_k[0])}, beta_T={F(mu_k[1])}, alpha_m={F(mu_k[2])}, "
+                            f"beta_w={F(mu_k[3])}, beta_c={F(mu_k[4])} | "
+                            f"err_T={F(eT)}, err_w={F(ew)}, err_c={F(ec)}"
+                        )
                         if kf_log_phi:
-                            msg += f" | φΔ(dT={F(oT - sT)}, dW={F(ow - sw)}, dC={F(oc - sc)})"
+                            msg += f" | phi_dT={F(oT - sT)}, phi_dW={F(ow - sw)}, phi_dC={F(oc - sc)}"
                         self._log(1, msg)
                 except Exception:
                     pass
