@@ -3564,23 +3564,100 @@ class EPlusUtil:
             d["_kf_sql_conn"] = conn
             d["_kf_sql_cur"]  = cur
 
-        def _ins(ts, z, y_vec, yhat_vec, mu_vec):
-            """Safe insert with clean types."""
-            ts_str = str(ts)
-            z_str  = str(z)
-            def at(vec, i):
-                return float(vec[i]) if vec is not None and len(vec) > i and _np.isfinite(vec[i]) else None
-            cur = d["_kf_sql_cur"]
-            cur.execute(f"""
-                INSERT INTO {table_name}
-                (Timestamp, Zone, y_T, y_w, y_c, yhat_T, yhat_w, yhat_c,
-                alpha_T, beta_T, alpha_m, beta_w, beta_c)
-                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)
-            """, (ts_str, z_str,
-                at(y_vec,0), at(y_vec,1), at(y_vec,2),
-                at(yhat_vec,0), at(yhat_vec,1), at(yhat_vec,2),
-                float(mu_vec[0]), float(mu_vec[1]), float(mu_vec[2]),
-                float(mu_vec[3]), float(mu_vec[4])))
+        # --- open/create SQL and table once (unchanged filename) ---
+        assert self.out_dir, "set_model(...) first so out_dir is available."
+        sql_path = os.path.join(self.out_dir, "eplusout.sql")
+
+        conn = sqlite3.connect(sql_path, timeout=30.0)
+        cur  = conn.cursor()
+
+        # Use WAL for fewer write conflicts (safe; no-op if already set)
+        try:
+            cur.execute("PRAGMA journal_mode=WAL;")
+        except Exception:
+            pass
+
+        # Keep same schema; make sure types are flexible
+        cur.execute(f"""
+            CREATE TABLE IF NOT EXISTS {table_name} (
+                Timestamp TEXT NOT NULL,
+                Zone      TEXT NOT NULL,
+                y_T   REAL, y_w   REAL, y_c   REAL,
+                yhat_T REAL, yhat_w REAL, yhat_c REAL,
+                alpha_T REAL, beta_T REAL, alpha_m REAL, beta_w REAL, beta_c REAL
+            )
+        """)
+        conn.commit()
+
+        d["_kf_sql_conn"] = conn
+        d["_kf_sql_cur"]  = cur
+
+        def _to_iso_ts(ts_obj) -> str:
+            """
+            Return an ISO 'YYYY-MM-DD HH:MM:SS' string.
+            Falls back to the current sim timestamp if needed.
+            """
+            # Preferred: probe-provided timestamp
+            if ts_obj:
+                s = str(ts_obj)
+                # Normalize common variants to ISO-like format pandas can parse
+                # e.g., '2002-01-21 00:15:00'
+                return s.replace("T", " ")  # in case it is ISO with 'T'
+            # Fallback: rebuild from API clock
+            try:
+                yr = int(self.api.exchange.year(self.state))
+                m  = int(self.api.exchange.month(self.state))
+                d_ = int(self.api.exchange.day_of_month(self.state))
+                hh = int(self.api.exchange.hour(self.state))
+                mm = int(self.api.exchange.minute(self.state))
+                return f"{yr:04d}-{m:02d}-{d_:02d} {hh:02d}:{mm:02d}:00"
+            except Exception:
+                return ""
+
+        def _to_num(x):
+            """Finite float or None (so SQLite gets NULL)."""
+            try:
+                import numpy as _np
+                if x is None: return None
+                xv = float(x)
+                if _np.isnan(xv) or _np.isinf(xv): return None
+                return xv
+            except Exception:
+                return None
+
+        def _ins(ts, zone_name: str, y_vec, yhat_vec, mu_vec):
+            """
+            Robust insert using named parameters; avoids column-order bugs and NaN writes.
+            """
+            row = {
+                "ts":      _to_iso_ts(ts),
+                "zone":    str(zone_name),
+
+                "y_T":     _to_num(y_vec[0]),
+                "y_w":     _to_num(y_vec[1]),
+                "y_c":     _to_num(y_vec[2]),
+
+                "yhat_T":  _to_num(yhat_vec[0]),
+                "yhat_w":  _to_num(yhat_vec[1]),
+                "yhat_c":  _to_num(yhat_vec[2]),
+
+                "alpha_T": _to_num(mu_vec[0]),
+                "beta_T":  _to_num(mu_vec[1]),
+                "alpha_m": _to_num(mu_vec[2]),
+                "beta_w":  _to_num(mu_vec[3]),
+                "beta_c":  _to_num(mu_vec[4]),
+            }
+
+            d["_kf_sql_cur"].execute(
+                f"""INSERT INTO {table_name}
+                    (Timestamp, Zone, y_T, y_w, y_c, yhat_T, yhat_w, yhat_c,
+                    alpha_T, beta_T, alpha_m, beta_w, beta_c)
+                VALUES
+                    (:ts, :zone, :y_T, :y_w, :y_c, :yhat_T, :yhat_w, :yhat_c,
+                    :alpha_T, :beta_T, :alpha_m, :beta_w, :beta_c)
+                """,
+                row
+            )
             d["_kf_inserts"] += 1
             if d["_kf_inserts"] % commit_every == 0:
                 d["_kf_sql_conn"].commit()
