@@ -452,7 +452,7 @@ class EPlusSqlExplorer:
         """
 
         # Resolve DB path
-        path = db else self.sql_path
+        path = db or self.sql_path
         if not os.path.exists(path):
             if verbose:
                 print(f"[check] DB not found: {path}")
