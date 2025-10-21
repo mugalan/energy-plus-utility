@@ -3534,22 +3534,23 @@ class EPlusUtil:
     def probe_zone_air_and_supply_with_kf(self, s, **opts):
         """
         Probe + Kalman filter + SQL persistence (uses probe payload only).
-        NOTE: This version does NOT use mass flow anywhere; it updates every tick.
+        NOTE: No mass flow used; updates every tick.
 
         Missing-data policy:
         - If current measurement is NA -> use last available for that zone/outdoor.
         - If no history yet -> use 0.0.
+        - Zone w fallback chain: payload w → Zone Mean Air Humidity Ratio → w(T,RH,P_site).
 
-        Extra opts (unchanged): kf_sigma_P_diag, kf_sigma_R_diag, kf_init_mu, kf_init_cov_diag,
-                                kf_sql_table, kf_zones, kf_exclude_patterns, kf_log
-        Perf opts (unchanged):  kf_db_filename, kf_batch_size, kf_commit_every_batches,
-                                kf_checkpoint_every_commits, kf_journal_mode, kf_synchronous
+        Extra opts: kf_sigma_P_diag, kf_sigma_R_diag, kf_init_mu, kf_init_cov_diag,
+                    kf_sql_table, kf_zones, kf_exclude_patterns, kf_log
+        Perf opts : kf_db_filename, kf_batch_size, kf_commit_every_batches,
+                    kf_checkpoint_every_commits, kf_journal_mode, kf_synchronous
         """
         ex = self.api.exchange
         if ex.warmup_flag(s):
             return
 
-        import os, sqlite3
+        import os, sqlite3, math
         import numpy as _np
 
         # ---- run the working probe (unchanged) ----
@@ -3594,10 +3595,44 @@ class EPlusUtil:
             d["_kf_last_out"] = {}        # {'T':..., 'w':..., 'c':...}
             d["_kf_last_air"] = {}        # zone -> {'T':...,'w':...,'c':...}
             d["_kf_last_sup"] = {}        # zone -> {'T':...,'w':...,'c':...}
-            # NEW: per-zone handle for Zone Mean Air Humidity Ratio
-            d["_kf_h_zone_w_mean"] = {}   # zone -> handle (int)
 
-        # --- fast SQL open+schema (reused connection; WAL+synchronous PRAGMAs) ---
+            # zones list for handle requests
+            if kf_zones:
+                zones = [z for z in kf_zones if z in payload["zones"]]
+            else:
+                zones = [z for z in payload["zones"].keys()
+                        if not any(p in z.upper() for p in excl_pats)]
+            d["_kf_zones_cached"] = zones
+
+            # Request only the minimal fallbacks we may need
+            for z in zones:
+                for nm in ("Zone Mean Air Humidity Ratio",
+                        "Zone Air Relative Humidity",
+                        "Zone Mean Air Temperature"):
+                    try: ex.request_variable(s, nm, z)
+                    except Exception: pass
+            try: ex.request_variable(s, "Site Outdoor Air Barometric Pressure", "Environment")
+            except Exception: pass
+
+            d["_kf_h_ready"] = False
+            d["_kf_h_wmean"] = {}  # z -> handle
+            d["_kf_h_rh"]    = {}
+            d["_kf_h_T"]     = {}
+            d["_kf_h_Psite"] = -1
+
+        # Resolve handles once
+        if not d.get("_kf_h_ready", False) and ex.api_data_fully_ready(s):
+            zones = d.get("_kf_zones_cached", [])
+            def H(nm, key):
+                try: return ex.get_variable_handle(s, nm, key)
+                except Exception: return -1
+            d["_kf_h_wmean"] = {z: H("Zone Mean Air Humidity Ratio", z) for z in zones}
+            d["_kf_h_rh"]    = {z: H("Zone Air Relative Humidity",   z) for z in zones}
+            d["_kf_h_T"]     = {z: H("Zone Mean Air Temperature",    z) for z in zones}
+            d["_kf_h_Psite"] = H("Site Outdoor Air Barometric Pressure", "Environment")
+            d["_kf_h_ready"] = True
+
+        # --- fast SQL open+schema once ---
         def _ensure_sql():
             if d.get("_kf_sql_disabled"):
                 return False
@@ -3653,8 +3688,7 @@ class EPlusUtil:
 
         # ---- helpers ----
         def _to_iso_ts(ts_obj) -> str:
-            if ts_obj:
-                return str(ts_obj).replace("T", " ")
+            if ts_obj: return str(ts_obj).replace("T", " ")
             try:
                 yr = int(self.api.exchange.year(self.state))
                 m  = int(self.api.exchange.month(self.state))
@@ -3667,11 +3701,9 @@ class EPlusUtil:
 
         def _to_num(x):
             try:
-                if x is None:
-                    return None
+                if x is None: return None
                 xv = float(x)
-                if _np.isfinite(xv):
-                    return xv
+                if _np.isfinite(xv): return xv
             except Exception:
                 pass
             return None
@@ -3680,29 +3712,26 @@ class EPlusUtil:
             try: return _np.isfinite(float(x))
             except Exception: return False
 
-        # NEW: lazy ensure + read "Zone Mean Air Humidity Ratio" handle/value
-        def _zone_w_mean(z):
-            """Return Zone Mean Air Humidity Ratio for zone z if available, else None."""
-            h = d["_kf_h_zone_w_mean"].get(z, None)
-            if h is None:
-                try:
-                    ex.request_variable(s, "Zone Mean Air Humidity Ratio", z)
-                except Exception:
-                    pass
-                try:
-                    h = ex.get_variable_handle(s, "Zone Mean Air Humidity Ratio", z)
-                except Exception:
-                    h = -1
-                d["_kf_h_zone_w_mean"][z] = h
-            if h is None or h == -1:
-                return None
+        def _v(h):
+            if h in (-1, None): return float("nan")
             try:
-                v = float(ex.get_variable_value(s, h))
-                return v if _fin(v) else None
+                x = float(ex.get_variable_value(s, h))
+                return x if (x == x) else float("nan")
             except Exception:
-                return None
+                return float("nan")
 
-        # forward-fill helpers (no mass flow)
+        def _w_from_T_RH_P(Tc, RH_pct, P_pa):
+            try:
+                if not (Tc == Tc and RH_pct == RH_pct and P_pa == P_pa and P_pa > 1000.0):
+                    return float("nan")
+                psat = 610.94 * math.exp(17.625 * Tc / (Tc + 243.04))
+                pw = max(0.0, min(1.0, RH_pct/100.0)) * psat
+                denom = max(1.0, P_pa - pw)
+                return 0.62198 * pw / denom
+            except Exception:
+                return float("nan")
+
+        # forward-fill caches
         def _ffill_out(key, val, default=0.0):
             if _fin(val):
                 d["_kf_last_out"][key] = float(val)
@@ -3728,15 +3757,12 @@ class EPlusUtil:
             row = {
                 "ts":      _to_iso_ts(ts),
                 "zone":    str(zone_name),
-
                 "y_T":     _get(names, y_vec,   "T"),
                 "y_w":     _get(names, y_vec,   "w"),
                 "y_c":     _get(names, y_vec,   "CO2"),
-
                 "yhat_T":  _get(names, yhat_vec, "T"),
                 "yhat_w":  _get(names, yhat_vec, "w"),
                 "yhat_c":  _get(names, yhat_vec, "CO2"),
-
                 "alpha_T": _to_num(mu_vec[0]),
                 "beta_T":  _to_num(mu_vec[1]),
                 "alpha_m": _to_num(mu_vec[2]),
@@ -3787,25 +3813,33 @@ class EPlusUtil:
         ow = _ffill_out("w",  payload["outdoor"].get("w_kgperkg"), 0.0)
         oc = _ffill_out("c",  payload["outdoor"].get("co2_ppm"),   0.0)
 
+        # Site pressure for psychro fallback
+        P_site = _v(d.get("_kf_h_Psite", -1)) if d.get("_kf_h_ready", False) else float("nan")
+
         for z in zones_use:
             Z = payload["zones"][z]
 
-            # Zone air: use payload; if w is NaN, try direct 'Zone Mean Air Humidity Ratio'
-            yT = Z["air"].get("Tdb_C")
+            # Zone air: T from payload (+ffill)
+            yT = _ffill_zone("air", z, "T", Z["air"].get("Tdb_C"), 0.0)
+
+            # Zone air: w fallback chain
             yw = Z["air"].get("w_kgperkg")
-            if not _fin(yw):
-                v_alt = _zone_w_mean(z)          # NEW: fallback read
-                if v_alt is not None:
-                    yw = v_alt
-
-            yc = Z["air"].get("co2_ppm")
-
-            # Now forward-fill (after fallback)
-            yT = _ffill_zone("air", z, "T", yT, 0.0)
+            if not _fin(yw) and d.get("_kf_h_ready", False):
+                w_mean = _v(d["_kf_h_wmean"].get(z, -1))
+                if _fin(w_mean):
+                    yw = w_mean
+                else:
+                    rh = _v(d["_kf_h_rh"].get(z, -1))
+                    Tz = _v(d["_kf_h_T"].get(z, -1))
+                    w_calc = _w_from_T_RH_P(Tz, rh, P_site)
+                    if _fin(w_calc):
+                        yw = w_calc
             yw = _ffill_zone("air", z, "w", yw, 0.0)
-            yc = _ffill_zone("air", z, "c", yc, 0.0)
 
-            # Supply (forward-fill from payload as-is)
+            # Zone CO2 (+ffill)
+            yc = _ffill_zone("air", z, "c", Z["air"].get("co2_ppm"), 0.0)
+
+            # Supply (from payload only, +ffill)
             sT = _ffill_zone("sup", z, "T", Z["supply"].get("Tdb_C"),     0.0)
             sw = _ffill_zone("sup", z, "w", Z["supply"].get("w_kgperkg"), 0.0)
             sc = _ffill_zone("sup", z, "c", Z["supply"].get("co2_ppm"),   0.0)
@@ -3823,16 +3857,15 @@ class EPlusUtil:
             mu_prev = d["_kf_mu"][z].reshape(5,1)
             S_prev  = d["_kf_Sigma"][z]
 
-            # Update every tick (no mass-flow gating)
+            # Kalman update (random walk model)
             mu_minus = mu_prev
             S_minus  = S_prev + Sigma_P
-            R = Sigma_R_full
-            S_innov = phi @ S_minus @ phi.T + R
-            K = S_minus @ phi.T @ _np.linalg.pinv(S_innov)
-            yhat_minus = phi @ mu_minus
-            mu_k = mu_minus + K @ (y - yhat_minus)
-            S_k  = (_np.eye(5) - K @ phi) @ S_minus
-            yhat_k = (phi @ mu_k).reshape(-1)
+            S_innov  = phi @ S_minus @ phi.T + Sigma_R_full
+            K        = S_minus @ phi.T @ _np.linalg.pinv(S_innov)
+            yhat_m   = phi @ mu_minus
+            mu_k     = mu_minus + K @ (y - yhat_m)
+            S_k      = (_np.eye(5) - K @ phi) @ S_minus
+            yhat_k   = (phi @ mu_k).reshape(-1)
 
             d["_kf_mu"][z]    = mu_k.reshape(-1)
             d["_kf_Sigma"][z] = S_k
