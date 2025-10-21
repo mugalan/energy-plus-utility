@@ -3499,21 +3499,24 @@ class EPlusUtil:
     def probe_zone_air_and_supply_with_kf(self, s, **opts):
         """
         Probe + Kalman filter + SQL persistence (uses probe payload only).
-        Skips plenums; carries forward the previous estimate when m_sa≈0.
+        NOTE: This version does NOT use mass flow anywhere; it updates every tick.
 
-        Extra opts (existing):
+        Missing-data policy:
+        - If current measurement is NA -> use last available for that zone/outdoor.
+        - If no history yet -> use 0.0.
+
+        Extra opts (unchanged):
         kf_sigma_P_diag, kf_sigma_R_diag, kf_init_mu, kf_init_cov_diag
         kf_sql_table="KalmanEstimates"
         kf_zones=None, kf_exclude_patterns=("PLENUM",), kf_log=True
-        kf_zero_mass_eps=1e-6
 
-        New perf opts (mirrors dummy-fast helper):
-        kf_db_filename: str = "eplusout.sql"         # DB file to write into
-        kf_batch_size: int = 50                      # rows per executemany()
-        kf_commit_every_batches: int = 10            # commit after N batches
-        kf_checkpoint_every_commits: int = 5         # WAL checkpoint cadence
-        kf_journal_mode: str = "WAL"                 # WAL|MEMORY|OFF (OFF unsafe)
-        kf_synchronous: str = "NORMAL"               # FULL|NORMAL|OFF (OFF unsafe)
+        Perf opts (unchanged, batched I/O):
+        kf_db_filename="eplusout.sql"
+        kf_batch_size=50
+        kf_commit_every_batches=10
+        kf_checkpoint_every_commits=5
+        kf_journal_mode="WAL"
+        kf_synchronous="NORMAL"
         """
         ex = self.api.exchange
         if ex.warmup_flag(s):
@@ -3522,10 +3525,10 @@ class EPlusUtil:
         import os, sqlite3
         import numpy as _np
 
-        # ---- run your working probe (unchanged) ----
+        # ---- run the working probe (unchanged) ----
         probe_kwargs = {k:v for k,v in opts.items() if k not in {
             "kf_sigma_P_diag","kf_sigma_R_diag","kf_init_mu","kf_init_cov_diag",
-            "kf_sql_table","kf_zones","kf_exclude_patterns","kf_log","kf_zero_mass_eps",
+            "kf_sql_table","kf_zones","kf_exclude_patterns","kf_log",
             "kf_db_filename","kf_batch_size","kf_commit_every_batches","kf_checkpoint_every_commits",
             "kf_journal_mode","kf_synchronous"}}
         payload = self.probe_zone_air_and_supply(s, **probe_kwargs)
@@ -3543,9 +3546,8 @@ class EPlusUtil:
         kf_zones     = opts.get("kf_zones", None)
         excl_pats    = tuple(opts.get("kf_exclude_patterns", ("PLENUM",)))
         do_log       = bool(opts.get("kf_log", True))
-        eps_m        = float(opts.get("kf_zero_mass_eps", 1e-6))
 
-        # NEW perf opts
+        # Perf opts
         db_filename  = str(opts.get("kf_db_filename", "eplusout.sql"))
         batch_size   = int(opts.get("kf_batch_size", 50))
         commit_every_batches = int(opts.get("kf_commit_every_batches", 10))
@@ -3554,19 +3556,22 @@ class EPlusUtil:
         synchronous  = str(opts.get("kf_synchronous", "NORMAL"))
 
         Sigma_P = _np.diag(Sigma_P_diag)
-        Sigma_R_full = _np.diag(Sigma_R_diag)
+        Sigma_R_full = _np.diag(Sigma_R_diag)  # 3x3
 
-        # ---- Per-state init (per EP state & per zone) ----
+        # ---- Per-state init ----
         if d.get("_kf_state_id") != id(self.state):
             d["_kf_state_id"] = id(self.state)
             d["_kf_mu"]    = {}  # zone -> (5,)
             d["_kf_Sigma"] = {}  # zone -> (5,5)
+            # forward-fill caches
+            d["_kf_last_out"] = {}        # {'T':..., 'w':..., 'c':...}
+            d["_kf_last_air"] = {}        # zone -> {'T':...,'w':...,'c':...}
+            d["_kf_last_sup"] = {}        # zone -> {'T':...,'w':...,'c':...}
 
         # --- fast SQL open+schema (reused connection; WAL+synchronous PRAGMAs) ---
         def _ensure_sql():
             if d.get("_kf_sql_disabled"):
                 return False
-            # Reuse same DB file; reopen if filename changed across runs
             if d.get("_kf_sql_conn") and d.get("_kf_sql_cur") and d.get("_kf_sql_db") == db_filename:
                 return True
             try:
@@ -3617,7 +3622,7 @@ class EPlusUtil:
         if not _ensure_sql():
             return payload
 
-        # ---- tiny helpers (unchanged semantics) ----
+        # ---- helpers ----
         def _to_iso_ts(ts_obj) -> str:
             if ts_obj:
                 return str(ts_obj).replace("T", " ")
@@ -3642,9 +3647,26 @@ class EPlusUtil:
                 pass
             return None
 
-        # ---- batched insert (minimal change to your previous _ins) ----
+        def _fin(x):
+            try: return _np.isfinite(float(x))
+            except Exception: return False
+
+        # forward-fill helpers (no mass flow)
+        def _ffill_out(key, val, default=0.0):
+            if _fin(val):
+                d["_kf_last_out"][key] = float(val)
+                return float(val)
+            return d["_kf_last_out"].get(key, float(default))
+
+        def _ffill_zone(cat, z, key, val, default=0.0):
+            store = d["_kf_last_air"] if cat == "air" else d["_kf_last_sup"]
+            zm = store.setdefault(z, {})
+            if _fin(val):
+                zm[key] = float(val)
+                return float(val)
+            return float(zm.get(key, default))
+
         def _ins(ts, zone_name: str, names, y_vec, yhat_vec, mu_vec):
-            # map helper: label -> numeric (or None)
             def _get(_names, _vec, lbl):
                 try:
                     i = _names.index(lbl)
@@ -3673,8 +3695,7 @@ class EPlusUtil:
 
             d["_kf_batch"].append(row)
             if len(d["_kf_batch"]) >= batch_size:
-                cur = d["_kf_sql_cur"]
-                sql = d["_kf_sql_insert"]
+                cur = d["_kf_sql_cur"]; sql = d["_kf_sql_insert"]
                 try:
                     cur.executemany(sql, d["_kf_batch"])
                     d["_kf_batch"].clear()
@@ -3686,7 +3707,6 @@ class EPlusUtil:
                             try: cur.execute("PRAGMA wal_checkpoint(TRUNCATE);")
                             except Exception: pass
                 except sqlite3.DatabaseError as e:
-                    # Disable further writes for this run (no recovery)
                     d["_kf_sql_disabled"] = True
                     try: self._log(1, f"[kf-sql] insert disabled: {e}")
                     except Exception: pass
@@ -3710,100 +3730,65 @@ class EPlusUtil:
         else:
             zones_use = [z for z in payload["zones"].keys() if not _is_excluded(z)]
 
+        # --- Outdoor (forward-fill) ---
         ts = payload["timestamp"]
-        oT = payload["outdoor"].get("Tdb_C")
-        ow = payload["outdoor"].get("w_kgperkg")
-        oc = payload["outdoor"].get("co2_ppm")
+        oT = _ffill_out("T",  payload["outdoor"].get("Tdb_C"),     0.0)
+        ow = _ffill_out("w",  payload["outdoor"].get("w_kgperkg"), 0.0)
+        oc = _ffill_out("c",  payload["outdoor"].get("co2_ppm"),   0.0)
 
         for z in zones_use:
-            Z  = payload["zones"][z]
-            yT = Z["air"].get("Tdb_C")
-            yw = Z["air"].get("w_kgperkg")
-            yc = Z["air"].get("co2_ppm")
+            Z = payload["zones"][z]
 
-            sT = Z["supply"].get("Tdb_C")
-            sw = Z["supply"].get("w_kgperkg")
-            sc = Z["supply"].get("co2_ppm")
-            m_sa = Z["supply"].get("m_dot_kgs")
+            # Zone air (forward-fill)
+            yT = _ffill_zone("air", z, "T", Z["air"].get("Tdb_C"),      0.0)
+            yw = _ffill_zone("air", z, "w", Z["air"].get("w_kgperkg"),  0.0)
+            yc = _ffill_zone("air", z, "c", Z["air"].get("co2_ppm"),    0.0)
 
-            # Build φ rows based on available measurements
-            rows, y_vals, names = [], [], []
+            # Supply (forward-fill)
+            sT = _ffill_zone("sup", z, "T", Z["supply"].get("Tdb_C"),     0.0)
+            sw = _ffill_zone("sup", z, "w", Z["supply"].get("w_kgperkg"), 0.0)
+            sc = _ffill_zone("sup", z, "c", Z["supply"].get("co2_ppm"),   0.0)
 
-            def _fin(x):
-                try: return _np.isfinite(float(x))
-                except Exception: return False
-
-            if _fin(yT) and _fin(oT) and _fin(sT):
-                rows.append([ (oT - sT), 1.0, 0.0, 0.0, 0.0 ])
-                y_vals.append(float(yT)); names.append("T")
-            if _fin(yw) and _fin(ow) and _fin(sw):
-                rows.append([ 0.0, 0.0, (ow - sw), 1.0, 0.0 ])
-                y_vals.append(float(yw)); names.append("w")
-            if _fin(yc) and _fin(oc) and _fin(sc):
-                rows.append([ 0.0, 0.0, (oc - sc), 0.0, 1.0 ])
-                y_vals.append(float(yc)); names.append("CO2")
-
-            if not rows:
-                if do_log:
-                    self._log(1, f"[kf] {ts} {z}: skipped (missing T/w/CO₂ rows)")
-                continue
-
-            phi = _np.asarray(rows, dtype=float)                 # (m,5)
-            y   = _np.asarray(y_vals, dtype=float).reshape(-1,1) # (m,1)
+            # Build φ and y (always 3 rows via ffill)
+            phi = _np.asarray([
+                [ (oT - sT), 1.0, 0.0,     0.0, 0.0 ],
+                [ 0.0,       0.0, (ow-sw), 1.0, 0.0 ],
+                [ 0.0,       0.0, (oc-sc), 0.0, 1.0 ],
+            ], dtype=float)
+            y   = _np.asarray([yT, yw, yc], dtype=float).reshape(-1,1)
+            names = ["T","w","CO2"]
 
             _ensure_zone(z)
-            mu_prev = d["_kf_mu"][z].reshape(5,1)                # (5,1)
-            S_prev  = d["_kf_Sigma"][z]                          # (5,5)
+            mu_prev = d["_kf_mu"][z].reshape(5,1)
+            S_prev  = d["_kf_Sigma"][z]
 
-            # Carry-forward if no supply flow
-            do_update = (_fin(m_sa) and float(m_sa) > eps_m)
+            # Always update (no mass-flow gating)
+            mu_minus = mu_prev
+            S_minus  = S_prev + Sigma_P
+            R = Sigma_R_full
+            S_innov = phi @ S_minus @ phi.T + R
+            K = S_minus @ phi.T @ _np.linalg.pinv(S_innov)
+            yhat_minus = phi @ mu_minus
+            mu_k = mu_minus + K @ (y - yhat_minus)
+            S_k  = (_np.eye(5) - K @ phi) @ S_minus
+            yhat_k = (phi @ mu_k).reshape(-1)
 
-            if do_update:
-                # Predict
-                mu_minus = mu_prev
-                S_minus  = S_prev + Sigma_P
-                # Innovation
-                m = phi.shape[0]
-                R = Sigma_R_full[:m, :m]
-                S_innov = phi @ S_minus @ phi.T + R
-                K = S_minus @ phi.T @ _np.linalg.pinv(S_innov)
-                # Update
-                yhat_minus = phi @ mu_minus
-                mu_k = mu_minus + K @ (y - yhat_minus)
-                S_k  = ( _np.eye(5) - K @ phi ) @ S_minus
-                yhat_k = (phi @ mu_k).reshape(-1)
-                d["_kf_mu"][z]    = mu_k.reshape(-1)
-                d["_kf_Sigma"][z] = S_k
-                mode = "update"
-            else:
-                mu_k   = mu_prev
-                S_k    = S_prev
-                yhat_k = (phi @ mu_prev).reshape(-1)
-                d["_kf_mu"][z]    = mu_prev.reshape(-1)
-                d["_kf_Sigma"][z] = S_prev
-                mode = "carry"
+            d["_kf_mu"][z]    = mu_k.reshape(-1)
+            d["_kf_Sigma"][z] = S_k
 
             # Batched insert into SQL
             _ins(ts, z, names, y.reshape(-1), yhat_k, d["_kf_mu"][z])
 
-            # Logging (unchanged)
+            # Logging
             if do_log:
-                name_to_idx = {nm:i for i,nm in enumerate(names)}
-                def pick(arr, nm):
-                    return arr[name_to_idx[nm]] if nm in name_to_idx else None
                 aT,bT,am,bw,bc = d["_kf_mu"][z]
                 self._log(
                     1,
-                    "[kf] %s %s | %s rows=%s | yhat_T=%s yhat_w=%s yhat_c=%s | "
-                    "alpha_T=%s beta_T=%s alpha_m=%s beta_w=%s beta_c=%s"
-                    % (ts, z, mode, ",".join(names) or "-",
-                    (f"{pick(yhat_k,'T'):.3f}"   if pick(yhat_k,'T')   is not None else "NA"),
-                    (f"{pick(yhat_k,'w'):.5f}"   if pick(yhat_k,'w')   is not None else "NA"),
-                    (f"{pick(yhat_k,'CO2'):.1f}" if pick(yhat_k,'CO2') is not None else "NA"),
-                    f"{aT:.4f}", f"{bT:.4f}", f"{am:.4f}", f"{bw:.6f}", f"{bc:.2f}")
+                    "[kf] %s %s | update | yhat_T=%.3f yhat_w=%.5f yhat_c=%.1f | "
+                    "alpha_T=%.4f beta_T=%.4f alpha_m=%.4f beta_w=%.6f beta_c=%.2f"
+                    % (ts, z, yhat_k[0], yhat_k[1], yhat_k[2], aT, bT, am, bw, bc)
                 )
 
-        # (Optional) you can flush at end-of-sim in another callback; here we leave batch to be committed on cadence
         return payload
 
     def kf_dummy_sql_writer_fast(self, s, **opts):
