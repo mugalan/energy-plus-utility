@@ -4200,3 +4200,55 @@ class EPlusUtil:
                 )
 
         return payload
+
+
+
+    def get_kf_estimates(self, db="eplusout_kf_test.sqlite", table="KalmanEstimates"):
+        """
+        Load *all* rows from the given SQLite table and return them as a DataFrame.
+        Also prints some quick stats (row count, time range, top zones).
+        """
+        util=self
+        path = os.path.join(util.out_dir, db)
+        if not os.path.exists(path):
+            print(f"[check] DB not found: {path}")
+            return None
+
+        with sqlite3.connect(path) as con:
+            # 1) Table exists?
+            tabs = pd.read_sql_query("SELECT name FROM sqlite_master WHERE type='table'", con)
+            names = set(tabs["name"].tolist())
+            if table not in names:
+                print(f"[check] Table '{table}' NOT found. Available: {sorted(names)}")
+                return None
+
+            # 2) Row count
+            n = pd.read_sql_query(f"SELECT COUNT(*) AS n FROM {table}", con)["n"].iat[0]
+            print(f"[check] {table}: {n} rows")
+
+            # 3) Time range + top zones
+            try:
+                rng = pd.read_sql_query(f"SELECT MIN(Timestamp) AS start, MAX(Timestamp) AS end FROM {table}", con)
+                start, end = rng["start"].iat[0], rng["end"].iat[0]
+                print(f"[check] Time range: {start} → {end}")
+            except Exception:
+                print("[check] No Timestamp column or unable to compute time range.")
+
+            try:
+                zdf = pd.read_sql_query(
+                    f"SELECT Zone, COUNT(*) AS n FROM {table} GROUP BY Zone ORDER BY n DESC LIMIT 10", con
+                )
+                print(f"[check] Top zones: {zdf.to_dict('records')}")
+            except Exception:
+                print("[check] No Zone column or unable to compute top zones.")
+
+            # 4) Return ALL rows
+            df = pd.read_sql_query(f"SELECT * FROM {table}", con)
+
+        # Parse a timestamp column if present
+        for c in ("Timestamp","DateTime","Time","ts"):
+            if c in df.columns:
+                df[c] = pd.to_datetime(df[c], errors="coerce")
+                break
+
+        return df
