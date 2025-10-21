@@ -435,7 +435,7 @@ class EPlusSqlExplorer:
             conn.close()
 
 
-    def get_table_data(self, db="eplus_out/eplusout_kf_test.sqlite", table="KalmanEstimates",
+    def get_table_data(self, db=None, table="KalmanEstimates",
                         *, timestamp_candidates=("Timestamp","DateTime","dateTime","TIME","Time","ts","time_stamp","date_time"),
                         verbose=True):
         """
@@ -452,7 +452,7 @@ class EPlusSqlExplorer:
         """
 
         # Resolve DB path
-        path = db
+        path = db else self.sql_path
         if not os.path.exists(path):
             if verbose:
                 print(f"[check] DB not found: {path}")
