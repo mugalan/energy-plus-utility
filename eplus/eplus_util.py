@@ -3273,8 +3273,14 @@ class EPlusUtil:
         Callback (fast): per zone snapshot of air state + supply aggregate.
         Prints at a configurable interval and returns a dict snapshot.
 
+        Fallbacks:
+        • Zone w: try Zone Air Humidity Ratio → Zone Mean Air Humidity Ratio →
+                    compute from (zone T, zone RH, site P).
+        • Site w: try Site Outdoor Air Humidity Ratio → compute from (To, RHo, Po).
+        • Supply node w: try node Humidity Ratio → compute from (node T, node RH, site P).
+
         Kwargs:
-        log_every_minutes: int | None = 1   # 1 => each timestep; None => no prints
+        log_every_minutes: int | None = 1   # 1 => every timestep; None => no prints
         precision: int = 3
         """
         ex = self.api.exchange
@@ -3288,11 +3294,15 @@ class EPlusUtil:
         log_every = opts.get("log_every_minutes", 1)
         prec = int(opts.get("precision", 3))
 
-        # --- tiny psychro helper: w from T[°C], RH[%], P[Pa] (Tetens)
+        # --- tiny psychro helper: w from T[°C], RH[%], P[Pa] (Tetens) ---
         def _w_from_T_RH_P(Tc, RH_pct, P_pa):
+            try:
+                Tc = float(Tc); RH_pct = float(RH_pct); P_pa = float(P_pa)
+            except Exception:
+                return _np.nan
             if not (_np.isfinite(Tc) and _np.isfinite(RH_pct) and _np.isfinite(P_pa) and P_pa > 1000.0):
                 return _np.nan
-            # Tetens saturation pressure (Pa), adequate for runtime display
+            # Tetens saturation pressure (Pa)
             psat = 610.94 * math.exp(17.625 * Tc / (Tc + 243.04))
             pw = max(0.0, min(1.0, RH_pct / 100.0)) * psat
             denom = max(1.0, P_pa - pw)
@@ -3316,9 +3326,14 @@ class EPlusUtil:
                 }
             d["_probe_zone_nodes"] = z2nodes
 
-            # Request ZONE variables (use correct names)
+            # Request ZONE variables (include both Air/Mean names for T, w, RH)
             for z in z2nodes:
-                for nm in ("Zone Mean Air Temperature", "Zone Air Humidity Ratio", "Zone Air CO2 Concentration"):
+                for nm in (
+                    "Zone Mean Air Temperature", "Zone Air Temperature",
+                    "Zone Air Humidity Ratio", "Zone Mean Air Humidity Ratio",
+                    "Zone Air Relative Humidity", "Zone Mean Air Relative Humidity",
+                    "Zone Air CO2 Concentration"
+                ):
                     try: ex.request_variable(s, nm, z)
                     except Exception: pass
 
@@ -3365,10 +3380,19 @@ class EPlusUtil:
             z2nodes = d["_probe_zone_nodes"]
             zones = list(z2nodes.keys())
 
-            d["_probe_h_zone_T"]   = {z: H("Zone Mean Air Temperature", z)   for z in zones}
-            d["_probe_h_zone_w"]   = {z: H("Zone Air Humidity Ratio",   z)   for z in zones}
-            d["_probe_h_zone_CO2"] = {z: H("Zone Air CO2 Concentration", z)  for z in zones}
+            # Zone handles (T, w, RH) with Air+Mean variants
+            d["_probe_h_zone_T_mean"] = {z: H("Zone Mean Air Temperature", z)      for z in zones}
+            d["_probe_h_zone_T_air"]  = {z: H("Zone Air Temperature", z)            for z in zones}
 
+            d["_probe_h_zone_w_air"]  = {z: H("Zone Air Humidity Ratio", z)         for z in zones}
+            d["_probe_h_zone_w_mean"] = {z: H("Zone Mean Air Humidity Ratio", z)    for z in zones}
+
+            d["_probe_h_zone_rh_air"]  = {z: H("Zone Air Relative Humidity", z)     for z in zones}
+            d["_probe_h_zone_rh_mean"] = {z: H("Zone Mean Air Relative Humidity", z)for z in zones}
+
+            d["_probe_h_zone_CO2"] = {z: H("Zone Air CO2 Concentration", z)         for z in zones}
+
+            # Site handles
             d["_probe_h_site_T"]   = H("Site Outdoor Air Drybulb Temperature",   "Environment")
             d["_probe_h_site_w"]   = H("Site Outdoor Air Humidity Ratio",        "Environment")
             d["_probe_h_site_RH"]  = H("Site Outdoor Air Relative Humidity",     "Environment")
@@ -3390,7 +3414,7 @@ class EPlusUtil:
                 znode_handles[z] = tuples
             d["_probe_znode_handles"] = znode_handles
 
-            # debug once
+            # one-shot debug
             for z, tuples in znode_handles.items():
                 parts = []
                 for (hm, hT, hw, hRH, hC), nname in zip(tuples, z2nodes[z]):
@@ -3400,7 +3424,10 @@ class EPlusUtil:
                         f"w={'ok' if hw!=-1 else ('rh' if hRH!=-1 else 'NA')}, "
                         f"CO2={'ok' if hC!=-1 else 'NA'}"
                     )
-                self._log(1, f"[probe] {z} inlet nodes → " + ("; ".join(parts) if parts else "none"))
+                try:
+                    self._log(1, f"[probe] {z} inlet nodes → " + ("; ".join(parts) if parts else "none"))
+                except Exception:
+                    pass
 
             d["_probe_handles_ready"] = True
             # proceed to read this same tick
@@ -3416,7 +3443,7 @@ class EPlusUtil:
         # Site/outdoor (compute w if direct var missing)
         oT = v(d["_probe_h_site_T"])
         ow = v(d["_probe_h_site_w"])
-        if ow != ow:
+        if not _np.isfinite(ow):
             oRH = v(d["_probe_h_site_RH"])
             oP  = v(d["_probe_h_site_P"])
             ow  = _w_from_T_RH_P(oT, oRH, oP)
@@ -3428,31 +3455,39 @@ class EPlusUtil:
 
         # Zones
         zones_data = {}
+        P_site = v(d["_probe_h_site_P"])  # for psychro fallbacks
+
         for z, tuples in d["_probe_znode_handles"].items():
-            zT = v(d["_probe_h_zone_T"].get(z, -1))
-            zw = v(d["_probe_h_zone_w"].get(z, -1))  # this now uses 'Zone Air Humidity Ratio'
+            # Zone T: prefer Mean, then Air
+            zT = v(d["_probe_h_zone_T_mean"].get(z, -1))
+            if not _np.isfinite(zT):
+                zT = v(d["_probe_h_zone_T_air"].get(z, -1))
+
+            # Zone w: try Air, then Mean; else compute from RH (Air → Mean)
+            zw = v(d["_probe_h_zone_w_air"].get(z, -1))
+            if not _np.isfinite(zw):
+                zw = v(d["_probe_h_zone_w_mean"].get(z, -1))
+            if not _np.isfinite(zw):
+                zRH = v(d["_probe_h_zone_rh_air"].get(z, -1))
+                if not _np.isfinite(zRH):
+                    zRH = v(d["_probe_h_zone_rh_mean"].get(z, -1))
+                zw = _w_from_T_RH_P(zT, zRH, P_site)
+
+            # Zone CO2
             zC = v(d["_probe_h_zone_CO2"].get(z, -1))
 
-            m_list = []
-            T_list = []
-            w_list = []
-            C_list = []
-            # Use site P for node psychro fallback
-            P_site = v(d["_probe_h_site_P"])
-
+            # Supply (mass-flow-weighted; compute node w from RH if needed)
+            m_list, T_list, w_list, C_list = [], [], [], []
             for (hm, hT, hw, hRH, hC) in tuples:
                 m  = v(hm)
-                if m == m:  # only weight with valid m_dot
+                if m == m:  # valid
                     Tn = v(hT)
                     wn = v(hw)
-                    if wn != wn:  # compute from RH if needed
+                    if not _np.isfinite(wn):
                         RHn = v(hRH)
                         wn  = _w_from_T_RH_P(Tn, RHn, P_site)
                     Cn = v(hC)
-                    m_list.append(m)
-                    T_list.append(Tn)
-                    w_list.append(wn)
-                    C_list.append(Cn)
+                    m_list.append(m); T_list.append(Tn); w_list.append(wn); C_list.append(Cn)
 
             m_sum = float(_np.nansum(m_list)) if m_list else _np.nan
             if m_list:
