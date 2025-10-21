@@ -4011,3 +4011,132 @@ class EPlusUtil:
                             f"batches={d['_kf_batches_written_fast']}, commits={d['_kf_commits_fast']}")
             except Exception:
                 pass
+
+
+    def api_check_zone_humidity_ratio(self, s, **opts):
+        """
+        After-HVAC callback: verify that the API returns Zone Mean Air Humidity Ratio.
+        If missing/NaN, also show a fallback computed from Zone Air RH, Zone Mean T, and Site P.
+
+        Options:
+        zones: list[str] | None = None     # default: all non-plenum zones
+        exclude_patterns: tuple[str,...] = ("PLENUM",)
+        max_zones: int = 6                 # log at most this many zones per tick
+        precision: int = 6
+        log_label: str = "[w-check]"
+        """
+        ex = self.api.exchange
+        if ex.warmup_flag(s):
+            return
+
+        import math
+
+        d = self.__dict__
+        zones_opt      = opts.get("zones", None)
+        exclude_pats   = tuple(opts.get("exclude_patterns", ("PLENUM",)))
+        max_zones      = int(opts.get("max_zones", 6))
+        prec           = int(opts.get("precision", 6))
+        LOG            = str(opts.get("log_label", "[w-check]"))
+
+        # --- one-time: choose zones, request variables, cache handles
+        if d.get("_wcheck_state_id") != id(self.state):
+            d["_wcheck_state_id"] = id(self.state)
+
+            # pick zones
+            if zones_opt:
+                zones = [z for z in zones_opt]
+            else:
+                try:
+                    zones = self.list_zone_names(preferred_sources=("sql","api","idf"))
+                    # exclude common plenums
+                    zones = [z for z in zones if all(p not in z.upper() for p in exclude_pats)]
+                except Exception:
+                    zones = []
+            d["_wcheck_zones"] = zones
+
+            # request variables
+            for z in zones:
+                for nm in ("Zone Mean Air Humidity Ratio",
+                        "Zone Air Relative Humidity",
+                        "Zone Mean Air Temperature"):
+                    try: ex.request_variable(s, nm, z)
+                    except Exception: pass
+            try: ex.request_variable(s, "Site Outdoor Air Barometric Pressure", "Environment")
+            except Exception: pass
+
+            # resolve handles (may need to wait for api_data_fully_ready)
+            d["_wcheck_ready"] = False
+
+        if not d.get("_wcheck_ready", False):
+            if not ex.api_data_fully_ready(s):
+                # wait until E+ says variables are ready
+                return
+            zones = d.get("_wcheck_zones", [])
+            def H(nm, key):
+                try: return ex.get_variable_handle(s, nm, key)
+                except Exception: return -1
+            d["_wcheck_h"] = {
+                "w_mean": {z: H("Zone Mean Air Humidity Ratio", z) for z in zones},
+                "rh":     {z: H("Zone Air Relative Humidity",   z) for z in zones},
+                "T":      {z: H("Zone Mean Air Temperature",    z) for z in zones},
+                "P":           H("Site Outdoor Air Barometric Pressure", "Environment"),
+            }
+            # one-shot handle status
+            try:
+                self._log(1, f"{LOG} handles resolved for {len(zones)} zones.")
+            except Exception: pass
+            d["_wcheck_ready"] = True
+
+        H = d["_wcheck_h"]
+        zones = d.get("_wcheck_zones", [])
+
+        # safe value reader
+        def v(h):
+            if h in (-1, None): return float("nan")
+            try:
+                x = float(ex.get_variable_value(s, h))
+                return x if (x == x) else float("nan")  # NaN check
+            except Exception:
+                return float("nan")
+
+        # psychro fallback: w from T[°C], RH[%], P[Pa] (Tetens)
+        def w_from_T_RH_P(Tc, RH_pct, P_pa):
+            try:
+                if not (Tc == Tc and RH_pct == RH_pct and P_pa == P_pa and P_pa > 1000.0):
+                    return float("nan")
+                psat = 610.94 * math.exp(17.625 * Tc / (Tc + 243.04))
+                pw = max(0.0, min(1.0, RH_pct/100.0)) * psat
+                denom = max(1.0, P_pa - pw)
+                return 0.62198 * pw / denom
+            except Exception:
+                return float("nan")
+
+        # timestamp (best-effort)
+        try:
+            ts = self._occ_current_timestamp(s)
+        except Exception:
+            ts = None
+
+        # --- log a small sample each tick
+        P = v(H["P"])  # site barometric pressure
+        header = f"{LOG} timestamp={ts} (showing up to {max_zones} zones)"
+        try: self._log(1, header)
+        except Exception: pass
+
+        shown = 0
+        for z in zones:
+            if shown >= max_zones:
+                break
+            w_mean = v(H["w_mean"][z])
+            rh     = v(H["rh"][z])
+            T      = v(H["T"][z])
+            w_calc = w_from_T_RH_P(T, rh, P)
+
+            def F(x):  # format or NA
+                return (f"{x:.{prec}g}" if x == x else "NA")
+
+            line = (f"  {z}: w_mean={F(w_mean)}  | T={F(T)}C RH={F(rh)}% P={F(P)}Pa "
+                    f"| w_calc={F(w_calc)}  -> used={'w_mean' if w_mean==w_mean else ('w_calc' if w_calc==w_calc else 'NA')}")
+            try: self._log(1, line)
+            except Exception: pass
+            shown += 1                
