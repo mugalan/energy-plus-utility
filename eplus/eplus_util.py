@@ -3501,11 +3501,19 @@ class EPlusUtil:
         Probe + Kalman filter + SQL persistence (uses probe payload only).
         Skips plenums; carries forward the previous estimate when m_sa≈0.
 
-        Extra opts:
+        Extra opts (existing):
         kf_sigma_P_diag, kf_sigma_R_diag, kf_init_mu, kf_init_cov_diag
-        kf_sql_table="KalmanEstimates", kf_sql_commit_every=200
+        kf_sql_table="KalmanEstimates"
         kf_zones=None, kf_exclude_patterns=("PLENUM",), kf_log=True
         kf_zero_mass_eps=1e-6
+
+        New perf opts (mirrors dummy-fast helper):
+        kf_db_filename: str = "eplusout.sql"         # DB file to write into
+        kf_batch_size: int = 50                      # rows per executemany()
+        kf_commit_every_batches: int = 10            # commit after N batches
+        kf_checkpoint_every_commits: int = 5         # WAL checkpoint cadence
+        kf_journal_mode: str = "WAL"                 # WAL|MEMORY|OFF (OFF unsafe)
+        kf_synchronous: str = "NORMAL"               # FULL|NORMAL|OFF (OFF unsafe)
         """
         ex = self.api.exchange
         if ex.warmup_flag(s):
@@ -3517,8 +3525,9 @@ class EPlusUtil:
         # ---- run your working probe (unchanged) ----
         probe_kwargs = {k:v for k,v in opts.items() if k not in {
             "kf_sigma_P_diag","kf_sigma_R_diag","kf_init_mu","kf_init_cov_diag",
-            "kf_sql_table","kf_sql_commit_every","kf_zones","kf_exclude_patterns","kf_log",
-            "kf_zero_mass_eps"}}
+            "kf_sql_table","kf_zones","kf_exclude_patterns","kf_log","kf_zero_mass_eps",
+            "kf_db_filename","kf_batch_size","kf_commit_every_batches","kf_checkpoint_every_commits",
+            "kf_journal_mode","kf_synchronous"}}
         payload = self.probe_zone_air_and_supply(s, **probe_kwargs)
         if not payload or "zones" not in payload:
             return payload
@@ -3531,11 +3540,18 @@ class EPlusUtil:
         mu0          = _np.asarray(opts.get("kf_init_mu",      [0.0, 20.0, 0.0, 0.008, 400.0]), dtype=float)
         S0_diag      = _np.asarray(opts.get("kf_init_cov_diag",[1.0, 25.0, 1.0, 1e-3, 1e3]), dtype=float)
         table_name   = str(opts.get("kf_sql_table", "KalmanEstimates"))
-        commit_every = int(opts.get("kf_sql_commit_every", 200))
         kf_zones     = opts.get("kf_zones", None)
         excl_pats    = tuple(opts.get("kf_exclude_patterns", ("PLENUM",)))
         do_log       = bool(opts.get("kf_log", True))
         eps_m        = float(opts.get("kf_zero_mass_eps", 1e-6))
+
+        # NEW perf opts
+        db_filename  = str(opts.get("kf_db_filename", "eplusout.sql"))
+        batch_size   = int(opts.get("kf_batch_size", 50))
+        commit_every_batches = int(opts.get("kf_commit_every_batches", 10))
+        checkpoint_every_commits = int(opts.get("kf_checkpoint_every_commits", 5))
+        journal_mode = str(opts.get("kf_journal_mode", "WAL"))
+        synchronous  = str(opts.get("kf_synchronous", "NORMAL"))
 
         Sigma_P = _np.diag(Sigma_P_diag)
         Sigma_R_full = _np.diag(Sigma_R_diag)
@@ -3545,65 +3561,66 @@ class EPlusUtil:
             d["_kf_state_id"] = id(self.state)
             d["_kf_mu"]    = {}  # zone -> (5,)
             d["_kf_Sigma"] = {}  # zone -> (5,5)
-            d["_kf_inserts"] = 0
 
-            assert self.out_dir, "set_model(...) first so out_dir is available."
-            sql_path = os.path.join(self.out_dir, "eplusout.sql")
-            conn = sqlite3.connect(sql_path, timeout=30.0)
-            cur  = conn.cursor()
-            cur.execute(f"""
-                CREATE TABLE IF NOT EXISTS {table_name} (
-                    Timestamp TEXT NOT NULL,
-                    Zone TEXT NOT NULL,
-                    y_T REAL, y_w REAL, y_c REAL,
-                    yhat_T REAL, yhat_w REAL, yhat_c REAL,
-                    alpha_T REAL, beta_T REAL, alpha_m REAL, beta_w REAL, beta_c REAL
-                )
-            """)
-            conn.commit()
-            d["_kf_sql_conn"] = conn
-            d["_kf_sql_cur"]  = cur
+        # --- fast SQL open+schema (reused connection; WAL+synchronous PRAGMAs) ---
+        def _ensure_sql():
+            if d.get("_kf_sql_disabled"):
+                return False
+            # Reuse same DB file; reopen if filename changed across runs
+            if d.get("_kf_sql_conn") and d.get("_kf_sql_cur") and d.get("_kf_sql_db") == db_filename:
+                return True
+            try:
+                assert self.out_dir, "set_model(...) first so out_dir is available."
+                path = os.path.join(self.out_dir, db_filename)
+                conn = sqlite3.connect(path, timeout=30.0)
+                cur  = conn.cursor()
+                try:
+                    cur.execute(f"PRAGMA journal_mode={journal_mode};")
+                    cur.execute(f"PRAGMA synchronous={synchronous};")
+                except Exception:
+                    pass
+                cur.execute(f"""
+                    CREATE TABLE IF NOT EXISTS {table_name} (
+                        Timestamp TEXT NOT NULL,
+                        Zone      TEXT NOT NULL,
+                        y_T   REAL, y_w   REAL, y_c   REAL,
+                        yhat_T REAL, yhat_w REAL, yhat_c REAL,
+                        alpha_T REAL, beta_T REAL, alpha_m REAL, beta_w REAL, beta_c REAL
+                    )
+                """)
+                conn.commit()
+                d["_kf_sql_conn"] = conn
+                d["_kf_sql_cur"]  = cur
+                d["_kf_sql_db"]   = db_filename
+                d["_kf_batch"]    = []     # list of dict rows for executemany
+                d["_kf_batches_written"] = 0
+                d["_kf_commits"]  = 0
+                d["_kf_sql_insert"] = f"""
+                    INSERT INTO {table_name}
+                    (Timestamp, Zone,
+                    y_T, y_w, y_c,
+                    yhat_T, yhat_w, yhat_c,
+                    alpha_T, beta_T, alpha_m, beta_w, beta_c)
+                    VALUES
+                    (:ts, :zone,
+                    :y_T, :y_w, :y_c,
+                    :yhat_T, :yhat_w, :yhat_c,
+                    :alpha_T, :beta_T, :alpha_m, :beta_w, :beta_c)
+                """
+                return True
+            except sqlite3.DatabaseError as e:
+                try: self._log(1, f"[kf-sql] DISABLED (open): {e}")
+                except Exception: pass
+                d["_kf_sql_disabled"] = True
+                return False
 
-        # --- open/create SQL and table once (unchanged filename) ---
-        assert self.out_dir, "set_model(...) first so out_dir is available."
-        sql_path = os.path.join(self.out_dir, "eplusout.sql")
+        if not _ensure_sql():
+            return payload
 
-        conn = sqlite3.connect(sql_path, timeout=30.0)
-        cur  = conn.cursor()
-
-        # Use WAL for fewer write conflicts (safe; no-op if already set)
-        try:
-            cur.execute("PRAGMA journal_mode=WAL;")
-        except Exception:
-            pass
-
-        # Keep same schema; make sure types are flexible
-        cur.execute(f"""
-            CREATE TABLE IF NOT EXISTS {table_name} (
-                Timestamp TEXT NOT NULL,
-                Zone      TEXT NOT NULL,
-                y_T   REAL, y_w   REAL, y_c   REAL,
-                yhat_T REAL, yhat_w REAL, yhat_c REAL,
-                alpha_T REAL, beta_T REAL, alpha_m REAL, beta_w REAL, beta_c REAL
-            )
-        """)
-        conn.commit()
-
-        d["_kf_sql_conn"] = conn
-        d["_kf_sql_cur"]  = cur
-
+        # ---- tiny helpers (unchanged semantics) ----
         def _to_iso_ts(ts_obj) -> str:
-            """
-            Return an ISO 'YYYY-MM-DD HH:MM:SS' string.
-            Falls back to the current sim timestamp if needed.
-            """
-            # Preferred: probe-provided timestamp
             if ts_obj:
-                s = str(ts_obj)
-                # Normalize common variants to ISO-like format pandas can parse
-                # e.g., '2002-01-21 00:15:00'
-                return s.replace("T", " ")  # in case it is ISO with 'T'
-            # Fallback: rebuild from API clock
+                return str(ts_obj).replace("T", " ")
             try:
                 yr = int(self.api.exchange.year(self.state))
                 m  = int(self.api.exchange.month(self.state))
@@ -3615,23 +3632,18 @@ class EPlusUtil:
                 return ""
 
         def _to_num(x):
-            """Finite float or None (so SQLite gets NULL)."""
             try:
-                import numpy as _np
-                if x is None: return None
+                if x is None:
+                    return None
                 xv = float(x)
-                if _np.isnan(xv) or _np.isinf(xv): return None
-                return xv
+                if _np.isfinite(xv):
+                    return xv
             except Exception:
-                return None
+                pass
+            return None
 
+        # ---- batched insert (minimal change to your previous _ins) ----
         def _ins(ts, zone_name: str, names, y_vec, yhat_vec, mu_vec):
-            """
-            Robust insert using labels. `names` is a list like ['T'] or ['T','w'] or
-            ['T','w','CO2']. Missing components are written as NULL.
-            """
-            import sqlite3
-
             # map helper: label -> numeric (or None)
             def _get(_names, _vec, lbl):
                 try:
@@ -3659,32 +3671,29 @@ class EPlusUtil:
                 "beta_c":  _to_num(mu_vec[4]),
             }
 
-            sql = f"""
-                INSERT INTO {table_name}
-                (Timestamp, Zone,
-                y_T, y_w, y_c,
-                yhat_T, yhat_w, yhat_c,
-                alpha_T, beta_T, alpha_m, beta_w, beta_c)
-                VALUES
-                (:ts, :zone,
-                :y_T, :y_w, :y_c,
-                :yhat_T, :yhat_w, :yhat_c,
-                :alpha_T, :beta_T, :alpha_m, :beta_w, :beta_c)
-            """
-
-            try:
-                d["_kf_sql_cur"].execute(sql, row)
-                d["_kf_inserts"] += 1
-                if d["_kf_inserts"] % commit_every == 0:
-                    d["_kf_sql_conn"].commit()
-            except sqlite3.DatabaseError as e:
-                # Do not attempt recovery; just log once per tick to avoid spam
-                if not d.get("_kf_sql_last_err_logged"):
-                    try:
-                        self._log(1, f"[kf-sql] insert failed: {e}")
-                    except Exception:
-                        pass
-                    d["_kf_sql_last_err_logged"] = True
+            d["_kf_batch"].append(row)
+            if len(d["_kf_batch"]) >= batch_size:
+                cur = d["_kf_sql_cur"]
+                sql = d["_kf_sql_insert"]
+                try:
+                    cur.executemany(sql, d["_kf_batch"])
+                    d["_kf_batch"].clear()
+                    d["_kf_batches_written"] += 1
+                    if d["_kf_batches_written"] % commit_every_batches == 0:
+                        d["_kf_sql_conn"].commit()
+                        d["_kf_commits"] += 1
+                        if journal_mode.upper() == "WAL" and (d["_kf_commits"] % checkpoint_every_commits == 0):
+                            try: cur.execute("PRAGMA wal_checkpoint(TRUNCATE);")
+                            except Exception: pass
+                except sqlite3.DatabaseError as e:
+                    # Disable further writes for this run (no recovery)
+                    d["_kf_sql_disabled"] = True
+                    try: self._log(1, f"[kf-sql] insert disabled: {e}")
+                    except Exception: pass
+                    try: d["_kf_sql_conn"].close()
+                    except Exception: pass
+                    d["_kf_sql_conn"] = None
+                    d["_kf_sql_cur"]  = None
 
         def _ensure_zone(z):
             if z not in d["_kf_mu"]:
@@ -3718,9 +3727,7 @@ class EPlusUtil:
             m_sa = Z["supply"].get("m_dot_kgs")
 
             # Build φ rows based on available measurements
-            rows = []
-            y_vals = []
-            names = []
+            rows, y_vals, names = [], [], []
 
             def _fin(x):
                 try: return _np.isfinite(float(x))
@@ -3769,7 +3776,6 @@ class EPlusUtil:
                 d["_kf_Sigma"][z] = S_k
                 mode = "update"
             else:
-                # Carry forward previous estimate; compute yhat from previous state
                 mu_k   = mu_prev
                 S_k    = S_prev
                 yhat_k = (phi @ mu_prev).reshape(-1)
@@ -3777,10 +3783,10 @@ class EPlusUtil:
                 d["_kf_Sigma"][z] = S_prev
                 mode = "carry"
 
-            # Insert into SQL
+            # Batched insert into SQL
             _ins(ts, z, names, y.reshape(-1), yhat_k, d["_kf_mu"][z])
 
-            # Logging
+            # Logging (unchanged)
             if do_log:
                 name_to_idx = {nm:i for i,nm in enumerate(names)}
                 def pick(arr, nm):
@@ -3796,12 +3802,8 @@ class EPlusUtil:
                     (f"{pick(yhat_k,'CO2'):.1f}" if pick(yhat_k,'CO2') is not None else "NA"),
                     f"{aT:.4f}", f"{bT:.4f}", f"{am:.4f}", f"{bw:.6f}", f"{bc:.2f}")
                 )
-        # Commit frequently (cheap)
-        try:
-            d["_kf_sql_conn"].commit()
-        except Exception:
-            pass
 
+        # (Optional) you can flush at end-of-sim in another callback; here we leave batch to be committed on cadence
         return payload
 
     def kf_dummy_sql_writer_fast(self, s, **opts):
