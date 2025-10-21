@@ -3711,154 +3711,154 @@ class EPlusUtil:
 
         return mu_k.reshape(-1), S_k, yhat_k.reshape(-1), K                 
 
+    # def _kf_random_walk_update_simdkalman_v0(
+    #     self,
+    #     phi,           # (m, n)
+    #     y,             # (m,) or (m,1)
+    #     mu_prev,       # (n,) or (n,1)
+    #     S_prev,        # (n, n)
+    #     Sigma_P,       # (n, n)
+    #     Sigma_R        # (m, m)
+    # ):
+    #     """
+    #     One-step Kalman filter update using simdkalman for the random-walk model:
+
+    #     x_k = I x_{k-1} + w_{k-1},   w ~ N(0, Sigma_P)
+    #     y_k = phi_k x_k + v_k,       v ~ N(0, Sigma_R)
+
+    #     Returns (mu_k_flat, S_k, yhat_k_flat, K) where K is the Kalman gain
+    #     computed explicitly for convenience.
+    #     """
+    #     import numpy as np
+    #     import simdkalman
+
+    #     # coerce shapes
+    #     phi     = np.asarray(phi, dtype=float)
+    #     y       = np.asarray(y,   dtype=float).reshape(-1)
+    #     mu_prev = np.asarray(mu_prev, dtype=float).reshape(-1)
+    #     S_prev  = np.asarray(S_prev,  dtype=float)
+    #     Q       = np.asarray(Sigma_P, dtype=float)
+    #     R       = np.asarray(Sigma_R, dtype=float)
+
+    #     m, n = phi.shape
+    #     assert mu_prev.shape[0] == n and S_prev.shape == (n, n)
+    #     assert y.shape[0] == m and R.shape == (m, m) and Q.shape == (n, n)
+
+    #     # Random-walk: A = I
+    #     A = np.eye(n, dtype=float)
+
+    #     # Build a KF instance for this step (H = phi_k changes each tick)
+    #     kf = simdkalman.KalmanFilter(
+    #         state_transition   = A,   # A
+    #         process_noise      = Q,   # Q
+    #         observation_model  = phi, # H (time-varying, so pass current phi)
+    #         observation_noise  = R    # R
+    #     )
+
+    #     # Time update: (mu^-, S^-)
+    #     mu_prior, S_prior = kf.predict_next(mu_prev, S_prev)   # E[x_k|k-1], Cov[x_k|k-1]
+
+    #     # Measurement update: (mu_k, S_k)
+    #     mu_k, S_k = kf.update(mu_prior, S_prior, y)[:2]        # E[x_k|k], Cov[x_k|k]
+
+    #     # Predicted observation from posterior: \hat{y}_k = H mu_k
+    #     # (could also use kf.predict_observation(mu_k, S_k)[0])
+    #     yhat_k = phi @ mu_k
+
+    #     # Kalman gain K = S^- H^T (H S^- H^T + R)^{-1} (handy to return)
+    #     S_innov = phi @ S_prior @ phi.T + R
+    #     K = S_prior @ phi.T @ np.linalg.pinv(S_innov)
+
+    #     return mu_k.reshape(-1), S_k, yhat_k.reshape(-1), K
+
+
     def _kf_random_walk_update_simdkalman(
         self,
         phi,           # (m, n)
         y,             # (m,) or (m,1)
         mu_prev,       # (n,) or (n,1)
-        S_prev,        # (n, n)
-        Sigma_P,       # (n, n)
-        Sigma_R        # (m, m)
+        S_prev,        # (n,n) or (n,) diag
+        Sigma_P,       # (n,n) or (n,) diag
+        Sigma_R,       # (m,m) or (m,) diag
+        *,
+        nonneg_idx=None,   # iterable of integer indices to clip to >= 0 (e.g. [3,4])
+        eps=1e-9           # tiny variance bump when clipping
     ):
         """
-        One-step Kalman filter update using simdkalman for the random-walk model:
-
-        x_k = I x_{k-1} + w_{k-1},   w ~ N(0, Sigma_P)
-        y_k = phi_k x_k + v_k,       v ~ N(0, Sigma_R)
-
-        Returns (mu_k_flat, S_k, yhat_k_flat, K) where K is the Kalman gain
-        computed explicitly for convenience.
+        One-step Kalman update using simdkalman for a random-walk model (A=I).
+        Robust to 1-D vs 2-D covariance outputs and supports optional
+        nonnegativity projection on selected state components.
+        Returns: (mu_k_flat, S_k_mat, yhat_k_flat)
         """
         import numpy as np
         import simdkalman
 
-        # coerce shapes
+        # --- normalize shapes ---
         phi     = np.asarray(phi, dtype=float)
-        y       = np.asarray(y,   dtype=float).reshape(-1)
+        y       = np.asarray(y, dtype=float).reshape(-1)
         mu_prev = np.asarray(mu_prev, dtype=float).reshape(-1)
-        S_prev  = np.asarray(S_prev,  dtype=float)
-        Q       = np.asarray(Sigma_P, dtype=float)
-        R       = np.asarray(Sigma_R, dtype=float)
+        S_prev  = np.asarray(S_prev, dtype=float)
+        Sigma_P = np.asarray(Sigma_P, dtype=float)
+        Sigma_R = np.asarray(Sigma_R, dtype=float)
 
-        m, n = phi.shape
-        assert mu_prev.shape[0] == n and S_prev.shape == (n, n)
-        assert y.shape[0] == m and R.shape == (m, m) and Q.shape == (n, n)
+        n = mu_prev.shape[0]
+        m = phi.shape[0]
 
-        # Random-walk: A = I
-        A = np.eye(n, dtype=float)
+        # ensure 2-D covariances for the filter construction
+        def _to_cov2d(C, dim):
+            C = np.asarray(C, dtype=float)
+            if C.ndim == 0:
+                return np.eye(dim) * float(C)
+            if C.ndim == 1:
+                # treat as diagonal
+                return np.diag(C.reshape(-1))
+            return C
 
-        # Build a KF instance for this step (H = phi_k changes each tick)
+        P_prev = _to_cov2d(S_prev, n)
+        Q      = _to_cov2d(Sigma_P, n)
+        R      = _to_cov2d(Sigma_R, m)
+
+        # build per-step KF (A = I for random walk; H = phi)
+        I = np.eye(n)
         kf = simdkalman.KalmanFilter(
-            state_transition   = A,   # A
-            process_noise      = Q,   # Q
-            observation_model  = phi, # H (time-varying, so pass current phi)
-            observation_noise  = R    # R
+            state_transition = I,
+            process_noise    = Q,
+            observation_model= phi,
+            observation_noise= R
         )
 
-        # Time update: (mu^-, S^-)
-        mu_prior, S_prior = kf.predict_next(mu_prev, S_prev)   # E[x_k|k-1], Cov[x_k|k-1]
+        # predict & update
+        m_minus, P_minus = kf.predict_next(mu_prev, P_prev)
+        m_post, P_post   = kf.update(m_minus, P_minus, y)
 
-        # Measurement update: (mu_k, S_k)
-        mu_k, S_k = kf.update(mu_prior, S_prior, y)[:2]        # E[x_k|k], Cov[x_k|k]
+        # enforce nonnegativity if requested
+        if nonneg_idx:
+            m_post = np.asarray(m_post, dtype=float).reshape(-1)
+            P_post = np.asarray(P_post, dtype=float)
+            # covariance may be returned as 1-D (diag) or 2-D
+            if P_post.ndim == 1:
+                # bump diagonal variances for clipped components
+                for i in nonneg_idx:
+                    if i < 0 or i >= n: continue
+                    if m_post[i] < 0.0:
+                        m_post[i] = 0.0
+                        P_post[i] = float(P_post[i]) + eps
+                # turn into 2-D matrix for uniform downstream handling
+                P_post = np.diag(P_post)
+            else:
+                for i in nonneg_idx:
+                    if i < 0 or i >= n: continue
+                    if m_post[i] < 0.0:
+                        m_post[i] = 0.0
+                        P_post[i, i] = float(P_post[i, i]) + eps
+        else:
+            m_post = np.asarray(m_post, dtype=float).reshape(-1)
+            P_post = _to_cov2d(P_post, n)
 
-        # Predicted observation from posterior: \hat{y}_k = H mu_k
-        # (could also use kf.predict_observation(mu_k, S_k)[0])
-        yhat_k = phi @ mu_k
+        # yhat = phi mu
+        yhat = phi @ m_post
 
-        # Kalman gain K = S^- H^T (H S^- H^T + R)^{-1} (handy to return)
-        S_innov = phi @ S_prior @ phi.T + R
-        K = S_prior @ phi.T @ np.linalg.pinv(S_innov)
-
-        return mu_k.reshape(-1), S_k, yhat_k.reshape(-1), K
-
-
-    # def _kf_random_walk_update_simdkalman(
-    #     self,
-    #     phi,           # (m, n)
-    #     y,             # (m,) or (m,1)
-    #     mu_prev,       # (n,) or (n,1)
-    #     S_prev,        # (n,n) or (n,) diag
-    #     Sigma_P,       # (n,n) or (n,) diag
-    #     Sigma_R,       # (m,m) or (m,) diag
-    #     *,
-    #     nonneg_idx=None,   # iterable of integer indices to clip to >= 0 (e.g. [3,4])
-    #     eps=1e-9           # tiny variance bump when clipping
-    # ):
-    #     """
-    #     One-step Kalman update using simdkalman for a random-walk model (A=I).
-    #     Robust to 1-D vs 2-D covariance outputs and supports optional
-    #     nonnegativity projection on selected state components.
-    #     Returns: (mu_k_flat, S_k_mat, yhat_k_flat)
-    #     """
-    #     import numpy as np
-    #     import simdkalman
-
-    #     # --- normalize shapes ---
-    #     phi     = np.asarray(phi, dtype=float)
-    #     y       = np.asarray(y, dtype=float).reshape(-1)
-    #     mu_prev = np.asarray(mu_prev, dtype=float).reshape(-1)
-    #     S_prev  = np.asarray(S_prev, dtype=float)
-    #     Sigma_P = np.asarray(Sigma_P, dtype=float)
-    #     Sigma_R = np.asarray(Sigma_R, dtype=float)
-
-    #     n = mu_prev.shape[0]
-    #     m = phi.shape[0]
-
-    #     # ensure 2-D covariances for the filter construction
-    #     def _to_cov2d(C, dim):
-    #         C = np.asarray(C, dtype=float)
-    #         if C.ndim == 0:
-    #             return np.eye(dim) * float(C)
-    #         if C.ndim == 1:
-    #             # treat as diagonal
-    #             return np.diag(C.reshape(-1))
-    #         return C
-
-    #     P_prev = _to_cov2d(S_prev, n)
-    #     Q      = _to_cov2d(Sigma_P, n)
-    #     R      = _to_cov2d(Sigma_R, m)
-
-    #     # build per-step KF (A = I for random walk; H = phi)
-    #     I = np.eye(n)
-    #     kf = simdkalman.KalmanFilter(
-    #         state_transition = I,
-    #         process_noise    = Q,
-    #         observation_model= phi,
-    #         observation_noise= R
-    #     )
-
-    #     # predict & update
-    #     m_minus, P_minus = kf.predict_next(mu_prev, P_prev)
-    #     m_post, P_post   = kf.update(m_minus, P_minus, y)
-
-    #     # enforce nonnegativity if requested
-    #     if nonneg_idx:
-    #         m_post = np.asarray(m_post, dtype=float).reshape(-1)
-    #         P_post = np.asarray(P_post, dtype=float)
-    #         # covariance may be returned as 1-D (diag) or 2-D
-    #         if P_post.ndim == 1:
-    #             # bump diagonal variances for clipped components
-    #             for i in nonneg_idx:
-    #                 if i < 0 or i >= n: continue
-    #                 if m_post[i] < 0.0:
-    #                     m_post[i] = 0.0
-    #                     P_post[i] = float(P_post[i]) + eps
-    #             # turn into 2-D matrix for uniform downstream handling
-    #             P_post = np.diag(P_post)
-    #         else:
-    #             for i in nonneg_idx:
-    #                 if i < 0 or i >= n: continue
-    #                 if m_post[i] < 0.0:
-    #                     m_post[i] = 0.0
-    #                     P_post[i, i] = float(P_post[i, i]) + eps
-    #     else:
-    #         m_post = np.asarray(m_post, dtype=float).reshape(-1)
-    #         P_post = _to_cov2d(P_post, n)
-
-    #     # yhat = phi mu
-    #     yhat = phi @ m_post
-
-    #     return m_post, P_post, np.asarray(yhat, dtype=float).reshape(-1)
+        return m_post, P_post, np.asarray(yhat, dtype=float).reshape(-1)
 
     def probe_zone_air_and_supply_with_kf(self, s, **opts):
         """
@@ -4171,20 +4171,20 @@ class EPlusUtil:
             # mu_k, S_k, yhat_k, _K = self._kf_random_walk_update(
             #     phi, y, mu_prev, S_prev, Sigma_P, Sigma_R_full, use_pinv=True
             # )
-            mu_k, S_k, yhat_k, K = self._kf_random_walk_update_simdkalman(
-                phi, y, mu_prev, S_prev, Sigma_P, Sigma_R_full
-            )
+            # mu_k, S_k, yhat_k, K = self._kf_random_walk_update_simdkalman_v0(
+            #     phi, y, mu_prev, S_prev, Sigma_P, Sigma_R_full
+            # )
 
-            # mu_k, S_k, yhat_k = self._kf_random_walk_update_simdkalman(
-            #     phi=phi,
-            #     y=y.reshape(-1),
-            #     mu_prev=mu_prev.reshape(-1),
-            #     S_prev=S_prev,
-            #     Sigma_P=Sigma_P,
-            #     Sigma_R=Sigma_R_full,
-            #     nonneg_idx=opts.get("kf_nonneg_idx", [3, 4]),  # e.g. enforce β_w, β_c >= 0
-            #     eps=1e-9
-            # )            
+            mu_k, S_k, yhat_k = self._kf_random_walk_update_simdkalman(
+                phi=phi,
+                y=y.reshape(-1),
+                mu_prev=d["_kf_mu"][z],
+                S_prev=d["_kf_Sigma"][z],
+                Sigma_P=Sigma_P,
+                Sigma_R=Sigma_R_full,
+                nonneg_idx=opts.get("kf_nonneg_idx")  # e.g., [3,4]
+            )
+           
             d["_kf_mu"][z]    = mu_k
             d["_kf_Sigma"][z] = S_k
 
