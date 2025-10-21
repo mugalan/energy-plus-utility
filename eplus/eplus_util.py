@@ -3804,15 +3804,25 @@ class EPlusUtil:
 
         return payload
 
-    def kf_dummy_sql_writer(self, s, **opts):
+    def kf_dummy_sql_writer_fast(self, s, **opts):
         """
-        Minimal runtime test of the SQL insert helper with dummy data.
-        Writes a row each callback using labels ['T'], ['T','w'] or ['T','w','CO2'].
-        Options:
-        table         : str  = "KalmanEstimatesTest"
-        commit_every  : int  = 20
-        run_during_warmup : bool = False
-        db_filename   : str  = "eplusout_kf_test.sqlite"  # use "eplusout.sql" to target EP DB
+        Lean runtime test of the SQL insert path with dummy data.
+        Optimizations:
+        - single connection reused
+        - batched inserts (executemany)
+        - periodic WAL checkpoint
+        - throttled logging
+
+        Options (sane defaults):
+        table: str = "KalmanEstimatesTest"
+        db_filename: str = "eplusout_kf_test.sqlite"   # use "eplusout.sql" to hit EP DB
+        batch_size: int = 50                            # rows per executemany
+        commit_every_batches: int = 10                  # commit after N batches
+        checkpoint_every_commits: int = 5               # WAL checkpoint cadence
+        log_every_ticks: int | None = 200               # None = no logs
+        run_during_warmup: bool = False
+        journal_mode: str = "WAL"                       # WAL | MEMORY | OFF (OFF is unsafe)
+        synchronous: str = "NORMAL"                     # FULL | NORMAL | OFF (OFF is unsafe)
         """
         import os, sqlite3, numpy as _np
 
@@ -3821,11 +3831,16 @@ class EPlusUtil:
             return
 
         d = self.__dict__
-        table_name   = str(opts.get("table", "KalmanEstimatesTest"))
-        commit_every = int(opts.get("commit_every", 20))
-        db_filename  = str(opts.get("db_filename", "eplusout_kf_test.sqlite"))
+        table         = str(opts.get("table", "KalmanEstimatesTest"))
+        db_filename   = str(opts.get("db_filename", "eplusout_kf_test.sqlite"))
+        batch_size    = int(opts.get("batch_size", 50))
+        commit_every_batches = int(opts.get("commit_every_batches", 10))
+        checkpoint_every_commits = int(opts.get("checkpoint_every_commits", 5))
+        log_every_ticks = opts.get("log_every_ticks", 200)
+        journal_mode  = str(opts.get("journal_mode", "WAL"))
+        synchronous   = str(opts.get("synchronous", "NORMAL"))
 
-        # --- helpers (same shapes/names your _ins expects) ---
+        # --- fast helpers ---
         def _to_iso_ts(ts_obj) -> str:
             if ts_obj:
                 return str(ts_obj).replace("T", " ")
@@ -3842,29 +3857,31 @@ class EPlusUtil:
         def _to_num(x):
             try:
                 v = float(x)
-                return None if (not _np.isfinite(v)) else v
+                if _np.isfinite(v):
+                    return v
             except Exception:
-                return None
+                pass
+            return None
 
-        # --- one-time SQL open / schema ---
-        d.setdefault("_kf_sql_disabled", False)
-        d.setdefault("_kf_sql_conn", None)
-        d.setdefault("_kf_sql_cur", None)
-        d.setdefault("_kf_sql_db_filename", None)
-
-        def _ensure_sql_ready():
-            if d["_kf_sql_disabled"]:
+        # --- open DB once + schema + PRAGMAs ---
+        def _ensure_sql():
+            if d.get("_kf_sql_disabled_fast"):
                 return False
-            if d["_kf_sql_conn"] is not None and d["_kf_sql_cur"] is not None and d["_kf_sql_db_filename"] == db_filename:
+            if d.get("_kf_sql_conn_fast") and d.get("_kf_sql_cur_fast") and d.get("_kf_sql_db_fast") == db_filename:
                 return True
-            # (re)open on first run or if filename changed
             try:
                 assert self.out_dir, "set_model(...) first so out_dir is available."
-                sql_path = os.path.join(self.out_dir, db_filename)
-                conn = sqlite3.connect(sql_path, timeout=30.0)
+                path = os.path.join(self.out_dir, db_filename)
+                conn = sqlite3.connect(path, timeout=30.0)
                 cur  = conn.cursor()
+                # light tuning
+                try:
+                    cur.execute(f"PRAGMA journal_mode={journal_mode};")
+                    cur.execute(f"PRAGMA synchronous={synchronous};")
+                except Exception:
+                    pass
                 cur.execute(f"""
-                    CREATE TABLE IF NOT EXISTS {table_name} (
+                    CREATE TABLE IF NOT EXISTS {table} (
                         Timestamp TEXT NOT NULL,
                         Zone      TEXT NOT NULL,
                         y_T   REAL, y_w   REAL, y_c   REAL,
@@ -3873,108 +3890,112 @@ class EPlusUtil:
                     )
                 """)
                 conn.commit()
-                d["_kf_sql_conn"], d["_kf_sql_cur"] = conn, cur
-                d["_kf_sql_db_filename"] = db_filename
-                d["_kf_inserts"] = 0
+                d["_kf_sql_conn_fast"] = conn
+                d["_kf_sql_cur_fast"]  = cur
+                d["_kf_sql_db_fast"]   = db_filename
+                d["_kf_batch_fast"]    = []         # list of dict rows
+                d["_kf_batches_written_fast"] = 0
+                d["_kf_commits_fast"]  = 0
+                # pre-bind SQL
+                d["_kf_sql_insert_fast"] = f"""
+                    INSERT INTO {table}
+                    (Timestamp, Zone,
+                    y_T, y_w, y_c,
+                    yhat_T, yhat_w, yhat_c,
+                    alpha_T, beta_T, alpha_m, beta_w, beta_c)
+                    VALUES
+                    (:ts, :zone,
+                    :y_T, :y_w, :y_c,
+                    :yhat_T, :yhat_w, :yhat_c,
+                    :alpha_T, :beta_T, :alpha_m, :beta_w, :beta_c)
+                """
                 return True
             except sqlite3.DatabaseError as e:
-                try: self._log(1, f"[dummy-sql] DISABLED (open): {e}")
+                try: self._log(1, f"[dummy-fast] DISABLED (open): {e}")
                 except Exception: pass
-                d["_kf_sql_disabled"] = True
-                d["_kf_sql_conn"] = None
-                d["_kf_sql_cur"]  = None
+                d["_kf_sql_disabled_fast"] = True
                 return False
 
-        # --- the tested insert helper (uses labels) ---
-        def _ins(ts, zone_name: str, names, y_vec, yhat_vec, mu_vec):
-            import sqlite3
-            def _get(_names, _vec, lbl):
-                try:
-                    i = _names.index(lbl); return _to_num(_vec[i])
-                except Exception:
-                    return None
-            if d["_kf_sql_disabled"] or not _ensure_sql_ready():
-                return
-            row = {
-                "ts":      _to_iso_ts(ts),
-                "zone":    str(zone_name),
-                "y_T":     _get(names, y_vec,   "T"),
-                "y_w":     _get(names, y_vec,   "w"),
-                "y_c":     _get(names, y_vec,   "CO2"),
-                "yhat_T":  _get(names, yhat_vec, "T"),
-                "yhat_w":  _get(names, yhat_vec, "w"),
-                "yhat_c":  _get(names, yhat_vec, "CO2"),
-                "alpha_T": _to_num(mu_vec[0]),
-                "beta_T":  _to_num(mu_vec[1]),
-                "alpha_m": _to_num(mu_vec[2]),
-                "beta_w":  _to_num(mu_vec[3]),
-                "beta_c":  _to_num(mu_vec[4]),
-            }
-            sql = f"""
-                INSERT INTO {table_name}
-                (Timestamp, Zone,
-                y_T, y_w, y_c,
-                yhat_T, yhat_w, yhat_c,
-                alpha_T, beta_T, alpha_m, beta_w, beta_c)
-                VALUES
-                (:ts, :zone,
-                :y_T, :y_w, :y_c,
-                :yhat_T, :yhat_w, :yhat_c,
-                :alpha_T, :beta_T, :alpha_m, :beta_w, :beta_c)
-            """
+        if not _ensure_sql():
+            return
+
+        # --- create a tiny dummy row (no allocations beyond minimal dict) ---
+        # pick a stable zone name
+        if "_kf_dummy_zone_fast" not in d:
             try:
-                d["_kf_sql_cur"].execute(sql, row)
-                d["_kf_inserts"] += 1
-                if d["_kf_inserts"] % commit_every == 0:
-                    d["_kf_sql_conn"].commit()
-            except sqlite3.DatabaseError as e:
-                if not d.get("_kf_sql_last_err_logged"):
-                    try: self._log(1, f"[dummy-sql] insert failed: {e}")
-                    except Exception: pass
-                    d["_kf_sql_last_err_logged"] = True
-                d["_kf_sql_disabled"] = True
-                try:
-                    if d["_kf_sql_conn"]: d["_kf_sql_conn"].close()
-                except Exception:
-                    pass
-                d["_kf_sql_conn"] = None
-                d["_kf_sql_cur"]  = None
+                zlist = self.list_zone_names(preferred_sources=("sql","api","idf"))
+                d["_kf_dummy_zone_fast"] = zlist[0] if zlist else "TEST-ZONE"
+            except Exception:
+                d["_kf_dummy_zone_fast"] = "TEST-ZONE"
+        zone = d["_kf_dummy_zone_fast"]
 
-        # --- generate dummy data and insert ---
-        # pick a zone label
-        try:
-            zlist = self.list_zone_names(preferred_sources=("sql","api","idf"))
-            zone  = zlist[0] if zlist else "TEST-ZONE"
-        except Exception:
-            zone = "TEST-ZONE"
+        # deterministic light math (no RNG allocations)
+        d["_kf_tick_fast"] = d.get("_kf_tick_fast", 0) + 1
+        k = d["_kf_tick_fast"]
 
-        # deterministic dummy stream
-        d.setdefault("_kf_dummy_counter", 0)
-        d.setdefault("_kf_rng", _np.random.default_rng(12345))
-        d["_kf_dummy_counter"] += 1
-        k = d["_kf_dummy_counter"]
+        # vary label set to exercise mapping, but keep constant shapes in storage (we just null missing)
+        labels_cycle = (("T",), ("T","w"), ("T","w","CO2"))
+        names = labels_cycle[k % 3]
 
-        # vary which labels we include so we exercise the mapping
-        seq = [["T"], ["T","w"], ["T","w","CO2"]]
-        names = seq[k % 3]
-
-        # create vectors matching names
         T  = 22.0 + 0.5 * _np.sin(0.1*k)
         w  = 0.008 + 1e-4 * _np.cos(0.2*k)
         c  = 400.0 + 10.0 * _np.sin(0.05*k)
 
-        y_map    = {"T": T,          "w": w,          "CO2": c}
-        yhat_map = {"T": T + 0.1,    "w": w + 1e-5,   "CO2": c + 5.0}
-        mu_vec   = _np.array([0.02, 23.5, 0.001, 0.0081, 405.0], dtype=float)  # 5-element state
+        y_map    = {"T": T,        "w": w,         "CO2": c}
+        yhat_map = {"T": T + 0.1,  "w": w + 1e-5,  "CO2": c + 5.0}
+        mu = (0.02, 23.5, 0.001, 0.0081, 405.0)
 
-        y_vec    = _np.array([y_map[nm] for nm in names], dtype=float)
-        yhat_vec = _np.array([yhat_map[nm] for nm in names], dtype=float)
+        def _pick(lbls, mp, key):
+            return _to_num(mp[key]) if key in lbls else None
 
-        ts = getattr(self, "_occ_current_timestamp", lambda _s: None)(s)
-        _ins(ts, zone, names, y_vec, yhat_vec, mu_vec)
+        row = {
+            "ts":      _to_iso_ts(getattr(self, "_occ_current_timestamp", lambda _s: None)(s)),
+            "zone":    str(zone),
+            "y_T":     _pick(names, y_map, "T"),
+            "y_w":     _pick(names, y_map, "w"),
+            "y_c":     _pick(names, y_map, "CO2"),
+            "yhat_T":  _pick(names, yhat_map, "T"),
+            "yhat_w":  _pick(names, yhat_map, "w"),
+            "yhat_c":  _pick(names, yhat_map, "CO2"),
+            "alpha_T": _to_num(mu[0]),
+            "beta_T":  _to_num(mu[1]),
+            "alpha_m": _to_num(mu[2]),
+            "beta_w":  _to_num(mu[3]),
+            "beta_c":  _to_num(mu[4]),
+        }
 
-        # lightweight heartbeat
-        try:
-            self._log(1, f"[dummy-sql] wrote {names} for zone='{zone}'")
-        except Exception:
-            pass        
+        # --- batch + executemany ---
+        d["_kf_batch_fast"].append(row)
+        if len(d["_kf_batch_fast"]) >= batch_size:
+            cur = d["_kf_sql_cur_fast"]
+            sql = d["_kf_sql_insert_fast"]
+            try:
+                cur.executemany(sql, d["_kf_batch_fast"])
+                d["_kf_batch_fast"].clear()     # free memory immediately
+                d["_kf_batches_written_fast"] += 1
+                if d["_kf_batches_written_fast"] % commit_every_batches == 0:
+                    d["_kf_sql_conn_fast"].commit()
+                    d["_kf_commits_fast"] += 1
+                    # Periodic WAL checkpoint to keep files small
+                    if journal_mode.upper() == "WAL" and (d["_kf_commits_fast"] % checkpoint_every_commits == 0):
+                        try: cur.execute("PRAGMA wal_checkpoint(TRUNCATE);")
+                        except Exception: pass
+            except sqlite3.DatabaseError as e:
+                # disable on first error to avoid loops
+                d["_kf_sql_disabled_fast"] = True
+                try: self._log(1, f"[dummy-fast] insert disabled: {e}")
+                except Exception: pass
+                try:
+                    d["_kf_sql_conn_fast"].close()
+                except Exception:
+                    pass
+                d["_kf_sql_conn_fast"] = None
+                d["_kf_sql_cur_fast"]  = None
+
+        # --- throttle logging hard (or disable by setting log_every_ticks=None) ---
+        if (log_every_ticks is not None) and (k % int(log_every_ticks) == 0):
+            try:
+                self._log(1, f"[dummy-fast] wrote {batch_size}x rows (zone='{zone}'), "
+                            f"batches={d['_kf_batches_written_fast']}, commits={d['_kf_commits_fast']}")
+            except Exception:
+                pass
