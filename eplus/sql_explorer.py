@@ -433,3 +433,102 @@ class EPlusSqlExplorer:
             return pd.read_sql_query(q, conn, params=params)
         finally:
             conn.close()
+
+
+    def get_table_data(self, db="eplus_out/eplusout_kf_test.sqlite", table="KalmanEstimates",
+                        *, timestamp_candidates=("Timestamp","DateTime","dateTime","TIME","Time","ts","time_stamp","date_time"),
+                        verbose=True):
+        """
+        Load *all* rows from a given SQLite table and return them as a DataFrame.
+
+        Generalized behavior:
+        - Works with any DB filename and table name (SQLite).
+        - Detects a timestamp-like column (prefers 'Timestamp' if present, else tries common candidates, case-insensitive).
+        - Parses that column to pandas datetime (errors='coerce').
+        - Prints quick stats: row count, time range (if timestamp found), top 'Zone' (case-insensitive) values.
+
+        Returns:
+        pandas.DataFrame (possibly with a parsed datetime column).
+        """
+
+        # Resolve DB path
+        path = db
+        if not os.path.exists(path):
+            if verbose:
+                print(f"[check] DB not found: {path}")
+            return None
+
+        # SQLite identifier quoting
+        def _q(ident: str) -> str:
+            return '"' + str(ident).replace('"', '""') + '"'
+
+        with sqlite3.connect(path) as con:
+            # 1) Table exists?
+            tabs = pd.read_sql_query("SELECT name FROM sqlite_master WHERE type='table'", con)
+            names = set(tabs["name"].astype(str).tolist())
+            if table not in names:
+                if verbose:
+                    print(f"[check] Table '{table}' NOT found in {path}. Available: {sorted(names)}")
+                return None
+
+            # 2) Row count (cheap)
+            n = pd.read_sql_query(f"SELECT COUNT(*) AS n FROM {_q(table)}", con)["n"].iat[0]
+            if verbose:
+                print(f"[check] {os.path.basename(path)} | table={table} : {n} rows")
+
+            # 3) Pull schema to detect columns
+            schema = pd.read_sql_query(f"PRAGMA table_info({_q(table)})", con)
+            cols = schema["name"].astype(str).tolist()
+            cols_lower = {c.lower(): c for c in cols}
+
+            # Timestamp detection (prefer exact 'Timestamp' if present)
+            ts_col = None
+            if "timestamp" in cols_lower:
+                ts_col = cols_lower["timestamp"]
+            else:
+                # Try candidates in order, case-insensitive
+                for cand in timestamp_candidates:
+                    c = cand.lower()
+                    if c in cols_lower:
+                        ts_col = cols_lower[c]
+                        break
+
+            # Zone detection (case-insensitive)
+            zone_col = cols_lower.get("zone", None)
+
+            # 4) Load all rows
+            df = pd.read_sql_query(f"SELECT * FROM {_q(table)}", con)
+
+        # 5) Parse the timestamp column if found
+        if ts_col and ts_col in df.columns:
+            df[ts_col] = pd.to_datetime(df[ts_col], errors="coerce")
+            if verbose:
+                # Compute time range safely
+                if not df[ts_col].dropna().empty:
+                    start, end = df[ts_col].min(), df[ts_col].max()
+                    print(f"[check] Time range ({ts_col}): {start} → {end}")
+                else:
+                    print(f"[check] Timestamp column '{ts_col}' present but could not parse any valid datetimes.")
+        else:
+            if verbose:
+                print(f"[check] No timestamp-like column found. Searched: "
+                    f"{['Timestamp'] + list(timestamp_candidates)}")
+
+        # 6) Top zones (if column exists)
+        if zone_col and zone_col in df.columns:
+            try:
+                topz = (df[zone_col].astype(str)
+                            .value_counts()
+                            .head(10)
+                            .reset_index())
+                topz.columns = [zone_col, "n"]
+                if verbose:
+                    print(f"[check] Top zones: {topz.to_dict('records')}")
+            except Exception:
+                if verbose:
+                    print("[check] Unable to compute top zones.")
+        else:
+            if verbose:
+                print("[check] No 'Zone' column (case-insensitive) found.")
+
+        return df
