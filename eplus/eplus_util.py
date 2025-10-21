@@ -3505,18 +3505,10 @@ class EPlusUtil:
         - If current measurement is NA -> use last available for that zone/outdoor.
         - If no history yet -> use 0.0.
 
-        Extra opts (unchanged):
-        kf_sigma_P_diag, kf_sigma_R_diag, kf_init_mu, kf_init_cov_diag
-        kf_sql_table="KalmanEstimates"
-        kf_zones=None, kf_exclude_patterns=("PLENUM",), kf_log=True
-
-        Perf opts (unchanged, batched I/O):
-        kf_db_filename="eplusout.sql"
-        kf_batch_size=50
-        kf_commit_every_batches=10
-        kf_checkpoint_every_commits=5
-        kf_journal_mode="WAL"
-        kf_synchronous="NORMAL"
+        Extra opts (unchanged): kf_sigma_P_diag, kf_sigma_R_diag, kf_init_mu, kf_init_cov_diag,
+                                kf_sql_table, kf_zones, kf_exclude_patterns, kf_log
+        Perf opts (unchanged):  kf_db_filename, kf_batch_size, kf_commit_every_batches,
+                                kf_checkpoint_every_commits, kf_journal_mode, kf_synchronous
         """
         ex = self.api.exchange
         if ex.warmup_flag(s):
@@ -3567,6 +3559,8 @@ class EPlusUtil:
             d["_kf_last_out"] = {}        # {'T':..., 'w':..., 'c':...}
             d["_kf_last_air"] = {}        # zone -> {'T':...,'w':...,'c':...}
             d["_kf_last_sup"] = {}        # zone -> {'T':...,'w':...,'c':...}
+            # NEW: per-zone handle for Zone Mean Air Humidity Ratio
+            d["_kf_h_zone_w_mean"] = {}   # zone -> handle (int)
 
         # --- fast SQL open+schema (reused connection; WAL+synchronous PRAGMAs) ---
         def _ensure_sql():
@@ -3597,7 +3591,7 @@ class EPlusUtil:
                 d["_kf_sql_conn"] = conn
                 d["_kf_sql_cur"]  = cur
                 d["_kf_sql_db"]   = db_filename
-                d["_kf_batch"]    = []     # list of dict rows for executemany
+                d["_kf_batch"]    = []
                 d["_kf_batches_written"] = 0
                 d["_kf_commits"]  = 0
                 d["_kf_sql_insert"] = f"""
@@ -3650,6 +3644,28 @@ class EPlusUtil:
         def _fin(x):
             try: return _np.isfinite(float(x))
             except Exception: return False
+
+        # NEW: lazy ensure + read "Zone Mean Air Humidity Ratio" handle/value
+        def _zone_w_mean(z):
+            """Return Zone Mean Air Humidity Ratio for zone z if available, else None."""
+            h = d["_kf_h_zone_w_mean"].get(z, None)
+            if h is None:
+                try:
+                    ex.request_variable(s, "Zone Mean Air Humidity Ratio", z)
+                except Exception:
+                    pass
+                try:
+                    h = ex.get_variable_handle(s, "Zone Mean Air Humidity Ratio", z)
+                except Exception:
+                    h = -1
+                d["_kf_h_zone_w_mean"][z] = h
+            if h is None or h == -1:
+                return None
+            try:
+                v = float(ex.get_variable_value(s, h))
+                return v if _fin(v) else None
+            except Exception:
+                return None
 
         # forward-fill helpers (no mass flow)
         def _ffill_out(key, val, default=0.0):
@@ -3739,17 +3755,27 @@ class EPlusUtil:
         for z in zones_use:
             Z = payload["zones"][z]
 
-            # Zone air (forward-fill)
-            yT = _ffill_zone("air", z, "T", Z["air"].get("Tdb_C"),      0.0)
-            yw = _ffill_zone("air", z, "w", Z["air"].get("w_kgperkg"),  0.0)
-            yc = _ffill_zone("air", z, "c", Z["air"].get("co2_ppm"),    0.0)
+            # Zone air: use payload; if w is NaN, try direct 'Zone Mean Air Humidity Ratio'
+            yT = Z["air"].get("Tdb_C")
+            yw = Z["air"].get("w_kgperkg")
+            if not _fin(yw):
+                v_alt = _zone_w_mean(z)          # NEW: fallback read
+                if v_alt is not None:
+                    yw = v_alt
 
-            # Supply (forward-fill)
+            yc = Z["air"].get("co2_ppm")
+
+            # Now forward-fill (after fallback)
+            yT = _ffill_zone("air", z, "T", yT, 0.0)
+            yw = _ffill_zone("air", z, "w", yw, 0.0)
+            yc = _ffill_zone("air", z, "c", yc, 0.0)
+
+            # Supply (forward-fill from payload as-is)
             sT = _ffill_zone("sup", z, "T", Z["supply"].get("Tdb_C"),     0.0)
             sw = _ffill_zone("sup", z, "w", Z["supply"].get("w_kgperkg"), 0.0)
             sc = _ffill_zone("sup", z, "c", Z["supply"].get("co2_ppm"),   0.0)
 
-            # Build φ and y (always 3 rows via ffill)
+            # Build φ and y
             phi = _np.asarray([
                 [ (oT - sT), 1.0, 0.0,     0.0, 0.0 ],
                 [ 0.0,       0.0, (ow-sw), 1.0, 0.0 ],
@@ -3762,7 +3788,7 @@ class EPlusUtil:
             mu_prev = d["_kf_mu"][z].reshape(5,1)
             S_prev  = d["_kf_Sigma"][z]
 
-            # Always update (no mass-flow gating)
+            # Update every tick (no mass-flow gating)
             mu_minus = mu_prev
             S_minus  = S_prev + Sigma_P
             R = Sigma_R_full
@@ -3776,10 +3802,9 @@ class EPlusUtil:
             d["_kf_mu"][z]    = mu_k.reshape(-1)
             d["_kf_Sigma"][z] = S_k
 
-            # Batched insert into SQL
+            # Batched insert
             _ins(ts, z, names, y.reshape(-1), yhat_k, d["_kf_mu"][z])
 
-            # Logging
             if do_log:
                 aT,bT,am,bw,bc = d["_kf_mu"][z]
                 self._log(
