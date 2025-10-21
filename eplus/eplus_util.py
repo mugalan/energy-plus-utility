@@ -3711,68 +3711,68 @@ class EPlusUtil:
 
         return mu_k.reshape(-1), S_k, yhat_k.reshape(-1), K                 
 
-    # def _kf_random_walk_update_simdkalman_v0(
-    #     self,
-    #     phi,           # (m, n)
-    #     y,             # (m,) or (m,1)
-    #     mu_prev,       # (n,) or (n,1)
-    #     S_prev,        # (n, n)
-    #     Sigma_P,       # (n, n)
-    #     Sigma_R        # (m, m)
-    # ):
-    #     """
-    #     One-step Kalman filter update using simdkalman for the random-walk model:
-
-    #     x_k = I x_{k-1} + w_{k-1},   w ~ N(0, Sigma_P)
-    #     y_k = phi_k x_k + v_k,       v ~ N(0, Sigma_R)
-
-    #     Returns (mu_k_flat, S_k, yhat_k_flat, K) where K is the Kalman gain
-    #     computed explicitly for convenience.
-    #     """
-    #     import numpy as np
-    #     import simdkalman
-
-    #     # coerce shapes
-    #     phi     = np.asarray(phi, dtype=float)
-    #     y       = np.asarray(y,   dtype=float).reshape(-1)
-    #     mu_prev = np.asarray(mu_prev, dtype=float).reshape(-1)
-    #     S_prev  = np.asarray(S_prev,  dtype=float)
-    #     Q       = np.asarray(Sigma_P, dtype=float)
-    #     R       = np.asarray(Sigma_R, dtype=float)
-
-    #     m, n = phi.shape
-    #     assert mu_prev.shape[0] == n and S_prev.shape == (n, n)
-    #     assert y.shape[0] == m and R.shape == (m, m) and Q.shape == (n, n)
-
-    #     # Random-walk: A = I
-    #     A = np.eye(n, dtype=float)
-
-    #     # Build a KF instance for this step (H = phi_k changes each tick)
-    #     kf = simdkalman.KalmanFilter(
-    #         state_transition   = A,   # A
-    #         process_noise      = Q,   # Q
-    #         observation_model  = phi, # H (time-varying, so pass current phi)
-    #         observation_noise  = R    # R
-    #     )
-
-    #     # Time update: (mu^-, S^-)
-    #     mu_prior, S_prior = kf.predict_next(mu_prev, S_prev)   # E[x_k|k-1], Cov[x_k|k-1]
-
-    #     # Measurement update: (mu_k, S_k)
-    #     mu_k, S_k = kf.update(mu_prior, S_prior, y)[:2]        # E[x_k|k], Cov[x_k|k]
-
-    #     # Predicted observation from posterior: \hat{y}_k = H mu_k
-    #     # (could also use kf.predict_observation(mu_k, S_k)[0])
-    #     yhat_k = phi @ mu_k
-
-    #     # Kalman gain K = S^- H^T (H S^- H^T + R)^{-1} (handy to return)
-    #     S_innov = phi @ S_prior @ phi.T + R
-    #     K = S_prior @ phi.T @ np.linalg.pinv(S_innov)
-
-    #     return mu_k.reshape(-1), S_k, yhat_k.reshape(-1), K
-
-
     def _kf_random_walk_update_simdkalman(
+        self,
+        phi,           # (m, n)
+        y,             # (m,) or (m,1)
+        mu_prev,       # (n,) or (n,1)
+        S_prev,        # (n, n)
+        Sigma_P,       # (n, n)
+        Sigma_R        # (m, m)
+    ):
+        """
+        One-step Kalman filter update using simdkalman for the random-walk model:
+
+        x_k = I x_{k-1} + w_{k-1},   w ~ N(0, Sigma_P)
+        y_k = phi_k x_k + v_k,       v ~ N(0, Sigma_R)
+
+        Returns (mu_k_flat, S_k, yhat_k_flat, K) where K is the Kalman gain
+        computed explicitly for convenience.
+        """
+        import numpy as np
+        import simdkalman
+
+        # coerce shapes
+        phi     = np.asarray(phi, dtype=float)
+        y       = np.asarray(y,   dtype=float).reshape(-1)
+        mu_prev = np.asarray(mu_prev, dtype=float).reshape(-1)
+        S_prev  = np.asarray(S_prev,  dtype=float)
+        Q       = np.asarray(Sigma_P, dtype=float)
+        R       = np.asarray(Sigma_R, dtype=float)
+
+        m, n = phi.shape
+        assert mu_prev.shape[0] == n and S_prev.shape == (n, n)
+        assert y.shape[0] == m and R.shape == (m, m) and Q.shape == (n, n)
+
+        # Random-walk: A = I
+        A = np.eye(n, dtype=float)
+
+        # Build a KF instance for this step (H = phi_k changes each tick)
+        kf = simdkalman.KalmanFilter(
+            state_transition   = A,   # A
+            process_noise      = Q,   # Q
+            observation_model  = phi, # H (time-varying, so pass current phi)
+            observation_noise  = R    # R
+        )
+
+        # Time update: (mu^-, S^-)
+        mu_prior, S_prior = kf.predict_next(mu_prev, S_prev)   # E[x_k|k-1], Cov[x_k|k-1]
+
+        # Measurement update: (mu_k, S_k)
+        mu_k, S_k = kf.update(mu_prior, S_prior, y)[:2]        # E[x_k|k], Cov[x_k|k]
+
+        # Predicted observation from posterior: \hat{y}_k = H mu_k
+        # (could also use kf.predict_observation(mu_k, S_k)[0])
+        yhat_k = phi @ mu_k
+
+        # Kalman gain K = S^- H^T (H S^- H^T + R)^{-1} (handy to return)
+        S_innov = phi @ S_prior @ phi.T + R
+        K = S_prior @ phi.T @ np.linalg.pinv(S_innov)
+
+        return mu_k.reshape(-1), S_k, yhat_k.reshape(-1), K
+
+
+    def _kf_random_walk_update_simdkalman_v2(
         self,
         phi,           # (m, n)
         y,             # (m,) or (m,1)
@@ -4168,22 +4168,22 @@ class EPlusUtil:
             S_prev  = d["_kf_Sigma"][z]
 
             # === Kalman update via helper ===
-            # mu_k, S_k, yhat_k, _K = self._kf_random_walk_update(
-            #     phi, y, mu_prev, S_prev, Sigma_P, Sigma_R_full, use_pinv=True
-            # )
-            # mu_k, S_k, yhat_k, K = self._kf_random_walk_update_simdkalman_v0(
-            #     phi, y, mu_prev, S_prev, Sigma_P, Sigma_R_full
-            # )
-
-            mu_k, S_k, yhat_k = self._kf_random_walk_update_simdkalman(
-                phi=phi,
-                y=y.reshape(-1),
-                mu_prev=d["_kf_mu"][z],
-                S_prev=d["_kf_Sigma"][z],
-                Sigma_P=Sigma_P,
-                Sigma_R=Sigma_R_full,
-                nonneg_idx=opts.get("kf_nonneg_idx")  # e.g., [3,4]
+            mu_k, S_k, yhat_k, _K = self._kf_random_walk_update(
+                phi, y, mu_prev, S_prev, Sigma_P, Sigma_R_full, use_pinv=True
             )
+            mu_k, S_k, yhat_k, K = self._kf_random_walk_update_simdkalman(
+                phi, y, mu_prev, S_prev, Sigma_P, Sigma_R_full
+            )
+
+            # mu_k, S_k, yhat_k = self._kf_random_walk_update_simdkalman_v2(
+            #     phi=phi,
+            #     y=y.reshape(-1),
+            #     mu_prev=d["_kf_mu"][z],
+            #     S_prev=d["_kf_Sigma"][z],
+            #     Sigma_P=Sigma_P,
+            #     Sigma_R=Sigma_R_full,
+            #     nonneg_idx=opts.get("kf_nonneg_idx")  # e.g., [3,4]
+            # )
            
             d["_kf_mu"][z]    = mu_k
             d["_kf_Sigma"][z] = S_k
@@ -4201,52 +4201,3 @@ class EPlusUtil:
 
         return payload
 
-    def get_kf_estimates(self, db="eplusout_kf_test.sqlite", table="KalmanEstimates"):
-        """
-        Load *all* rows from the given SQLite table and return them as a DataFrame.
-        Also prints some quick stats (row count, time range, top zones).
-        """
-        util=self
-        path = os.path.join(util.out_dir, db)
-        if not os.path.exists(path):
-            print(f"[check] DB not found: {path}")
-            return None
-
-        with sqlite3.connect(path) as con:
-            # 1) Table exists?
-            tabs = pd.read_sql_query("SELECT name FROM sqlite_master WHERE type='table'", con)
-            names = set(tabs["name"].tolist())
-            if table not in names:
-                print(f"[check] Table '{table}' NOT found. Available: {sorted(names)}")
-                return None
-
-            # 2) Row count
-            n = pd.read_sql_query(f"SELECT COUNT(*) AS n FROM {table}", con)["n"].iat[0]
-            print(f"[check] {table}: {n} rows")
-
-            # 3) Time range + top zones
-            try:
-                rng = pd.read_sql_query(f"SELECT MIN(Timestamp) AS start, MAX(Timestamp) AS end FROM {table}", con)
-                start, end = rng["start"].iat[0], rng["end"].iat[0]
-                print(f"[check] Time range: {start} → {end}")
-            except Exception:
-                print("[check] No Timestamp column or unable to compute time range.")
-
-            try:
-                zdf = pd.read_sql_query(
-                    f"SELECT Zone, COUNT(*) AS n FROM {table} GROUP BY Zone ORDER BY n DESC LIMIT 10", con
-                )
-                print(f"[check] Top zones: {zdf.to_dict('records')}")
-            except Exception:
-                print("[check] No Zone column or unable to compute top zones.")
-
-            # 4) Return ALL rows
-            df = pd.read_sql_query(f"SELECT * FROM {table}", con)
-
-        # Parse a timestamp column if present
-        for c in ("Timestamp","DateTime","Time","ts"):
-            if c in df.columns:
-                df[c] = pd.to_datetime(df[c], errors="coerce")
-                break
-
-        return df
