@@ -4201,8 +4201,6 @@ class EPlusUtil:
 
         return payload
 
-
-
     def get_kf_estimates(self, db="eplusout_kf_test.sqlite", table="KalmanEstimates"):
         """
         Load *all* rows from the given SQLite table and return them as a DataFrame.
