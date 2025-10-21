@@ -3712,82 +3712,82 @@ class EPlusUtil:
         return mu_k.reshape(-1), S_k, yhat_k.reshape(-1), K                 
 
 
-def _kf_random_walk_update_simdkalman(
-    self,
-    phi,           # (m, n)
-    y,             # (m,) or (m,1)
-    mu_prev,       # (n,) or (n,1)
-    S_prev,        # (n, n)
-    Sigma_P,       # (n, n)
-    Sigma_R,       # (m, m)
-    *,
-    positive_idx="all",     # "all" | sequence of indices | None
-    min_val=1e-9,           # floor applied to constrained components
-    clamp_cov_diag=1e-6     # posterior var to assign on clamped comps
-):
-    """
-    One-step random-walk KF via simdkalman with optional positivity constraints.
-    If 'positive_idx' is "all", all state elements are clamped to >= min_val.
-    If it's a list/tuple of indices, only those components are constrained.
-    If None, no constraints are applied.
+    def _kf_random_walk_update_simdkalman(
+        self,
+        phi,           # (m, n)
+        y,             # (m,) or (m,1)
+        mu_prev,       # (n,) or (n,1)
+        S_prev,        # (n, n)
+        Sigma_P,       # (n, n)
+        Sigma_R,       # (m, m)
+        *,
+        positive_idx="all",     # "all" | sequence of indices | None
+        min_val=1e-9,           # floor applied to constrained components
+        clamp_cov_diag=1e-6     # posterior var to assign on clamped comps
+    ):
+        """
+        One-step random-walk KF via simdkalman with optional positivity constraints.
+        If 'positive_idx' is "all", all state elements are clamped to >= min_val.
+        If it's a list/tuple of indices, only those components are constrained.
+        If None, no constraints are applied.
 
-    Returns (mu_k_flat, S_k, yhat_k_flat, K).
-    """
-    import numpy as np
-    import simdkalman
+        Returns (mu_k_flat, S_k, yhat_k_flat, K).
+        """
+        import numpy as np
+        import simdkalman
 
-    # --- coerce shapes
-    phi     = np.asarray(phi, dtype=float)
-    y       = np.asarray(y,   dtype=float).reshape(-1)
-    mu_prev = np.asarray(mu_prev, dtype=float).reshape(-1)
-    S_prev  = np.asarray(S_prev,  dtype=float)
-    Q       = np.asarray(Sigma_P, dtype=float)
-    R       = np.asarray(Sigma_R, dtype=float)
+        # --- coerce shapes
+        phi     = np.asarray(phi, dtype=float)
+        y       = np.asarray(y,   dtype=float).reshape(-1)
+        mu_prev = np.asarray(mu_prev, dtype=float).reshape(-1)
+        S_prev  = np.asarray(S_prev,  dtype=float)
+        Q       = np.asarray(Sigma_P, dtype=float)
+        R       = np.asarray(Sigma_R, dtype=float)
 
-    m, n = phi.shape
-    assert mu_prev.shape[0] == n and S_prev.shape == (n, n)
-    assert y.shape[0] == m and R.shape == (m, m) and Q.shape == (n, n)
+        m, n = phi.shape
+        assert mu_prev.shape[0] == n and S_prev.shape == (n, n)
+        assert y.shape[0] == m and R.shape == (m, m) and Q.shape == (n, n)
 
-    # --- build per-step KF (time-varying H = phi)
-    A = np.eye(n, dtype=float)
-    kf = simdkalman.KalmanFilter(
-        state_transition  = A,
-        process_noise     = Q,
-        observation_model = phi,
-        observation_noise = R
-    )
+        # --- build per-step KF (time-varying H = phi)
+        A = np.eye(n, dtype=float)
+        kf = simdkalman.KalmanFilter(
+            state_transition  = A,
+            process_noise     = Q,
+            observation_model = phi,
+            observation_noise = R
+        )
 
-    # --- predict & update
-    mu_prior, S_prior = kf.predict_next(mu_prev, S_prev)
-    mu_k, S_k = kf.update(mu_prior, S_prior, y)[:2]      # posterior state mean/cov
-    yhat_k = phi @ mu_k
+        # --- predict & update
+        mu_prior, S_prior = kf.predict_next(mu_prev, S_prev)
+        mu_k, S_k = kf.update(mu_prior, S_prior, y)[:2]      # posterior state mean/cov
+        yhat_k = phi @ mu_k
 
-    # --- Kalman gain (optional to return)
-    S_innov = phi @ S_prior @ phi.T + R
-    K = S_prior @ phi.T @ np.linalg.pinv(S_innov)
+        # --- Kalman gain (optional to return)
+        S_innov = phi @ S_prior @ phi.T + R
+        K = S_prior @ phi.T @ np.linalg.pinv(S_innov)
 
-    # --- positivity projection (optional)
-    if positive_idx is not None:
-        if positive_idx == "all":
-            idx = np.arange(n)
-        else:
-            idx = np.asarray(list(positive_idx), dtype=int)
-        # find negative (or below floor) entries among constrained set
-        mask = mu_k[idx] < min_val
-        if np.any(mask):
-            neg_idx = idx[mask]
-            # clamp mean
-            mu_k[neg_idx] = min_val
-            # shrink posterior covariance along those coordinates to keep PSD and “sticky”
-            S_k[neg_idx, :] = 0.0
-            S_k[:, neg_idx] = 0.0
-            for j in neg_idx:
-                S_k[j, j] = clamp_cov_diag
+        # --- positivity projection (optional)
+        if positive_idx is not None:
+            if positive_idx == "all":
+                idx = np.arange(n)
+            else:
+                idx = np.asarray(list(positive_idx), dtype=int)
+            # find negative (or below floor) entries among constrained set
+            mask = mu_k[idx] < min_val
+            if np.any(mask):
+                neg_idx = idx[mask]
+                # clamp mean
+                mu_k[neg_idx] = min_val
+                # shrink posterior covariance along those coordinates to keep PSD and “sticky”
+                S_k[neg_idx, :] = 0.0
+                S_k[:, neg_idx] = 0.0
+                for j in neg_idx:
+                    S_k[j, j] = clamp_cov_diag
 
-            # (Optional) also adjust yhat_k to reflect clamped mu_k
-            yhat_k = phi @ mu_k
+                # (Optional) also adjust yhat_k to reflect clamped mu_k
+                yhat_k = phi @ mu_k
 
-    return mu_k.reshape(-1), S_k, yhat_k.reshape(-1), K
+        return mu_k.reshape(-1), S_k, yhat_k.reshape(-1), K
 
     def probe_zone_air_and_supply_with_kf(self, s, **opts):
         """
