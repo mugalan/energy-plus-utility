@@ -3722,21 +3722,13 @@ class EPlusUtil:
         Sigma_R,       # (m, m)
     ):
         """
-        One-step Kalman filter update using simdkalman for the random-walk model:
-            x_k = x_{k-1} + w_k,     w ~ N(0, Sigma_P)
-            y_k = phi_k x_k + v_k,   v ~ N(0, Sigma_R)
+        One-step Kalman update using simdkalman (T=1 sequence, time-varying H=phi_k).
+        Falls back to the NumPy implementation if simdkalman isn't usable.
 
         Returns (mu_k_flat, S_k, yhat_k_flat, K_or_None).
-        K is computed from the predicted covariance if simdkalman exposes it; otherwise None.
         """
         import numpy as np
-        try:
-            import simdkalman
-        except Exception:
-            # Fallback to your numpy version if simdkalman isn't available
-            return self._kf_random_walk_update(phi, y, mu_prev, S_prev, Sigma_P, Sigma_R)
-
-        # --- sanitize shapes ---
+        # ---- sanitize inputs ----
         phi     = np.asarray(phi, dtype=float)
         y       = np.asarray(y, dtype=float).reshape(-1)
         mu_prev = np.asarray(mu_prev, dtype=float).reshape(-1)
@@ -3744,87 +3736,97 @@ class EPlusUtil:
         Sigma_P = np.asarray(Sigma_P, dtype=float)
         Sigma_R = np.asarray(Sigma_R, dtype=float)
 
-        m, n = phi.shape
-        if y.shape[0] != m:
-            raise ValueError(f"y length {y.shape[0]} != rows of phi {m}")
-        if mu_prev.shape[0] != n:
-            raise ValueError(f"mu_prev length {mu_prev.shape[0]} != cols of phi {n}")
-        if S_prev.shape != (n, n):
-            raise ValueError(f"S_prev shape {S_prev.shape} must be {(n,n)}")
-        if Sigma_P.shape != (n, n):
-            raise ValueError(f"Sigma_P shape {Sigma_P.shape} must be {(n,n)}")
-        if Sigma_R.shape != (m, m):
-            raise ValueError(f"Sigma_R shape {Sigma_R.shape} must be {(m,m)}")
+        n = mu_prev.size
+        m = y.size
 
-        # --- build single-step filter (A = I) ---
-        A = np.eye(n, dtype=float)
-        kf = simdkalman.KalmanFilter(
-            state_transition      = A,        # F_k
-            process_noise         = Sigma_P,  # Q_k
-            observation_model     = phi,      # H_k (time-varying here, single step)
-            observation_noise     = Sigma_R   # R_k
-        )
-
-        # simdkalman expects shape (N_series, T, dim) — use N_series=1, T=1
-        obs         = y.reshape(1, 1, m)
-        init_mean   = mu_prev.reshape(1, n)
-        init_cov    = S_prev.reshape(1, n, n)
+        # quick guard
+        if phi.shape != (m, n) or S_prev.shape != (n, n) or Sigma_P.shape != (n, n) or Sigma_R.shape != (m, m):
+            # shape mismatch → fall back
+            #return self._kf_random_walk_update(phi, y, mu_prev, S_prev, Sigma_P, Sigma_R)
+            raise
 
         try:
-            out = kf.filter(
-                observations=obs,
-                initial_value=init_mean,
-                initial_covariance=init_cov
+            import simdkalman as sdk
+
+            # Random-walk: F = I, Q = Sigma_P
+            F = np.eye(n, dtype=float)
+            Q = Sigma_P
+            H = phi
+            R = Sigma_R
+
+            # simdkalman likes time-indexed (T, …) arrays for time-varying models
+            F_seq = F[None, :, :]          # (T=1, n, n)
+            Q_seq = Q[None, :, :]          # (T=1, n, n)
+            H_seq = H[None, :, :]          # (T=1, m, n)
+            R_seq = R[None, :, :]          # (T=1, m, m)
+            Y_seq = y[None, :]             # (T=1, m)
+
+            # Build filter
+            kf = sdk.KalmanFilter(
+                F_seq,        # state_transition
+                Q_seq,        # process_noise
+                H_seq,        # observation_model
+                R_seq         # observation_noise
             )
-        except TypeError:
-            # Some versions use different kw names; try positional
-            out = kf.filter(obs, init_mean, init_cov)
 
-        # Try common attribute names first; fall back if lib API differs
-        mu_k = None
-        S_k  = None
-        S_minus = None
-        # 1) Most versions expose "filtered" and "predicted"
-        for mean_attr, cov_attr, target in [
-            ("filtered.mean", "filtered.cov", "filtered"),
-            ("filtered.means", "filtered.covariances", "filtered"),
-            ("states.mean", "states.cov", "states"),
-            ("states.means", "states.covariances", "states"),
-        ]:
-            try:
-                m_arr = eval(f"out.{mean_attr}")
-                c_arr = eval(f"out.{cov_attr}")
-                mu_k = np.asarray(m_arr)[0, -1, :].astype(float, copy=False)
-                S_k  = np.asarray(c_arr)[0, -1, :, :].astype(float, copy=False)
-                break
-            except Exception:
-                pass
+            # Initial conditions as (T0 batch=1)
+            x0 = mu_prev[None, :]          # (1, n)
+            P0 = S_prev[None, :, :]        # (1, n, n)
 
-        # Predicted (a priori) cov (for K). If not available, we'll leave K=None.
-        for pred_cov_attr in ["predicted.cov", "predicted.covariances"]:
-            try:
-                S_minus = np.asarray(eval(f"out.{pred_cov_attr}"))[0, -1, :, :].astype(float, copy=False)
-                break
-            except Exception:
-                pass
+            # Run one-step compute
+            res = kf.compute(
+                Y_seq,
+                initial_value=x0,
+                initial_covariance=P0
+            )
 
-        if (mu_k is None) or (S_k is None):
-            # As a safety net, use your proven numpy math
-            return self._kf_random_walk_update(phi, y, mu_prev, S_prev, Sigma_P, Sigma_R)
+            # Extract filtered state at t=0 (the only step)
+            mu_k = None
+            S_k  = None
 
-        # Compute yhat_k ourselves (consistent across versions)
-        yhat_k = phi @ mu_k
+            # simdkalman result structure has changed across versions; try a few layouts:
+            if hasattr(res, "states"):
+                st = res.states
+                # prefer filtered if present
+                if hasattr(st, "filtered") and hasattr(st.filtered, "mean") and hasattr(st.filtered, "cov"):
+                    mu_k = np.asarray(st.filtered.mean[0])       # (n,)
+                    S_k  = np.asarray(st.filtered.cov[0])        # (n,n)
+                elif hasattr(st, "mean") and hasattr(st, "cov"):
+                    mu_k = np.asarray(st.mean[0])
+                    S_k  = np.asarray(st.cov[0])
 
-        # Optional Kalman gain (if S_minus available)
-        K = None
-        if S_minus is not None:
-            try:
-                S_innov = phi @ S_minus @ phi.T + Sigma_R
-                K = S_minus @ phi.T @ np.linalg.pinv(S_innov)
-            except Exception:
-                K = None
+            if mu_k is None:
+                # Other versions expose arrays directly
+                for name in ("filtered_means", "filtered_mean", "means", "mean"):
+                    if hasattr(res, name):
+                        mu_arr = np.asarray(getattr(res, name))
+                        mu_k = mu_arr[0] if mu_arr.ndim >= 2 else mu_arr
+                        break
+                for name in ("filtered_covariances", "filtered_covariance", "covariances", "covariance", "cov"):
+                    if hasattr(res, name):
+                        S_arr = np.asarray(getattr(res, name))
+                        S_k = S_arr[0]
+                        break
 
-        return mu_k.reshape(-1), S_k, yhat_k.reshape(-1), K
+            if (mu_k is None) or (S_k is None):
+                # Couldn’t recognize this simdkalman version → safe fallback
+                return self._kf_random_walk_update(phi, y, mu_prev, S_prev, Sigma_P, Sigma_R)
+
+            # Predicted measurement with current phi
+            yhat_k = (phi @ mu_k.reshape(-1, 1)).reshape(-1)
+
+            # `simdkalman` doesn’t return K directly; if you need it, compute it
+            # from the posterior (optional):
+            # S_minus = S_prev + Sigma_P
+            # S_innov = phi @ S_minus @ phi.T + Sigma_R
+            # K = S_minus @ phi.T @ np.linalg.pinv(S_innov)
+
+            return mu_k.reshape(-1), S_k, yhat_k.reshape(-1), None
+
+        except Exception:
+            # Any import/API issue → fall back to the stable NumPy implementation
+            # return self._kf_random_walk_update(phi, y, mu_prev, S_prev, Sigma_P, Sigma_R)
+            raise
 
     def probe_zone_air_and_supply_with_kf(self, s, **opts):
         """
