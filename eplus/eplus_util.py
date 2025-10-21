@@ -4101,7 +4101,7 @@ class EPlusUtil:
             #     phi, y, mu_prev, S_prev, Sigma_P, Sigma_R_full, use_pinv=True
             # )
             mu_k, S_k, yhat_k, K = self._kf_random_walk_update_simdkalman(
-                phi, y, mu_prev, S_prev, Sigma_P, Sigma_R, positive_idx="all"
+                phi, y, mu_prev, S_prev, Sigma_P, Sigma_R_full, positive_idx="all"
             )
             d["_kf_mu"][z]    = mu_k
             d["_kf_Sigma"][z] = S_k
