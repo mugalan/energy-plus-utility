@@ -3803,3 +3803,178 @@ class EPlusUtil:
             pass
 
         return payload
+
+    def kf_dummy_sql_writer(self, s, **opts):
+        """
+        Minimal runtime test of the SQL insert helper with dummy data.
+        Writes a row each callback using labels ['T'], ['T','w'] or ['T','w','CO2'].
+        Options:
+        table         : str  = "KalmanEstimatesTest"
+        commit_every  : int  = 20
+        run_during_warmup : bool = False
+        db_filename   : str  = "eplusout_kf_test.sqlite"  # use "eplusout.sql" to target EP DB
+        """
+        import os, sqlite3, numpy as _np
+
+        ex = self.api.exchange
+        if ex.warmup_flag(s) and not bool(opts.get("run_during_warmup", False)):
+            return
+
+        d = self.__dict__
+        table_name   = str(opts.get("table", "KalmanEstimatesTest"))
+        commit_every = int(opts.get("commit_every", 20))
+        db_filename  = str(opts.get("db_filename", "eplusout_kf_test.sqlite"))
+
+        # --- helpers (same shapes/names your _ins expects) ---
+        def _to_iso_ts(ts_obj) -> str:
+            if ts_obj:
+                return str(ts_obj).replace("T", " ")
+            try:
+                yr = int(self.api.exchange.year(self.state))
+                mo = int(self.api.exchange.month(self.state))
+                dy = int(self.api.exchange.day_of_month(self.state))
+                hh = int(self.api.exchange.hour(self.state))
+                mm = int(self.api.exchange.minute(self.state))
+                return f"{yr:04d}-{mo:02d}-{dy:02d} {hh:02d}:{mm:02d}:00"
+            except Exception:
+                return ""
+
+        def _to_num(x):
+            try:
+                v = float(x)
+                return None if (not _np.isfinite(v)) else v
+            except Exception:
+                return None
+
+        # --- one-time SQL open / schema ---
+        d.setdefault("_kf_sql_disabled", False)
+        d.setdefault("_kf_sql_conn", None)
+        d.setdefault("_kf_sql_cur", None)
+        d.setdefault("_kf_sql_db_filename", None)
+
+        def _ensure_sql_ready():
+            if d["_kf_sql_disabled"]:
+                return False
+            if d["_kf_sql_conn"] is not None and d["_kf_sql_cur"] is not None and d["_kf_sql_db_filename"] == db_filename:
+                return True
+            # (re)open on first run or if filename changed
+            try:
+                assert self.out_dir, "set_model(...) first so out_dir is available."
+                sql_path = os.path.join(self.out_dir, db_filename)
+                conn = sqlite3.connect(sql_path, timeout=30.0)
+                cur  = conn.cursor()
+                cur.execute(f"""
+                    CREATE TABLE IF NOT EXISTS {table_name} (
+                        Timestamp TEXT NOT NULL,
+                        Zone      TEXT NOT NULL,
+                        y_T   REAL, y_w   REAL, y_c   REAL,
+                        yhat_T REAL, yhat_w REAL, yhat_c REAL,
+                        alpha_T REAL, beta_T REAL, alpha_m REAL, beta_w REAL, beta_c REAL
+                    )
+                """)
+                conn.commit()
+                d["_kf_sql_conn"], d["_kf_sql_cur"] = conn, cur
+                d["_kf_sql_db_filename"] = db_filename
+                d["_kf_inserts"] = 0
+                return True
+            except sqlite3.DatabaseError as e:
+                try: self._log(1, f"[dummy-sql] DISABLED (open): {e}")
+                except Exception: pass
+                d["_kf_sql_disabled"] = True
+                d["_kf_sql_conn"] = None
+                d["_kf_sql_cur"]  = None
+                return False
+
+        # --- the tested insert helper (uses labels) ---
+        def _ins(ts, zone_name: str, names, y_vec, yhat_vec, mu_vec):
+            import sqlite3
+            def _get(_names, _vec, lbl):
+                try:
+                    i = _names.index(lbl); return _to_num(_vec[i])
+                except Exception:
+                    return None
+            if d["_kf_sql_disabled"] or not _ensure_sql_ready():
+                return
+            row = {
+                "ts":      _to_iso_ts(ts),
+                "zone":    str(zone_name),
+                "y_T":     _get(names, y_vec,   "T"),
+                "y_w":     _get(names, y_vec,   "w"),
+                "y_c":     _get(names, y_vec,   "CO2"),
+                "yhat_T":  _get(names, yhat_vec, "T"),
+                "yhat_w":  _get(names, yhat_vec, "w"),
+                "yhat_c":  _get(names, yhat_vec, "CO2"),
+                "alpha_T": _to_num(mu_vec[0]),
+                "beta_T":  _to_num(mu_vec[1]),
+                "alpha_m": _to_num(mu_vec[2]),
+                "beta_w":  _to_num(mu_vec[3]),
+                "beta_c":  _to_num(mu_vec[4]),
+            }
+            sql = f"""
+                INSERT INTO {table_name}
+                (Timestamp, Zone,
+                y_T, y_w, y_c,
+                yhat_T, yhat_w, yhat_c,
+                alpha_T, beta_T, alpha_m, beta_w, beta_c)
+                VALUES
+                (:ts, :zone,
+                :y_T, :y_w, :y_c,
+                :yhat_T, :yhat_w, :yhat_c,
+                :alpha_T, :beta_T, :alpha_m, :beta_w, :beta_c)
+            """
+            try:
+                d["_kf_sql_cur"].execute(sql, row)
+                d["_kf_inserts"] += 1
+                if d["_kf_inserts"] % commit_every == 0:
+                    d["_kf_sql_conn"].commit()
+            except sqlite3.DatabaseError as e:
+                if not d.get("_kf_sql_last_err_logged"):
+                    try: self._log(1, f"[dummy-sql] insert failed: {e}")
+                    except Exception: pass
+                    d["_kf_sql_last_err_logged"] = True
+                d["_kf_sql_disabled"] = True
+                try:
+                    if d["_kf_sql_conn"]: d["_kf_sql_conn"].close()
+                except Exception:
+                    pass
+                d["_kf_sql_conn"] = None
+                d["_kf_sql_cur"]  = None
+
+        # --- generate dummy data and insert ---
+        # pick a zone label
+        try:
+            zlist = self.list_zone_names(preferred_sources=("sql","api","idf"))
+            zone  = zlist[0] if zlist else "TEST-ZONE"
+        except Exception:
+            zone = "TEST-ZONE"
+
+        # deterministic dummy stream
+        d.setdefault("_kf_dummy_counter", 0)
+        d.setdefault("_kf_rng", _np.random.default_rng(12345))
+        d["_kf_dummy_counter"] += 1
+        k = d["_kf_dummy_counter"]
+
+        # vary which labels we include so we exercise the mapping
+        seq = [["T"], ["T","w"], ["T","w","CO2"]]
+        names = seq[k % 3]
+
+        # create vectors matching names
+        T  = 22.0 + 0.5 * _np.sin(0.1*k)
+        w  = 0.008 + 1e-4 * _np.cos(0.2*k)
+        c  = 400.0 + 10.0 * _np.sin(0.05*k)
+
+        y_map    = {"T": T,          "w": w,          "CO2": c}
+        yhat_map = {"T": T + 0.1,    "w": w + 1e-5,   "CO2": c + 5.0}
+        mu_vec   = _np.array([0.02, 23.5, 0.001, 0.0081, 405.0], dtype=float)  # 5-element state
+
+        y_vec    = _np.array([y_map[nm] for nm in names], dtype=float)
+        yhat_vec = _np.array([yhat_map[nm] for nm in names], dtype=float)
+
+        ts = getattr(self, "_occ_current_timestamp", lambda _s: None)(s)
+        _ins(ts, zone, names, y_vec, yhat_vec, mu_vec)
+
+        # lightweight heartbeat
+        try:
+            self._log(1, f"[dummy-sql] wrote {names} for zone='{zone}'")
+        except Exception:
+            pass        
