@@ -4199,3 +4199,381 @@ class EPlusUtil:
 
     #     return payload
 
+    def _kf_prepare_inputs_random_walk(
+        self, s, payload, zone, *,
+        d, mu0, S0_diag, Sigma_P, Sigma_R
+    ):
+        """
+        Prepare EKF inputs for the 5-state random-walk model with 3 measurements.
+
+        State β = [alpha_T, beta_T, alpha_m, beta_w, beta_c]^T (n=5)
+        Measurement y = [Tz*, w_z*, c_z*]^T (m=3)
+        H(=φ) rows:
+        [ (To-Tsa)  1   0   0   0 ]
+        [   0       0 (wo-wsa) 1 0 ]
+        [   0       0 (co-csa) 0 1 ]
+
+        Forward-fill policy:
+        - outdoor: payload → ffill → 0.0
+        - zone T, CO2: payload → ffill → 0.0
+        - zone w: payload → Zone Mean Air Humidity Ratio → w(T,RH,P_site) → ffill → 0.0
+        - supply T,w,CO2: payload → ffill → 0.0
+
+        Returns:
+        (f_x_prev, F, H, y, mu_prev, P_prev, Q, R, names)
+        """
+        import math
+        import numpy as _np
+        ex = self.api.exchange
+
+        # -------- helpers (local, measurement-level; no KF math) --------
+        def _fin(x):
+            try: return _np.isfinite(float(x))
+            except Exception: return False
+
+        def _v(h):
+            if h in (-1, None): return float("nan")
+            try:
+                x = float(ex.get_variable_value(s, h))
+                return x if (x == x) else float("nan")
+            except Exception:
+                return float("nan")
+
+        def _w_from_T_RH_P(Tc, RH_pct, P_pa):
+            try:
+                if not (Tc == Tc and RH_pct == RH_pct and P_pa == P_pa and P_pa > 1000.0):
+                    return float("nan")
+                psat = 610.94 * math.exp(17.625 * Tc / (Tc + 243.04))
+                pw = max(0.0, min(1.0, RH_pct/100.0)) * psat
+                denom = max(1.0, P_pa - pw)
+                return 0.62198 * pw / denom
+            except Exception:
+                return float("nan")
+
+        def _ffill_out(key, val, default=0.0):
+            if _fin(val):
+                d["_kf_last_out"][key] = float(val)
+                return float(val)
+            return d["_kf_last_out"].get(key, float(default))
+
+        def _ffill_zone(cat, z, key, val, default=0.0):
+            store = d["_kf_last_air"] if cat == "air" else d["_kf_last_sup"]
+            zm = store.setdefault(z, {})
+            if _fin(val):
+                zm[key] = float(val)
+                return float(val)
+            return float(zm.get(key, default))
+
+        # -------- ensure per-zone prior (state & cov) --------
+        if zone not in d["_kf_mu"]:
+            d["_kf_mu"][zone]    = _np.asarray(mu0, dtype=float).reshape(-1)
+            d["_kf_Sigma"][zone] = _np.diag(_np.asarray(S0_diag, dtype=float))
+        mu_prev = d["_kf_mu"][zone].reshape(-1, 1)
+        P_prev  = d["_kf_Sigma"][zone]
+
+        # -------- outdoor (ffill) --------
+        ts = payload["timestamp"]
+        oT = _ffill_out("T",  payload["outdoor"].get("Tdb_C"),     0.0)
+        ow = _ffill_out("w",  payload["outdoor"].get("w_kgperkg"), 0.0)
+        oc = _ffill_out("c",  payload["outdoor"].get("co2_ppm"),   0.0)
+
+        # site pressure (for psychro fallback)
+        P_site = float("nan")
+        if d.get("_kf_h_ready", False):
+            P_site = _v(d.get("_kf_h_Psite", -1))
+
+        Z = payload["zones"][zone]
+
+        # -------- zone air: T, w (with fallbacks), CO2 → then ffill --------
+        yT = _ffill_zone("air", zone, "T", Z["air"].get("Tdb_C"), 0.0)
+
+        yw = Z["air"].get("w_kgperkg")
+        if not _fin(yw) and d.get("_kf_h_ready", False):
+            w_mean = _v(d["_kf_h_wmean"].get(zone, -1))
+            if _fin(w_mean):
+                yw = w_mean
+            else:
+                rh  = _v(d["_kf_h_rh"].get(zone, -1))
+                Tz  = _v(d["_kf_h_T"].get(zone, -1))
+                w_c = _w_from_T_RH_P(Tz, rh, P_site)
+                if _fin(w_c):
+                    yw = w_c
+        yw = _ffill_zone("air", zone, "w", yw, 0.0)
+
+        yc = _ffill_zone("air", zone, "c", Z["air"].get("co2_ppm"), 0.0)
+
+        # -------- supply (ffill) --------
+        sT = _ffill_zone("sup", zone, "T", Z["supply"].get("Tdb_C"),     0.0)
+        sw = _ffill_zone("sup", zone, "w", Z["supply"].get("w_kgperkg"), 0.0)
+        sc = _ffill_zone("sup", zone, "c", Z["supply"].get("co2_ppm"),   0.0)
+
+        # -------- build EKF inputs for random-walk model --------
+        # f(x) = x, F = I
+        n = 5
+        F  = _np.eye(n, dtype=float)
+        f_x_prev = mu_prev.copy()              # f(\hat{x}_{k-1|k-1}) = \hat{x}_{k-1|k-1}
+
+        # H (3x5) and y (3,)
+        H = _np.asarray([
+            [ (oT - sT), 1.0, 0.0,      0.0, 0.0 ],
+            [ 0.0,       0.0, (ow - sw), 1.0, 0.0 ],
+            [ 0.0,       0.0, (oc - sc), 0.0, 1.0 ],
+        ], dtype=float)
+
+        y = _np.asarray([yT, yw, yc], dtype=float).reshape(-1)
+
+        # Q, R from caller
+        Q = _np.asarray(Sigma_P, dtype=float)
+        R = _np.asarray(Sigma_R, dtype=float)
+
+        names = ["T", "w", "CO2"]   # for SQL writer mapping
+
+        return (f_x_prev, F, H, y, mu_prev, P_prev, Q, R, names, ts)
+
+    def probe_zone_air_and_supply_with_kf(self, s, **opts):
+        """
+        Orchestrator: probe + prepare EKF inputs + run EKF + persist.
+        No Kalman math here (delegated to _kf_prepare_inputs_random_walk and _ekf_update).
+        """
+        ex = self.api.exchange
+        if ex.warmup_flag(s):
+            return
+
+        import os, sqlite3
+        import numpy as _np
+
+        # ---- run the probe ----
+        probe_kwargs = {k:v for k,v in opts.items() if k not in {
+            "kf_sigma_P_diag","kf_sigma_R_diag","kf_init_mu","kf_init_cov_diag",
+            "kf_sql_table","kf_zones","kf_exclude_patterns","kf_log",
+            "kf_db_filename","kf_batch_size","kf_commit_every_batches","kf_checkpoint_every_commits",
+            "kf_journal_mode","kf_synchronous","kf_prepare_fn"}}
+        payload = self.probe_zone_air_and_supply(s, **probe_kwargs)
+        if not payload or "zones" not in payload:
+            return payload
+
+        d = self.__dict__
+
+        # ---- config (no math) ----
+        Sigma_P_diag = _np.asarray(opts.get("kf_sigma_P_diag", [1e-6, 1e-3, 1e-6, 1e-6, 1e-4]), dtype=float)
+        Sigma_R_diag = _np.asarray(opts.get("kf_sigma_R_diag", [0.2**2, (2e-4)**2, 30.0**2]), dtype=float)
+        mu0          = _np.asarray(opts.get("kf_init_mu",      [0.0, 20.0, 0.0, 0.008, 400.0]), dtype=float)
+        S0_diag      = _np.asarray(opts.get("kf_init_cov_diag",[1.0, 25.0, 1.0, 1e-3, 1e3]), dtype=float)
+        table_name   = str(opts.get("kf_sql_table", "KalmanEstimates"))
+        kf_zones     = opts.get("kf_zones", None)
+        excl_pats    = tuple(opts.get("kf_exclude_patterns", ("PLENUM",)))
+        do_log       = bool(opts.get("kf_log", True))
+
+        db_filename  = str(opts.get("kf_db_filename", "eplusout.sql"))
+        batch_size   = int(opts.get("kf_batch_size", 50))
+        commit_every_batches = int(opts.get("kf_commit_every_batches", 10))
+        checkpoint_every_commits = int(opts.get("kf_checkpoint_every_commits", 5))
+        journal_mode = str(opts.get("kf_journal_mode", "WAL"))
+        synchronous  = str(opts.get("kf_synchronous", "NORMAL"))
+
+        # choose preparer (default = random-walk 5x3 with our measurement model)
+        prepare_fn = opts.get("kf_prepare_fn", self._kf_prepare_inputs_random_walk)
+
+        Q = _np.diag(Sigma_P_diag)
+        R = _np.diag(Sigma_R_diag)
+
+        # ---- one-time init (no KF math) ----
+        if d.get("_kf_state_id") != id(self.state):
+            d["_kf_state_id"] = id(self.state)
+            d["_kf_mu"]    = {}
+            d["_kf_Sigma"] = {}
+            d["_kf_last_out"] = {}
+            d["_kf_last_air"] = {}
+            d["_kf_last_sup"] = {}
+
+            # cache zones list used for requesting handles
+            if kf_zones:
+                zones = [z for z in kf_zones if z in payload["zones"]]
+            else:
+                zones = [z for z in payload["zones"].keys()
+                        if not any(p in z.upper() for p in excl_pats)]
+            d["_kf_zones_cached"] = zones
+
+            # request auxiliary variables (for humidity fallback)
+            for z in zones:
+                for nm in ("Zone Mean Air Humidity Ratio",
+                        "Zone Air Relative Humidity",
+                        "Zone Mean Air Temperature"):
+                    try: ex.request_variable(s, nm, z)
+                    except Exception: pass
+            try: ex.request_variable(s, "Site Outdoor Air Barometric Pressure", "Environment")
+            except Exception: pass
+
+            d["_kf_h_ready"] = False
+            d["_kf_h_wmean"] = {}
+            d["_kf_h_rh"]    = {}
+            d["_kf_h_T"]     = {}
+            d["_kf_h_Psite"] = -1
+
+        if not d.get("_kf_h_ready", False) and ex.api_data_fully_ready(s):
+            zones = d.get("_kf_zones_cached", [])
+            def H(nm, key):
+                try: return ex.get_variable_handle(s, nm, key)
+                except Exception: return -1
+            d["_kf_h_wmean"] = {z: H("Zone Mean Air Humidity Ratio", z) for z in zones}
+            d["_kf_h_rh"]    = {z: H("Zone Air Relative Humidity",   z) for z in zones}
+            d["_kf_h_T"]     = {z: H("Zone Mean Air Temperature",    z) for z in zones}
+            d["_kf_h_Psite"] = H("Site Outdoor Air Barometric Pressure", "Environment")
+            d["_kf_h_ready"] = True
+
+        # ---- SQL open+schema (no KF math) ----
+        def _ensure_sql():
+            if d.get("_kf_sql_disabled"):
+                return False
+            if d.get("_kf_sql_conn") and d.get("_kf_sql_cur") and d.get("_kf_sql_db") == db_filename:
+                return True
+            try:
+                assert self.out_dir, "set_model(...) first so out_dir is available."
+                path = os.path.join(self.out_dir, db_filename)
+                conn = sqlite3.connect(path, timeout=30.0)
+                cur  = conn.cursor()
+                try:
+                    cur.execute(f"PRAGMA journal_mode={journal_mode};")
+                    cur.execute(f"PRAGMA synchronous={synchronous};")
+                except Exception:
+                    pass
+                cur.execute(f"""
+                    CREATE TABLE IF NOT EXISTS {table_name} (
+                        Timestamp TEXT NOT NULL,
+                        Zone      TEXT NOT NULL,
+                        y_T   REAL, y_w   REAL, y_c   REAL,
+                        yhat_T REAL, yhat_w REAL, yhat_c REAL,
+                        alpha_T REAL, beta_T REAL, alpha_m REAL, beta_w REAL, beta_c REAL
+                    )
+                """)
+                conn.commit()
+                d["_kf_sql_conn"] = conn
+                d["_kf_sql_cur"]  = cur
+                d["_kf_sql_db"]   = db_filename
+                d["_kf_batch"]    = []
+                d["_kf_batches_written"] = 0
+                d["_kf_commits"]  = 0
+                d["_kf_sql_insert"] = f"""
+                    INSERT INTO {table_name}
+                    (Timestamp, Zone,
+                    y_T, y_w, y_c,
+                    yhat_T, yhat_w, yhat_c,
+                    alpha_T, beta_T, alpha_m, beta_w, beta_c)
+                    VALUES
+                    (:ts, :zone,
+                    :y_T, :y_w, :y_c,
+                    :yhat_T, :yhat_w, :yhat_c,
+                    :alpha_T, :beta_T, :alpha_m, :beta_w, :beta_c)
+                """
+                return True
+            except sqlite3.DatabaseError as e:
+                try: self._log(1, f"[kf-sql] DISABLED (open): {e}")
+                except Exception: pass
+                d["_kf_sql_disabled"] = True
+                return False
+
+        if not _ensure_sql():
+            return payload
+
+        # insert helper (no KF math)
+        def _to_iso_ts(ts_obj) -> str:
+            if ts_obj:
+                return str(ts_obj).replace("T", " ")
+            try:
+                yr = int(self.api.exchange.year(self.state))
+                m  = int(self.api.exchange.month(self.state))
+                d_ = int(self.api.exchange.day_of_month(self.state))
+                hh = int(self.api.exchange.hour(self.state))
+                mm = int(self.api.exchange.minute(self.state))
+                return f"{yr:04d}-{m:02d}-{d_:02d} {hh:02d}:{mm:02d}:00"
+            except Exception:
+                return ""
+
+        def _to_num(x):
+            try:
+                if x is None: return None
+                v = float(x)
+                return v if _np.isfinite(v) else None
+            except Exception:
+                return None
+
+        def _ins(ts, zone_name: str, names, y_vec, yhat_vec, mu_vec):
+            def _get(_names, _vec, lbl):
+                try:
+                    i = _names.index(lbl)
+                    return _to_num(_vec[i])
+                except Exception:
+                    return None
+            row = {
+                "ts":      _to_iso_ts(ts),
+                "zone":    str(zone_name),
+                "y_T":     _get(names, y_vec,   "T"),
+                "y_w":     _get(names, y_vec,   "w"),
+                "y_c":     _get(names, y_vec,   "CO2"),
+                "yhat_T":  _get(names, yhat_vec, "T"),
+                "yhat_w":  _get(names, yhat_vec, "w"),
+                "yhat_c":  _get(names, yhat_vec, "CO2"),
+                "alpha_T": _to_num(mu_vec[0]),
+                "beta_T":  _to_num(mu_vec[1]),
+                "alpha_m": _to_num(mu_vec[2]),
+                "beta_w":  _to_num(mu_vec[3]),
+                "beta_c":  _to_num(mu_vec[4]),
+            }
+            d["_kf_batch"].append(row)
+            if len(d["_kf_batch"]) >= batch_size:
+                cur = d["_kf_sql_cur"]; sql = d["_kf_sql_insert"]
+                try:
+                    cur.executemany(sql, d["_kf_batch"])
+                    d["_kf_batch"].clear()
+                    d["_kf_batches_written"] += 1
+                    if d["_kf_batches_written"] % commit_every_batches == 0:
+                        d["_kf_sql_conn"].commit()
+                        d["_kf_commits"] += 1
+                        if journal_mode.upper() == "WAL" and (d["_kf_commits"] % checkpoint_every_commits == 0):
+                            try: cur.execute("PRAGMA wal_checkpoint(TRUNCATE);")
+                            except Exception: pass
+                except sqlite3.DatabaseError as e:
+                    d["_kf_sql_disabled"] = True
+                    try: self._log(1, f"[kf-sql] insert disabled: {e}")
+                    except Exception: pass
+                    try: d["_kf_sql_conn"].close()
+                    except Exception: pass
+                    d["_kf_sql_conn"] = None
+                    d["_kf_sql_cur"]  = None
+
+        # which zones to run
+        if kf_zones:
+            zones_use = [z for z in kf_zones if z in payload["zones"]]
+        else:
+            zones_use = [z for z in payload["zones"].keys()
+                        if not any(p in z.upper() for p in excl_pats)]
+
+        # ---- main loop: prepare → EKF → persist (no KF math here) ----
+        for z in zones_use:
+            (f_x_prev, F, H, y, mu_prev, P_prev, Qk, Rk, names, ts) = prepare_fn(
+                s, payload, z,
+                d=d, mu0=mu0, S0_diag=S0_diag, Sigma_P=Q, Sigma_R=R
+            )
+
+            # Run generic EKF step
+            mu_k, P_k, yhat_k, K = self._ekf_update(
+                f_x_prev, F, H, y, mu_prev, P_prev, Qk, Rk, use_pinv=True, jitter=1e-9
+            )
+
+            # stash back
+            d["_kf_mu"][z]    = mu_k
+            d["_kf_Sigma"][z] = P_k
+
+            # write
+            _ins(ts, z, names, y, yhat_k, mu_k)
+
+            if do_log:
+                aT,bT,am,bw,bc = mu_k
+                self._log(
+                    1,
+                    "[kf] %s %s | update | yhat_T=%.3f yhat_w=%.5f yhat_c=%.1f | "
+                    "alpha_T=%.4f beta_T=%.4f alpha_m=%.4f beta_w=%.6f beta_c=%.2f"
+                    % (ts, z, yhat_k[0], yhat_k[1], yhat_k[2], aT, bT, am, bw, bc)
+                )
+
+        return payload
