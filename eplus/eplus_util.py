@@ -4122,6 +4122,7 @@ class EPlusUtil:
         Update:
         x_post = x_prior + K (y - H x_prior)
         P_post = (I - K H) P_prior
+
         Returns: (x_post, P_post, yhat_post, K)
         """
         import numpy as np
@@ -4150,7 +4151,6 @@ class EPlusUtil:
         if use_pinv:
             K = P_prior @ H.T @ np.linalg.pinv(S_innov)
         else:
-            # numerically-stable solve
             K = np.linalg.solve(S_innov.T, (H @ P_prior).T).T
 
         # Update
@@ -4161,42 +4161,43 @@ class EPlusUtil:
 
         return x_post.reshape(-1), P_post, yhat_post.reshape(-1), K
 
+
     def _kf_prepare_inputs_random_walk(self, *, zone, meas, mu_prev, P_prev, Sigma_P, Sigma_R):
         """
-        Map the random-walk linear model into EKF inputs (so the main driver
-        can always call _ekf_update). Expects:
-        meas: {"phi": (m,n) matrix, "y": (m,) vector}
+        Map the random-walk linear model into EKF inputs so the driver can always call _ekf_update.
+        Expects: meas = {"phi": (m,n), "y": (m,)}.
         """
         import numpy as np
 
-        phi = meas["phi"]              # H_k
-        y   = meas["y"].reshape(-1)    # y_k
-        n   = mu_prev.shape[0]
+        phi = np.asarray(meas["phi"], dtype=float)      # H_k
+        y   = np.asarray(meas["y"],   dtype=float).reshape(-1)
+        n   = int(np.asarray(mu_prev).reshape(-1).size)
 
-        F = np.eye(n)                  # random-walk: x_k = I x_{k-1} + w
-        f_x = mu_prev.reshape(-1)      # f(x) = x
-
-        Q = np.asarray(Sigma_P, dtype=float)
-        R = np.asarray(Sigma_R, dtype=float)
+        F   = np.eye(n)                                 # random-walk: x_k = I x_{k-1} + w
+        f_x = np.asarray(mu_prev, dtype=float).reshape(-1)  # f(x) = x
+        Q   = np.asarray(Sigma_P, dtype=float)
+        R   = np.asarray(Sigma_R, dtype=float)
 
         return dict(
-            x_prev=mu_prev, P_prev=P_prev,
+            x_prev=np.asarray(mu_prev, dtype=float).reshape(-1),
+            P_prev=np.asarray(P_prev,  dtype=float),
             f_x=f_x, F=F, H=phi, Q=Q, R=R, y=y
         )
+
 
     def probe_zone_air_and_supply_with_kf(self, s, **opts):
         """
         Probe + KF/EKF persistence using a pluggable preparer.
 
-        Common measurement policy (applies to any KF):
+        Measurement policy (generic):
         - Forward-fill outdoor and zone measurements; default 0.0 at start.
-        - Zone w fallback chain: payload w → Zone Mean Air Humidity Ratio → w(T,RH,P_site)
+        - Zone w fallback: payload w → Zone Mean Air Humidity Ratio → w(T,RH,P_site)
 
         Choose the preparer with:
-        kf_prepare_fn: callable(self, *, zone, meas, mu_prev, P_prev, Sigma_P, Sigma_R) -> dict for _ekf_update
+        kf_prepare_fn(self?, *, zone, meas, mu_prev, P_prev, Sigma_P, Sigma_R) -> dict for _ekf_update
         (defaults to self._kf_prepare_inputs_random_walk)
 
-        Other opts unchanged:
+        Other opts:
         kf_sigma_P_diag, kf_sigma_R_diag, kf_init_mu, kf_init_cov_diag,
         kf_sql_table, kf_zones, kf_exclude_patterns, kf_log,
         kf_db_filename, kf_batch_size, kf_commit_every_batches,
@@ -4209,7 +4210,7 @@ class EPlusUtil:
         import os, sqlite3, math
         import numpy as _np
 
-        # ---- probe (no changes) ----
+        # ---- probe (pass-through) ----
         passthru_keys = {
             "kf_sigma_P_diag","kf_sigma_R_diag","kf_init_mu","kf_init_cov_diag",
             "kf_sql_table","kf_zones","kf_exclude_patterns","kf_log",
@@ -4242,24 +4243,18 @@ class EPlusUtil:
         synchronous  = str(opts.get("kf_synchronous", "NORMAL"))
 
         Sigma_P = _np.diag(Sigma_P_diag)
-        Sigma_R = _np.diag(Sigma_R_diag)  # 3x3
+        Sigma_R = _np.diag(Sigma_R_diag)  # 3x3 by construction
 
         # ---- pick preparer (pluggable) ----
-        # pick preparer (pluggable)
         kf_prepare_fn = opts.get("kf_prepare_fn") or self._kf_prepare_inputs_random_walk
 
         def _call_preparer(fn, **kw):
-            """
-            Call `fn` with the right `self` semantics:
-            - bound method:            fn(**kw)
-            - free function/unbound:   fn(self, **kw)
-            """
+            """Call `fn` correctly whether it is bound (method) or free function."""
             try:
                 is_bound = getattr(fn, "__self__", None) is not None
             except Exception:
                 is_bound = False
             return fn(**kw) if is_bound else fn(self, **kw)
-
 
         if not callable(kf_prepare_fn):
             kf_prepare_fn = getattr(self, "_kf_prepare_inputs_random_walk")
@@ -4319,47 +4314,42 @@ class EPlusUtil:
                 path = os.path.join(self.out_dir, db_filename)
                 conn = sqlite3.connect(path, timeout=30.0)
                 cur  = conn.cursor()
-                # light PRAGMAs
                 try:
                     cur.execute(f"PRAGMA journal_mode={journal_mode};")
                     cur.execute(f"PRAGMA synchronous={synchronous};")
                 except Exception:
                     pass
-
-                # --- minimal base schema (no state columns here) ---
+                # minimal base schema (state columns added dynamically on first insert)
                 cur.execute(f"""
                     CREATE TABLE IF NOT EXISTS {table_name} (
                         Timestamp TEXT NOT NULL,
                         Zone      TEXT NOT NULL,
                         y_T   REAL, y_w   REAL, y_c   REAL,
                         yhat_T REAL, yhat_w REAL, yhat_c REAL
-                        -- state (mu_*) columns will be added dynamically
                     )
                 """)
                 conn.commit()
 
-                # save handles
                 d["_kf_sql_conn"] = conn
                 d["_kf_sql_cur"]  = cur
                 d["_kf_sql_db"]   = db_filename
 
-                # batching state
-                d["_kf_batch"]             = []
-                d["_kf_batches_written"]   = 0
-                d["_kf_commits"]           = 0
+                d["_kf_batch"]           = []
+                d["_kf_batches_written"] = 0
+                d["_kf_commits"]         = 0
 
-                # NEW: dynamic-state machinery (built on first insert when mu is known)
-                d["_kf_mu_cols"]    = None     # e.g. ["mu_0","mu_1",...]
-                d["_kf_sql_insert"] = None     # INSERT statement built later
-
+                d["_kf_mu_cols"]    = None   # ["mu_0","mu_1",...], set on first insert
+                d["_kf_sql_insert"] = None   # INSERT stmt built on first insert
                 return True
             except sqlite3.DatabaseError as e:
-                try:
-                    self._log(1, f"[kf-sql] DISABLED (open): {e}")
-                except Exception:
-                    pass
+                try: self._log(1, f"[kf-sql] DISABLED (open): {e}")
+                except Exception: pass
                 d["_kf_sql_disabled"] = True
                 return False
+
+        # >>> ensure SQL is ready <<<
+        if not _ensure_sql():
+            return payload
 
         # -------- common helpers (measurement-level; shared across KFs) --------
         def _fin(x):
@@ -4427,7 +4417,7 @@ class EPlusUtil:
             return None
 
         def _ins(ts, zone_name: str, names, y_vec, yhat_vec, mu_vec):
-            # ---- small helpers ----
+            # --- helper to read by label ---
             def _get(_names, _vec, lbl):
                 try:
                     i = _names.index(lbl)
@@ -4435,44 +4425,37 @@ class EPlusUtil:
                 except Exception:
                     return None
 
-            # Ensure dynamic state columns + prepared INSERT exist
+            # Build dynamic state columns + prepared INSERT if first time
             if d.get("_kf_sql_insert") is None:
                 cur = d["_kf_sql_cur"]
-                # discover existing columns
                 try:
                     schema = cur.execute(f"PRAGMA table_info({table_name})").fetchall()
-                    existing_cols = {row[1] for row in schema}  # row[1] = column name
+                    existing_cols = {row[1] for row in schema}
                 except Exception:
                     existing_cols = set()
 
-                # how many state entries?
                 try:
                     import numpy as _np
                     n_state = int(_np.size(mu_vec)) if mu_vec is not None else 0
                 except Exception:
                     n_state = 0
 
-                # choose column names
-                desired = d.get("_kf_state_col_names")  # optional: list like ["alpha_T",...]
+                desired = d.get("_kf_state_col_names")  # optional list of names
                 if desired is not None:
                     mu_cols = [str(c) for c in desired][:n_state]
-                    # pad if shorter
                     while len(mu_cols) < n_state:
                         mu_cols.append(f"mu_{len(mu_cols)}")
                 else:
                     mu_cols = [f"mu_{i}" for i in range(n_state)]
 
-                # add any missing state columns as REAL
                 for col in mu_cols:
                     if col and (col not in existing_cols):
                         try:
                             cur.execute(f"ALTER TABLE {table_name} ADD COLUMN {col} REAL")
                         except Exception:
-                            # If another thread added it, ignore
                             pass
                 d["_kf_sql_conn"].commit()
 
-                # build and cache the prepared INSERT with whatever columns exist now
                 base_cols = ["Timestamp","Zone","y_T","y_w","y_c","yhat_T","yhat_w","yhat_c"]
                 all_cols  = base_cols + mu_cols
                 placeholders = [":ts", ":zone", ":y_T", ":y_w", ":y_c", ":yhat_T", ":yhat_w", ":yhat_c"] \
@@ -4480,7 +4463,7 @@ class EPlusUtil:
                 d["_kf_mu_cols"]    = mu_cols
                 d["_kf_sql_insert"] = f"INSERT INTO {table_name} ({', '.join(all_cols)}) VALUES ({', '.join(placeholders)})"
 
-            # ---- compose row dict ----
+            # compose row
             row = {
                 "ts":      _to_iso_ts(ts),
                 "zone":    str(zone_name),
@@ -4491,17 +4474,14 @@ class EPlusUtil:
                 "yhat_w":  _get(names, yhat_vec, "w"),
                 "yhat_c":  _get(names, yhat_vec, "CO2"),
             }
-
-            # add state entries using the dynamic columns
             mu_cols = d.get("_kf_mu_cols") or []
             if mu_cols:
                 import numpy as _np
                 mu_flat = _np.asarray(mu_vec, dtype=float).reshape(-1) if mu_vec is not None else _np.array([])
                 for i, col in enumerate(mu_cols):
-                    val = mu_flat[i] if i < mu_flat.size else None
-                    row[col] = _to_num(val)
+                    row[col] = _to_num(mu_flat[i] if i < mu_flat.size else None)
 
-            # ---- batch + executemany ----
+            # batch + executemany
             d["_kf_batch"].append(row)
             if len(d["_kf_batch"]) >= batch_size:
                 cur = d["_kf_sql_cur"]; sql = d["_kf_sql_insert"]
@@ -4513,10 +4493,8 @@ class EPlusUtil:
                         d["_kf_sql_conn"].commit()
                         d["_kf_commits"] += 1
                         if journal_mode.upper() == "WAL" and (d["_kf_commits"] % checkpoint_every_commits == 0):
-                            try:
-                                cur.execute("PRAGMA wal_checkpoint(TRUNCATE);")
-                            except Exception:
-                                pass
+                            try: cur.execute("PRAGMA wal_checkpoint(TRUNCATE);")
+                            except Exception: pass
                 except sqlite3.DatabaseError as e:
                     d["_kf_sql_disabled"] = True
                     try: self._log(1, f"[kf-sql] insert disabled: {e}")
@@ -4526,7 +4504,7 @@ class EPlusUtil:
                     d["_kf_sql_conn"] = None
                     d["_kf_sql_cur"]  = None
 
-        # -------- zone loop: build common meas, then delegate to preparer + EKF --------
+        # -------- zone loop: build common meas, delegate to preparer + EKF --------
         if kf_zones:
             zones_use = [z for z in kf_zones if z in payload["zones"]]
         else:
@@ -4561,7 +4539,7 @@ class EPlusUtil:
             sw = _ffill_zone("sup", zone, "w", Z["supply"].get("w_kgperkg"), 0.0)
             sc = _ffill_zone("sup", zone, "c", Z["supply"].get("co2_ppm"),   0.0)
 
-            # common φ and y for all KFs that use this linear observation form
+            # common linear observation (phi) + measurement vector y
             phi = _np.asarray([
                 [ (oT - sT), 1.0, 0.0,     0.0, 0.0 ],
                 [ 0.0,       0.0, (ow-sw), 1.0, 0.0 ],
@@ -4572,7 +4550,7 @@ class EPlusUtil:
             # prior
             mu_prev, P_prev = _ensure_prior(zone)
 
-            # let the PREPARER decide model (RW→EKF form by default)
+            # preparer → EKF inputs
             prep = _call_preparer(
                 kf_prepare_fn,
                 zone=zone,
@@ -4581,12 +4559,12 @@ class EPlusUtil:
                 Sigma_P=Sigma_P, Sigma_R=Sigma_R
             )
 
-            # run the generic EKF
+            # EKF step
             mu_k, P_k, yhat_k, K = self._ekf_update(
-                prep["x_prev"], prep["P_prev"],    # x_{k-1|k-1}, P_{k-1|k-1}
-                prep["f_x"], prep["F"],            # f(x_{k-1|k-1}), F_{k-1}
-                prep["H"], prep["Q"], prep["R"],   # H_k, Q, R
-                prep["y"]                           # y_k
+                prep["x_prev"], prep["P_prev"],
+                prep["f_x"], prep["F"],
+                prep["H"], prep["Q"], prep["R"],
+                prep["y"]
             )
 
             # persist posterior
@@ -4596,12 +4574,12 @@ class EPlusUtil:
             _ins(ts, zone, ["T","w","CO2"], y, yhat_k, mu_k)
 
             if do_log:
-                aT,bT,am,bw,bc = mu_k
+                # state-agnostic logging: show first few entries
+                mu_preview = ", ".join(f"{v:.4g}" for v in mu_k[:5])
                 self._log(
                     1,
-                    "[kf] %s %s | update | yhat_T=%.3f yhat_w=%.5f yhat_c=%.1f | "
-                    "alpha_T=%.4f beta_T=%.4f alpha_m=%.4f beta_w=%.6f beta_c=%.2f"
-                    % (ts, zone, yhat_k[0], yhat_k[1], yhat_k[2], aT, bT, am, bw, bc)
+                    "[kf] %s %s | update | yhat_T=%.3f yhat_w=%.5f yhat_c=%.1f | mu[:5]=[%s]"
+                    % (ts, zone, yhat_k[0], yhat_k[1], yhat_k[2], mu_preview)
                 )
 
         return payload
