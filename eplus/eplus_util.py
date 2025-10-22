@@ -4180,6 +4180,11 @@ class EPlusUtil:
             zones_use = [z for z in payload["zones"].keys() if not any(p in z.upper() for p in excl_pats)]
 
         ts = payload["timestamp"]
+        try:
+            N_steps = max(1, int(ex.num_time_steps_in_hour(s)))
+            dt_h = 1.0 / N_steps
+        except Exception:
+            dt_h = 1.0  # safe fallback if API not ready        
         oT = _ffill_out("T",  payload["outdoor"].get("Tdb_C"),     0.0)
         ow = _ffill_out("w",  payload["outdoor"].get("w_kgperkg"), 0.0)
         oc = _ffill_out("c",  payload["outdoor"].get("co2_ppm"),   0.0)
@@ -4208,6 +4213,8 @@ class EPlusUtil:
             sw = _ffill_zone("sup", zone, "w", Z["supply"].get("w_kgperkg"), 0.0)
             sc = _ffill_zone("sup", zone, "c", Z["supply"].get("co2_ppm"),   0.0)
 
+            sM = _ffill_zone("sup", zone, "m", Z["supply"].get("m_dot_kgs"), 0.0)
+
             # common linear observation (phi) + measurement vector y
             phi = _np.asarray([
                 [ (oT - sT), 1.0, 0.0,     0.0, 0.0 ],
@@ -4219,11 +4226,18 @@ class EPlusUtil:
             # prior
             mu_prev, P_prev = _ensure_prior(zone)
 
+            meas = {
+                "phi": phi, "y": y, "names": ["T","w","CO2"], "ts": ts,
+                "dt": dt_h, "msa": sM,
+                "To": oT, "wo": ow, "co": oc,
+                "Tsa": sT, "wsa": sw, "csa": sc,
+            }
+
             # preparer → EKF inputs
             prep = _call_preparer(
                 kf_prepare_fn,
                 zone=zone,
-                meas={"phi": phi, "y": y, "names": ["T","w","CO2"], "ts": ts},
+                meas=meas,
                 mu_prev=mu_prev, P_prev=P_prev,
                 Sigma_P=Sigma_P, Sigma_R=Sigma_R
             )
