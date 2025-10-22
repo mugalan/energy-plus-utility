@@ -4245,7 +4245,22 @@ class EPlusUtil:
         Sigma_R = _np.diag(Sigma_R_diag)  # 3x3
 
         # ---- pick preparer (pluggable) ----
-        kf_prepare_fn = opts.get("kf_prepare_fn", None)
+        # pick preparer (pluggable)
+        kf_prepare_fn = opts.get("kf_prepare_fn") or self._kf_prepare_inputs_random_walk
+
+        def _call_preparer(fn, **kw):
+            """
+            Call `fn` with the right `self` semantics:
+            - bound method:            fn(**kw)
+            - free function/unbound:   fn(self, **kw)
+            """
+            try:
+                is_bound = getattr(fn, "__self__", None) is not None
+            except Exception:
+                is_bound = False
+            return fn(**kw) if is_bound else fn(self, **kw)
+
+
         if not callable(kf_prepare_fn):
             kf_prepare_fn = getattr(self, "_kf_prepare_inputs_random_walk")
 
@@ -4558,8 +4573,8 @@ class EPlusUtil:
             mu_prev, P_prev = _ensure_prior(zone)
 
             # let the PREPARER decide model (RW→EKF form by default)
-            prep = kf_prepare_fn(
-                self,
+            prep = _call_preparer(
+                kf_prepare_fn,
                 zone=zone,
                 meas={"phi": phi, "y": y, "names": ["T","w","CO2"], "ts": ts},
                 mu_prev=mu_prev, P_prev=P_prev,
