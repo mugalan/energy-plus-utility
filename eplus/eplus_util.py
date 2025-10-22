@@ -4252,3 +4252,119 @@ class EPlusUtil:
                 )
 
         return payload
+
+    def _kf_prepare_inputs_zone_energy_balance(
+        self, *,
+        zone,
+        meas,          # dict with: y=[Tz, wz, cz], dt, To, wo, co, Tsa, wsa, csa, msa
+        mu_prev,       # (9,)  previous posterior state
+        P_prev,        # (9,9) previous posterior covariance
+        Sigma_P,       # (9,9) process noise
+        Sigma_R        # (3,3) measurement noise
+    ):
+        """
+        EKF preparer for the 9-state zone energy/mass balance model:
+
+        x = [α_o, α_s, α_e, β_o, β_s, β_e, T_z, w_z, c_z]^T
+
+        f(x_{k-1}) = x_{k-1} + Δt * [
+            0, 0, 0, 0, 0, 0,
+            -(α_o + m_sa α_s) T_z + α_o T_o + m_sa α_s T_sa + α_e,
+            -(β_o + m_sa β_s) w_z + β_o w_o + m_sa β_s w_sa + β_e,
+            -(β_o + m_sa β_s) c_z + β_o c_o + m_sa β_s c_sa + β_e
+        ]^T
+
+        F = I + Δt * G, where G has nonzeros only in the last 3 rows:
+            Row(T_z): d/d[α_o,α_s,α_e,β_o,β_s,β_e,T_z,w_z,c_z] =
+                    [-T_z + T_o, -m_sa T_z + m_sa T_sa, 1, 0, 0, 0, -(α_o + m_sa α_s), 0, 0]
+            Row(w_z): [0,0,0, -w_z + w_o, -m_sa w_z + m_sa w_sa, 1, 0, -(β_o + m_sa β_s), 0]
+            Row(c_z): [0,0,0, -c_z + c_o, -m_sa c_z + m_sa c_sa, 1, 0, 0, -(β_o + m_sa β_s)]
+
+        H = [[0… I₃]] selects (T_z, w_z, c_z).
+
+        Required meas keys:
+        y   : iterable of length 3 -> [Tz_meas, wz_meas, cz_meas]
+        dt  : float Δt
+        To, wo, co, Tsa, wsa, csa : floats
+        msa : float (m_sa); if missing/NaN -> 0
+
+        Returns dict compatible with self._ekf_update(...).
+        """
+        import numpy as np
+
+        # --- coerce & validate inputs ---
+        x_prev = np.asarray(mu_prev, dtype=float).reshape(-1)
+        P_prev = np.asarray(P_prev, dtype=float)
+        Q      = np.asarray(Sigma_P, dtype=float)
+        R      = np.asarray(Sigma_R, dtype=float)
+
+        if x_prev.size != 9:
+            raise ValueError(f"expected 9-state vector, got {x_prev.size}")
+        if P_prev.shape != (9, 9):
+            raise ValueError(f"P_prev must be (9,9), got {P_prev.shape}")
+        if Q.shape != (9, 9):
+            raise ValueError(f"Sigma_P must be (9,9), got {Q.shape}")
+        if R.shape != (3, 3):
+            raise ValueError(f"Sigma_R must be (3,3), got {R.shape}")
+
+        def _get(name, *alts, default=0.0):
+            for k in (name, *alts):
+                if k in meas:
+                    return float(meas[k])
+            return float(default)
+
+        # measurements and inputs
+        y   = np.asarray(meas.get("y", [np.nan, np.nan, np.nan]), dtype=float).reshape(3)
+        dt  = float(meas.get("dt", 1.0))
+        To  = _get("To",  "T_o",  "T_out",  default=0.0)
+        wo  = _get("wo",  "w_o",  "w_out",  default=0.0)
+        co  = _get("co",  "c_o",  "co_out", default=0.0)
+        Tsa = _get("Tsa", "T_sa", default=0.0)
+        wsa = _get("wsa", "w_sa", default=0.0)
+        csa = _get("csa", "c_sa", default=0.0)
+        msa = _get("msa", "m_sa", "m_dot", "m_dot_kgs", default=0.0)
+        if not np.isfinite(msa):
+            msa = 0.0
+
+        # unpack state (for readability)
+        ao,  aS,  aE,  bO,  bS,  bE,  Tz, wz, cz = x_prev
+
+        # --- f(x_prev) = x_prev + dt * g(x_prev, u_{k-1}) ---
+        g = np.zeros(9, dtype=float)
+        g[6] = -(ao + msa * aS) * Tz + ao * To + msa * aS * Tsa + aE   # Tz_dot
+        g[7] = -(bO + msa * bS) * wz + bO * wo + msa * bS * wsa + bE   # wz_dot
+        g[8] = -(bO + msa * bS) * cz + bO * co + msa * bS * csa + bE   # cz_dot
+        f_x  = x_prev + dt * g
+
+        # --- F = I + dt * G (Jacobian of g wrt x) ---
+        G = np.zeros((9, 9), dtype=float)
+
+        # Row for Tz dynamics (state index 6)
+        G[6, 0] = -Tz + To                      # d/d α_o
+        G[6, 1] = -msa * Tz + msa * Tsa         # d/d α_s
+        G[6, 2] =  1.0                          # d/d α_e
+        G[6, 6] = -(ao + msa * aS)              # d/d Tz
+
+        # Row for wz dynamics (state index 7)
+        G[7, 3] = -wz + wo                      # d/d β_o
+        G[7, 4] = -msa * wz + msa * wsa         # d/d β_s
+        G[7, 5] =  1.0                          # d/d β_e
+        G[7, 7] = -(bO + msa * bS)              # d/d wz
+
+        # Row for cz dynamics (state index 8)
+        G[8, 3] = -cz + co                      # d/d β_o
+        G[8, 4] = -msa * cz + msa * csa         # d/d β_s
+        G[8, 5] =  1.0                          # d/d β_e
+        G[8, 8] = -(bO + msa * bS)              # d/d cz
+
+        F = np.eye(9, dtype=float) + dt * G
+
+        # --- H selects (Tz, wz, cz) ---
+        H = np.zeros((3, 9), dtype=float)
+        H[:, 6:] = np.eye(3)
+
+        return dict(
+            x_prev=x_prev, P_prev=P_prev,
+            f_x=f_x, F=F, H=H, Q=Q, R=R,
+            y=y
+        )        
