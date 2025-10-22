@@ -4304,48 +4304,47 @@ class EPlusUtil:
                 path = os.path.join(self.out_dir, db_filename)
                 conn = sqlite3.connect(path, timeout=30.0)
                 cur  = conn.cursor()
+                # light PRAGMAs
                 try:
                     cur.execute(f"PRAGMA journal_mode={journal_mode};")
                     cur.execute(f"PRAGMA synchronous={synchronous};")
                 except Exception:
                     pass
+
+                # --- minimal base schema (no state columns here) ---
                 cur.execute(f"""
                     CREATE TABLE IF NOT EXISTS {table_name} (
                         Timestamp TEXT NOT NULL,
                         Zone      TEXT NOT NULL,
                         y_T   REAL, y_w   REAL, y_c   REAL,
-                        yhat_T REAL, yhat_w REAL, yhat_c REAL,
-                        alpha_T REAL, beta_T REAL, alpha_m REAL, beta_w REAL, beta_c REAL
+                        yhat_T REAL, yhat_w REAL, yhat_c REAL
+                        -- state (mu_*) columns will be added dynamically
                     )
                 """)
                 conn.commit()
+
+                # save handles
                 d["_kf_sql_conn"] = conn
                 d["_kf_sql_cur"]  = cur
                 d["_kf_sql_db"]   = db_filename
-                d["_kf_batch"]    = []
-                d["_kf_batches_written"] = 0
-                d["_kf_commits"]  = 0
-                d["_kf_sql_insert"] = f"""
-                    INSERT INTO {table_name}
-                    (Timestamp, Zone,
-                    y_T, y_w, y_c,
-                    yhat_T, yhat_w, yhat_c,
-                    alpha_T, beta_T, alpha_m, beta_w, beta_c)
-                    VALUES
-                    (:ts, :zone,
-                    :y_T, :y_w, :y_c,
-                    :yhat_T, :yhat_w, :yhat_c,
-                    :alpha_T, :beta_T, :alpha_m, :beta_w, :beta_c)
-                """
+
+                # batching state
+                d["_kf_batch"]             = []
+                d["_kf_batches_written"]   = 0
+                d["_kf_commits"]           = 0
+
+                # NEW: dynamic-state machinery (built on first insert when mu is known)
+                d["_kf_mu_cols"]    = None     # e.g. ["mu_0","mu_1",...]
+                d["_kf_sql_insert"] = None     # INSERT statement built later
+
                 return True
             except sqlite3.DatabaseError as e:
-                try: self._log(1, f"[kf-sql] DISABLED (open): {e}")
-                except Exception: pass
+                try:
+                    self._log(1, f"[kf-sql] DISABLED (open): {e}")
+                except Exception:
+                    pass
                 d["_kf_sql_disabled"] = True
                 return False
-
-        if not _ensure_sql():
-            return payload
 
         # -------- common helpers (measurement-level; shared across KFs) --------
         def _fin(x):
@@ -4413,27 +4412,81 @@ class EPlusUtil:
             return None
 
         def _ins(ts, zone_name: str, names, y_vec, yhat_vec, mu_vec):
+            # ---- small helpers ----
             def _get(_names, _vec, lbl):
                 try:
                     i = _names.index(lbl)
                     return _to_num(_vec[i])
                 except Exception:
                     return None
+
+            # Ensure dynamic state columns + prepared INSERT exist
+            if d.get("_kf_sql_insert") is None:
+                cur = d["_kf_sql_cur"]
+                # discover existing columns
+                try:
+                    schema = cur.execute(f"PRAGMA table_info({table_name})").fetchall()
+                    existing_cols = {row[1] for row in schema}  # row[1] = column name
+                except Exception:
+                    existing_cols = set()
+
+                # how many state entries?
+                try:
+                    import numpy as _np
+                    n_state = int(_np.size(mu_vec)) if mu_vec is not None else 0
+                except Exception:
+                    n_state = 0
+
+                # choose column names
+                desired = d.get("_kf_state_col_names")  # optional: list like ["alpha_T",...]
+                if desired is not None:
+                    mu_cols = [str(c) for c in desired][:n_state]
+                    # pad if shorter
+                    while len(mu_cols) < n_state:
+                        mu_cols.append(f"mu_{len(mu_cols)}")
+                else:
+                    mu_cols = [f"mu_{i}" for i in range(n_state)]
+
+                # add any missing state columns as REAL
+                for col in mu_cols:
+                    if col and (col not in existing_cols):
+                        try:
+                            cur.execute(f"ALTER TABLE {table_name} ADD COLUMN {col} REAL")
+                        except Exception:
+                            # If another thread added it, ignore
+                            pass
+                d["_kf_sql_conn"].commit()
+
+                # build and cache the prepared INSERT with whatever columns exist now
+                base_cols = ["Timestamp","Zone","y_T","y_w","y_c","yhat_T","yhat_w","yhat_c"]
+                all_cols  = base_cols + mu_cols
+                placeholders = [":ts", ":zone", ":y_T", ":y_w", ":y_c", ":yhat_T", ":yhat_w", ":yhat_c"] \
+                            + [f":{c}" for c in mu_cols]
+                d["_kf_mu_cols"]    = mu_cols
+                d["_kf_sql_insert"] = f"INSERT INTO {table_name} ({', '.join(all_cols)}) VALUES ({', '.join(placeholders)})"
+
+            # ---- compose row dict ----
             row = {
                 "ts":      _to_iso_ts(ts),
                 "zone":    str(zone_name),
-                "y_T":     _get(names, y_vec,   "T"),
-                "y_w":     _get(names, y_vec,   "w"),
-                "y_c":     _get(names, y_vec,   "CO2"),
+                "y_T":     _get(names, y_vec,    "T"),
+                "y_w":     _get(names, y_vec,    "w"),
+                "y_c":     _get(names, y_vec,    "CO2"),
                 "yhat_T":  _get(names, yhat_vec, "T"),
                 "yhat_w":  _get(names, yhat_vec, "w"),
                 "yhat_c":  _get(names, yhat_vec, "CO2"),
-                "alpha_T": _to_num(mu_vec[0]),
-                "beta_T":  _to_num(mu_vec[1]),
-                "alpha_m": _to_num(mu_vec[2]),
-                "beta_w":  _to_num(mu_vec[3]),
-                "beta_c":  _to_num(mu_vec[4]),
             }
+
+            # add state entries using the dynamic columns
+            mu_cols = d.get("_kf_mu_cols") or []
+            if mu_cols:
+                import numpy as _np
+                mu_flat = _np.asarray(mu_vec, dtype=float).reshape(-1) if mu_vec is not None else _np.array([])
+                for i, col in enumerate(mu_cols):
+                    val = mu_flat[i] if i < mu_flat.size else None
+                    row[col] = _to_num(val)
+
+            # ---- batch + executemany ----
             d["_kf_batch"].append(row)
             if len(d["_kf_batch"]) >= batch_size:
                 cur = d["_kf_sql_cur"]; sql = d["_kf_sql_insert"]
@@ -4445,8 +4498,10 @@ class EPlusUtil:
                         d["_kf_sql_conn"].commit()
                         d["_kf_commits"] += 1
                         if journal_mode.upper() == "WAL" and (d["_kf_commits"] % checkpoint_every_commits == 0):
-                            try: cur.execute("PRAGMA wal_checkpoint(TRUNCATE);")
-                            except Exception: pass
+                            try:
+                                cur.execute("PRAGMA wal_checkpoint(TRUNCATE);")
+                            except Exception:
+                                pass
                 except sqlite3.DatabaseError as e:
                     d["_kf_sql_disabled"] = True
                     try: self._log(1, f"[kf-sql] insert disabled: {e}")
