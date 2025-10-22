@@ -3711,64 +3711,6 @@ class EPlusUtil:
 
         return mu_k.reshape(-1), S_k, yhat_k.reshape(-1), K                 
 
-    def _ekf_update(
-        self,
-        x_prev, P_prev,         # (n,), (n,n)
-        f_x, F,                 # f(x_{k-1|k-1}) as (n,), and F_{k-1} as (n,n)
-        H, Q, R,                # H_k (m,n), Q (n,n), R (m,m)
-        y,                      # y_k (m,) or (m,1)
-        *, use_pinv=True
-    ):
-        """
-        One-step Extended Kalman Filter.
-
-        Predict:
-        x_prior = f_x
-        P_prior = F P_prev F^T + Q
-        Gain:
-        K = P_prior H^T (H P_prior H^T + R)^-1
-        Update:
-        x_post = x_prior + K (y - H x_prior)
-        P_post = (I - K H) P_prior
-        Returns: (x_post, P_post, yhat_post, K)
-        """
-        import numpy as np
-
-        x_prev  = np.asarray(x_prev, dtype=float).reshape(-1)
-        P_prev  = np.asarray(P_prev, dtype=float)
-        f_x     = np.asarray(f_x,    dtype=float).reshape(-1)
-        F       = np.asarray(F,      dtype=float)
-        H       = np.asarray(H,      dtype=float)
-        Q       = np.asarray(Q,      dtype=float)
-        R       = np.asarray(R,      dtype=float)
-        y       = np.asarray(y,      dtype=float).reshape(-1)
-
-        n = x_prev.shape[0]
-        m = y.shape[0]
-        assert f_x.shape[0] == n and F.shape == (n, n), "F/f_x dimension mismatch"
-        assert P_prev.shape == (n, n) and Q.shape == (n, n), "P/Q dimension mismatch"
-        assert H.shape == (m, n) and R.shape == (m, m), "H/R dimension mismatch"
-
-        # Predict
-        x_prior = f_x
-        P_prior = F @ P_prev @ F.T + Q
-
-        # Gain
-        S_innov = H @ P_prior @ H.T + R
-        if use_pinv:
-            K = P_prior @ H.T @ np.linalg.pinv(S_innov)
-        else:
-            # numerically-stable solve
-            K = np.linalg.solve(S_innov.T, (H @ P_prior).T).T
-
-        # Update
-        yhat_prior = H @ x_prior
-        x_post = x_prior + K @ (y - yhat_prior)
-        P_post = (np.eye(n) - K @ H) @ P_prior
-        yhat_post = H @ x_post
-
-        return x_post.reshape(-1), P_post, yhat_post.reshape(-1), K
-
     def _kf_random_walk_update_simdkalman(
         self,
         phi,           # (m, n)
@@ -4160,6 +4102,64 @@ class EPlusUtil:
     #             )
 
     #     return payload
+
+    def _ekf_update(
+        self,
+        x_prev, P_prev,         # (n,), (n,n)
+        f_x, F,                 # f(x_{k-1|k-1}) as (n,), and F_{k-1} as (n,n)
+        H, Q, R,                # H_k (m,n), Q (n,n), R (m,m)
+        y,                      # y_k (m,) or (m,1)
+        *, use_pinv=True
+    ):
+        """
+        One-step Extended Kalman Filter.
+
+        Predict:
+        x_prior = f_x
+        P_prior = F P_prev F^T + Q
+        Gain:
+        K = P_prior H^T (H P_prior H^T + R)^-1
+        Update:
+        x_post = x_prior + K (y - H x_prior)
+        P_post = (I - K H) P_prior
+        Returns: (x_post, P_post, yhat_post, K)
+        """
+        import numpy as np
+
+        x_prev  = np.asarray(x_prev, dtype=float).reshape(-1)
+        P_prev  = np.asarray(P_prev, dtype=float)
+        f_x     = np.asarray(f_x,    dtype=float).reshape(-1)
+        F       = np.asarray(F,      dtype=float)
+        H       = np.asarray(H,      dtype=float)
+        Q       = np.asarray(Q,      dtype=float)
+        R       = np.asarray(R,      dtype=float)
+        y       = np.asarray(y,      dtype=float).reshape(-1)
+
+        n = x_prev.shape[0]
+        m = y.shape[0]
+        assert f_x.shape[0] == n and F.shape == (n, n), "F/f_x dimension mismatch"
+        assert P_prev.shape == (n, n) and Q.shape == (n, n), "P/Q dimension mismatch"
+        assert H.shape == (m, n) and R.shape == (m, m), "H/R dimension mismatch"
+
+        # Predict
+        x_prior = f_x
+        P_prior = F @ P_prev @ F.T + Q
+
+        # Gain
+        S_innov = H @ P_prior @ H.T + R
+        if use_pinv:
+            K = P_prior @ H.T @ np.linalg.pinv(S_innov)
+        else:
+            # numerically-stable solve
+            K = np.linalg.solve(S_innov.T, (H @ P_prior).T).T
+
+        # Update
+        yhat_prior = H @ x_prior
+        x_post = x_prior + K @ (y - yhat_prior)
+        P_post = (np.eye(n) - K @ H) @ P_prior
+        yhat_post = H @ x_post
+
+        return x_post.reshape(-1), P_post, yhat_post.reshape(-1), K
 
     def _kf_prepare_inputs_random_walk(self, *, zone, meas, mu_prev, P_prev, Sigma_P, Sigma_R):
         """
