@@ -3915,7 +3915,7 @@ class EPlusUtil:
         Sigma_R = _np.diag(Sigma_R_diag)  # 3x3 by construction
 
         # ---- pick preparer (pluggable) ----
-        kf_prepare_fn = opts.get("kf_prepare_fn") or self._kf_prepare_inputs_random_walk
+        kf_prepare_fn = opts.get("kf_prepare_fn") or self._kf_prepare_inputs_zone_energy_balance
 
         def _call_preparer(fn, **kw):
             """Call `fn` correctly whether it is bound (method) or free function."""
@@ -3926,7 +3926,7 @@ class EPlusUtil:
             return fn(**kw) if is_bound else fn(self, **kw)
 
         if not callable(kf_prepare_fn):
-            kf_prepare_fn = getattr(self, "_kf_prepare_inputs_random_walk")
+            kf_prepare_fn = getattr(self, "_kf_prepare_inputs_zone_energy_balance")
 
         # ---- one-time initialization (state, handles, SQL) ----
         if d.get("_kf_state_id") != id(self.state):
