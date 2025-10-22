@@ -3713,99 +3713,61 @@ class EPlusUtil:
 
     def _ekf_update(
         self,
-        f_x_prev,    # f(\hat{x}_{k-1|k-1})  → array-like shape (n,) or (n,1)
-        F,           # state Jacobian F_{k-1} → (n, n)
-        H,           # measurement Jacobian H_k → (m, n)
-        y,           # measurement y_k → (m,) or (m,1)
-        mu_prev,     # prior state \hat{x}_{k-1|k-1} → (n,) or (n,1)
-        P_prev,      # prior covariance P_{k-1|k-1} → (n, n)
-        Sigma_Q,     # process noise Σ_Q → (n, n)
-        Sigma_R,     # measurement noise Σ_R → (m, m)
-        *,
-        use_pinv=True,   # use Moore–Penrose inverse for robustness
-        jitter=1e-9,     # small PSD jitter added to innovation for stability
+        x_prev, P_prev,         # (n,), (n,n)
+        f_x, F,                 # f(x_{k-1|k-1}) as (n,), and F_{k-1} as (n,n)
+        H, Q, R,                # H_k (m,n), Q (n,n), R (m,m)
+        y,                      # y_k (m,) or (m,1)
+        *, use_pinv=True
     ):
         """
-        One-step Extended Kalman Filter (EKF) update.
+        One-step Extended Kalman Filter.
 
-        Implements:
-        # Predict
-        x_prior = f(\hat{x}_{k-1|k-1})
-        P_prior = F P_{k-1|k-1} F^T + Σ_Q
-
-        # Gain
-        S      = H P_prior H^T + Σ_R
-        K      = P_prior H^T S^{-1}
-
-        # Update
-        \hat{x}_{k|k} = x_prior + K (y - H x_prior)
-        P_{k|k}       = (I - K H) P_prior
-
-        Returns:
-        mu_k_flat : (n,)     posterior state
-        P_k       : (n,n)    posterior covariance
-        yhat_k    : (m,)     posterior predicted measurement H mu_k
-        K         : (n,m)    Kalman gain
+        Predict:
+        x_prior = f_x
+        P_prior = F P_prev F^T + Q
+        Gain:
+        K = P_prior H^T (H P_prior H^T + R)^-1
+        Update:
+        x_post = x_prior + K (y - H x_prior)
+        P_post = (I - K H) P_prior
+        Returns: (x_post, P_post, yhat_post, K)
         """
         import numpy as np
 
-        # --- coerce shapes/dtypes ---
-        f_x_prev = np.asarray(f_x_prev, dtype=float).reshape(-1, 1)   # (n,1)
-        F        = np.asarray(F,        dtype=float)                  # (n,n)
-        H        = np.asarray(H,        dtype=float)                  # (m,n)
-        y        = np.asarray(y,        dtype=float).reshape(-1, 1)   # (m,1)
-        mu_prev  = np.asarray(mu_prev,  dtype=float).reshape(-1, 1)   # (n,1)
-        P_prev   = np.asarray(P_prev,   dtype=float)                  # (n,n)
-        Q        = np.asarray(Sigma_Q,  dtype=float)                  # (n,n)
-        R        = np.asarray(Sigma_R,  dtype=float)                  # (m,m)
+        x_prev  = np.asarray(x_prev, dtype=float).reshape(-1)
+        P_prev  = np.asarray(P_prev, dtype=float)
+        f_x     = np.asarray(f_x,    dtype=float).reshape(-1)
+        F       = np.asarray(F,      dtype=float)
+        H       = np.asarray(H,      dtype=float)
+        Q       = np.asarray(Q,      dtype=float)
+        R       = np.asarray(R,      dtype=float)
+        y       = np.asarray(y,      dtype=float).reshape(-1)
 
-        # --- dimensions & consistency checks ---
-        n = mu_prev.shape[0]
-        if f_x_prev.shape != (n, 1):
-            raise ValueError(f"f_x_prev shape {f_x_prev.shape} incompatible with n={n}. Expected {(n,1)}.")
-        if F.shape != (n, n):
-            raise ValueError(f"F shape {F.shape} must be {(n,n)}.")
-        if P_prev.shape != (n, n):
-            raise ValueError(f"P_prev shape {P_prev.shape} must be {(n,n)}.")
-        if Q.shape != (n, n):
-            raise ValueError(f"Sigma_Q shape {Q.shape} must be {(n,n)}.")
-        if H.ndim != 2 or H.shape[1] != n:
-            raise ValueError(f"H shape {H.shape} must be (m,{n}).")
-        m = H.shape[0]
-        if y.shape != (m, 1):
-            raise ValueError(f"y shape {y.shape} must be {(m,1)}.")
-        if R.shape != (m, m):
-            raise ValueError(f"Sigma_R shape {R.shape} must be {(m,m)}.")
+        n = x_prev.shape[0]
+        m = y.shape[0]
+        assert f_x.shape[0] == n and F.shape == (n, n), "F/f_x dimension mismatch"
+        assert P_prev.shape == (n, n) and Q.shape == (n, n), "P/Q dimension mismatch"
+        assert H.shape == (m, n) and R.shape == (m, m), "H/R dimension mismatch"
 
-        # --- 1) Prediction ---
-        x_prior = f_x_prev                                # (n,1)
-        P_prior = F @ P_prev @ F.T + Q                    # (n,n)
+        # Predict
+        x_prior = f_x
+        P_prior = F @ P_prev @ F.T + Q
 
-        # --- 2) Innovation / Gain ---
-        S_innov = H @ P_prior @ H.T + R                   # (m,m)
-        if jitter and jitter > 0.0:
-            S_innov = S_innov + jitter * np.eye(m)
-
+        # Gain
+        S_innov = H @ P_prior @ H.T + R
         if use_pinv:
-            S_inv = np.linalg.pinv(S_innov)
-            K = P_prior @ H.T @ S_inv                     # (n,m)
+            K = P_prior @ H.T @ np.linalg.pinv(S_innov)
         else:
-            # Solve S_innov * X = (H P_prior)^T  → K = X^T
+            # numerically-stable solve
             K = np.linalg.solve(S_innov.T, (H @ P_prior).T).T
 
-        # --- 3) Update state & covariance ---
-        yhat_prior = H @ x_prior                          # (m,1)
-        innov      = y - yhat_prior                       # (m,1)
-        mu_k       = x_prior + K @ innov                  # (n,1)
-        P_k        = (np.eye(n) - K @ H) @ P_prior        # (n,n)
+        # Update
+        yhat_prior = H @ x_prior
+        x_post = x_prior + K @ (y - yhat_prior)
+        P_post = (np.eye(n) - K @ H) @ P_prior
+        yhat_post = H @ x_post
 
-        # Symmetrize P_k to counter numeric drift
-        P_k = 0.5 * (P_k + P_k.T)
-
-        # --- Posterior predicted measurement ---
-        yhat_k = (H @ mu_k).reshape(-1)                   # (m,)
-
-        return mu_k.reshape(-1), P_k, yhat_k, K
+        return x_post.reshape(-1), P_post, yhat_post.reshape(-1), K
 
     def _kf_random_walk_update_simdkalman(
         self,
@@ -4199,162 +4161,70 @@ class EPlusUtil:
 
     #     return payload
 
-    def _kf_prepare_inputs_random_walk(
-        self, s, payload, zone, *,
-        d, mu0, S0_diag, Sigma_P, Sigma_R
-    ):
+    def _kf_prepare_inputs_random_walk(self, *, zone, meas, mu_prev, P_prev, Sigma_P, Sigma_R):
         """
-        Prepare EKF inputs for the 5-state random-walk model with 3 measurements.
-
-        State β = [alpha_T, beta_T, alpha_m, beta_w, beta_c]^T (n=5)
-        Measurement y = [Tz*, w_z*, c_z*]^T (m=3)
-        H(=φ) rows:
-        [ (To-Tsa)  1   0   0   0 ]
-        [   0       0 (wo-wsa) 1 0 ]
-        [   0       0 (co-csa) 0 1 ]
-
-        Forward-fill policy:
-        - outdoor: payload → ffill → 0.0
-        - zone T, CO2: payload → ffill → 0.0
-        - zone w: payload → Zone Mean Air Humidity Ratio → w(T,RH,P_site) → ffill → 0.0
-        - supply T,w,CO2: payload → ffill → 0.0
-
-        Returns:
-        (f_x_prev, F, H, y, mu_prev, P_prev, Q, R, names)
+        Map the random-walk linear model into EKF inputs (so the main driver
+        can always call _ekf_update). Expects:
+        meas: {"phi": (m,n) matrix, "y": (m,) vector}
         """
-        import math
-        import numpy as _np
-        ex = self.api.exchange
+        import numpy as np
 
-        # -------- helpers (local, measurement-level; no KF math) --------
-        def _fin(x):
-            try: return _np.isfinite(float(x))
-            except Exception: return False
+        phi = meas["phi"]              # H_k
+        y   = meas["y"].reshape(-1)    # y_k
+        n   = mu_prev.shape[0]
 
-        def _v(h):
-            if h in (-1, None): return float("nan")
-            try:
-                x = float(ex.get_variable_value(s, h))
-                return x if (x == x) else float("nan")
-            except Exception:
-                return float("nan")
+        F = np.eye(n)                  # random-walk: x_k = I x_{k-1} + w
+        f_x = mu_prev.reshape(-1)      # f(x) = x
 
-        def _w_from_T_RH_P(Tc, RH_pct, P_pa):
-            try:
-                if not (Tc == Tc and RH_pct == RH_pct and P_pa == P_pa and P_pa > 1000.0):
-                    return float("nan")
-                psat = 610.94 * math.exp(17.625 * Tc / (Tc + 243.04))
-                pw = max(0.0, min(1.0, RH_pct/100.0)) * psat
-                denom = max(1.0, P_pa - pw)
-                return 0.62198 * pw / denom
-            except Exception:
-                return float("nan")
+        Q = np.asarray(Sigma_P, dtype=float)
+        R = np.asarray(Sigma_R, dtype=float)
 
-        def _ffill_out(key, val, default=0.0):
-            if _fin(val):
-                d["_kf_last_out"][key] = float(val)
-                return float(val)
-            return d["_kf_last_out"].get(key, float(default))
-
-        def _ffill_zone(cat, z, key, val, default=0.0):
-            store = d["_kf_last_air"] if cat == "air" else d["_kf_last_sup"]
-            zm = store.setdefault(z, {})
-            if _fin(val):
-                zm[key] = float(val)
-                return float(val)
-            return float(zm.get(key, default))
-
-        # -------- ensure per-zone prior (state & cov) --------
-        if zone not in d["_kf_mu"]:
-            d["_kf_mu"][zone]    = _np.asarray(mu0, dtype=float).reshape(-1)
-            d["_kf_Sigma"][zone] = _np.diag(_np.asarray(S0_diag, dtype=float))
-        mu_prev = d["_kf_mu"][zone].reshape(-1, 1)
-        P_prev  = d["_kf_Sigma"][zone]
-
-        # -------- outdoor (ffill) --------
-        ts = payload["timestamp"]
-        oT = _ffill_out("T",  payload["outdoor"].get("Tdb_C"),     0.0)
-        ow = _ffill_out("w",  payload["outdoor"].get("w_kgperkg"), 0.0)
-        oc = _ffill_out("c",  payload["outdoor"].get("co2_ppm"),   0.0)
-
-        # site pressure (for psychro fallback)
-        P_site = float("nan")
-        if d.get("_kf_h_ready", False):
-            P_site = _v(d.get("_kf_h_Psite", -1))
-
-        Z = payload["zones"][zone]
-
-        # -------- zone air: T, w (with fallbacks), CO2 → then ffill --------
-        yT = _ffill_zone("air", zone, "T", Z["air"].get("Tdb_C"), 0.0)
-
-        yw = Z["air"].get("w_kgperkg")
-        if not _fin(yw) and d.get("_kf_h_ready", False):
-            w_mean = _v(d["_kf_h_wmean"].get(zone, -1))
-            if _fin(w_mean):
-                yw = w_mean
-            else:
-                rh  = _v(d["_kf_h_rh"].get(zone, -1))
-                Tz  = _v(d["_kf_h_T"].get(zone, -1))
-                w_c = _w_from_T_RH_P(Tz, rh, P_site)
-                if _fin(w_c):
-                    yw = w_c
-        yw = _ffill_zone("air", zone, "w", yw, 0.0)
-
-        yc = _ffill_zone("air", zone, "c", Z["air"].get("co2_ppm"), 0.0)
-
-        # -------- supply (ffill) --------
-        sT = _ffill_zone("sup", zone, "T", Z["supply"].get("Tdb_C"),     0.0)
-        sw = _ffill_zone("sup", zone, "w", Z["supply"].get("w_kgperkg"), 0.0)
-        sc = _ffill_zone("sup", zone, "c", Z["supply"].get("co2_ppm"),   0.0)
-
-        # -------- build EKF inputs for random-walk model --------
-        # f(x) = x, F = I
-        n = 5
-        F  = _np.eye(n, dtype=float)
-        f_x_prev = mu_prev.copy()              # f(\hat{x}_{k-1|k-1}) = \hat{x}_{k-1|k-1}
-
-        # H (3x5) and y (3,)
-        H = _np.asarray([
-            [ (oT - sT), 1.0, 0.0,      0.0, 0.0 ],
-            [ 0.0,       0.0, (ow - sw), 1.0, 0.0 ],
-            [ 0.0,       0.0, (oc - sc), 0.0, 1.0 ],
-        ], dtype=float)
-
-        y = _np.asarray([yT, yw, yc], dtype=float).reshape(-1)
-
-        # Q, R from caller
-        Q = _np.asarray(Sigma_P, dtype=float)
-        R = _np.asarray(Sigma_R, dtype=float)
-
-        names = ["T", "w", "CO2"]   # for SQL writer mapping
-
-        return (f_x_prev, F, H, y, mu_prev, P_prev, Q, R, names, ts)
+        return dict(
+            x_prev=mu_prev, P_prev=P_prev,
+            f_x=f_x, F=F, H=phi, Q=Q, R=R, y=y
+        )
 
     def probe_zone_air_and_supply_with_kf(self, s, **opts):
         """
-        Orchestrator: probe + prepare EKF inputs + run EKF + persist.
-        No Kalman math here (delegated to _kf_prepare_inputs_random_walk and _ekf_update).
+        Probe + KF/EKF persistence using a pluggable preparer.
+
+        Common measurement policy (applies to any KF):
+        - Forward-fill outdoor and zone measurements; default 0.0 at start.
+        - Zone w fallback chain: payload w → Zone Mean Air Humidity Ratio → w(T,RH,P_site)
+
+        Choose the preparer with:
+        kf_prepare_fn: callable(self, *, zone, meas, mu_prev, P_prev, Sigma_P, Sigma_R) -> dict for _ekf_update
+        (defaults to self._kf_prepare_inputs_random_walk)
+
+        Other opts unchanged:
+        kf_sigma_P_diag, kf_sigma_R_diag, kf_init_mu, kf_init_cov_diag,
+        kf_sql_table, kf_zones, kf_exclude_patterns, kf_log,
+        kf_db_filename, kf_batch_size, kf_commit_every_batches,
+        kf_checkpoint_every_commits, kf_journal_mode, kf_synchronous
         """
         ex = self.api.exchange
         if ex.warmup_flag(s):
             return
 
-        import os, sqlite3
+        import os, sqlite3, math
         import numpy as _np
 
-        # ---- run the probe ----
-        probe_kwargs = {k:v for k,v in opts.items() if k not in {
+        # ---- probe (no changes) ----
+        passthru_keys = {
             "kf_sigma_P_diag","kf_sigma_R_diag","kf_init_mu","kf_init_cov_diag",
             "kf_sql_table","kf_zones","kf_exclude_patterns","kf_log",
-            "kf_db_filename","kf_batch_size","kf_commit_every_batches","kf_checkpoint_every_commits",
-            "kf_journal_mode","kf_synchronous","kf_prepare_fn"}}
+            "kf_db_filename","kf_batch_size","kf_commit_every_batches",
+            "kf_checkpoint_every_commits","kf_journal_mode","kf_synchronous",
+            "kf_prepare_fn"
+        }
+        probe_kwargs = {k:v for k,v in opts.items() if k not in passthru_keys}
         payload = self.probe_zone_air_and_supply(s, **probe_kwargs)
         if not payload or "zones" not in payload:
             return payload
 
         d = self.__dict__
 
-        # ---- config (no math) ----
+        # ---- config ----
         Sigma_P_diag = _np.asarray(opts.get("kf_sigma_P_diag", [1e-6, 1e-3, 1e-6, 1e-6, 1e-4]), dtype=float)
         Sigma_R_diag = _np.asarray(opts.get("kf_sigma_R_diag", [0.2**2, (2e-4)**2, 30.0**2]), dtype=float)
         mu0          = _np.asarray(opts.get("kf_init_mu",      [0.0, 20.0, 0.0, 0.008, 400.0]), dtype=float)
@@ -4371,13 +4241,15 @@ class EPlusUtil:
         journal_mode = str(opts.get("kf_journal_mode", "WAL"))
         synchronous  = str(opts.get("kf_synchronous", "NORMAL"))
 
-        # choose preparer (default = random-walk 5x3 with our measurement model)
-        prepare_fn = opts.get("kf_prepare_fn", self._kf_prepare_inputs_random_walk)
+        Sigma_P = _np.diag(Sigma_P_diag)
+        Sigma_R = _np.diag(Sigma_R_diag)  # 3x3
 
-        Q = _np.diag(Sigma_P_diag)
-        R = _np.diag(Sigma_R_diag)
+        # ---- pick preparer (pluggable) ----
+        kf_prepare_fn = opts.get("kf_prepare_fn", None)
+        if not callable(kf_prepare_fn):
+            kf_prepare_fn = getattr(self, "_kf_prepare_inputs_random_walk")
 
-        # ---- one-time init (no KF math) ----
+        # ---- one-time initialization (state, handles, SQL) ----
         if d.get("_kf_state_id") != id(self.state):
             d["_kf_state_id"] = id(self.state)
             d["_kf_mu"]    = {}
@@ -4386,15 +4258,14 @@ class EPlusUtil:
             d["_kf_last_air"] = {}
             d["_kf_last_sup"] = {}
 
-            # cache zones list used for requesting handles
+            # cache chosen zones
             if kf_zones:
                 zones = [z for z in kf_zones if z in payload["zones"]]
             else:
-                zones = [z for z in payload["zones"].keys()
-                        if not any(p in z.upper() for p in excl_pats)]
+                zones = [z for z in payload["zones"].keys() if not any(p in z.upper() for p in excl_pats)]
             d["_kf_zones_cached"] = zones
 
-            # request auxiliary variables (for humidity fallback)
+            # request extra vars for w fallback
             for z in zones:
                 for nm in ("Zone Mean Air Humidity Ratio",
                         "Zone Air Relative Humidity",
@@ -4410,6 +4281,7 @@ class EPlusUtil:
             d["_kf_h_T"]     = {}
             d["_kf_h_Psite"] = -1
 
+        # resolve handles once
         if not d.get("_kf_h_ready", False) and ex.api_data_fully_ready(s):
             zones = d.get("_kf_zones_cached", [])
             def H(nm, key):
@@ -4421,7 +4293,7 @@ class EPlusUtil:
             d["_kf_h_Psite"] = H("Site Outdoor Air Barometric Pressure", "Environment")
             d["_kf_h_ready"] = True
 
-        # ---- SQL open+schema (no KF math) ----
+        # ---- SQL open + schema (reused) ----
         def _ensure_sql():
             if d.get("_kf_sql_disabled"):
                 return False
@@ -4475,7 +4347,50 @@ class EPlusUtil:
         if not _ensure_sql():
             return payload
 
-        # insert helper (no KF math)
+        # -------- common helpers (measurement-level; shared across KFs) --------
+        def _fin(x):
+            try: return _np.isfinite(float(x))
+            except Exception: return False
+
+        def _v(h):
+            if h in (-1, None): return float("nan")
+            try:
+                x = float(ex.get_variable_value(s, h))
+                return x if (x == x) else float("nan")
+            except Exception:
+                return float("nan")
+
+        def _w_from_T_RH_P(Tc, RH_pct, P_pa):
+            try:
+                if not (Tc == Tc and RH_pct == RH_pct and P_pa == P_pa and P_pa > 1000.0):
+                    return float("nan")
+                psat = 610.94 * math.exp(17.625 * Tc / (Tc + 243.04))
+                pw = max(0.0, min(1.0, RH_pct/100.0)) * psat
+                denom = max(1.0, P_pa - pw)
+                return 0.62198 * pw / denom
+            except Exception:
+                return float("nan")
+
+        def _ffill_out(key, val, default=0.0):
+            if _fin(val):
+                d["_kf_last_out"][key] = float(val)
+                return float(val)
+            return d["_kf_last_out"].get(key, float(default))
+
+        def _ffill_zone(cat, z, key, val, default=0.0):
+            store = d["_kf_last_air"] if cat == "air" else d["_kf_last_sup"]
+            zm = store.setdefault(z, {})
+            if _fin(val):
+                zm[key] = float(val)
+                return float(val)
+            return float(zm.get(key, default))
+
+        def _ensure_prior(zone):
+            if zone not in d["_kf_mu"]:
+                d["_kf_mu"][zone]    = mu0.copy().reshape(-1)
+                d["_kf_Sigma"][zone] = _np.diag(S0_diag.copy())
+            return d["_kf_mu"][zone].reshape(-1), d["_kf_Sigma"][zone]
+
         def _to_iso_ts(ts_obj) -> str:
             if ts_obj:
                 return str(ts_obj).replace("T", " ")
@@ -4492,10 +4407,10 @@ class EPlusUtil:
         def _to_num(x):
             try:
                 if x is None: return None
-                v = float(x)
-                return v if _np.isfinite(v) else None
-            except Exception:
-                return None
+                xv = float(x)
+                if _np.isfinite(xv): return xv
+            except Exception: pass
+            return None
 
         def _ins(ts, zone_name: str, names, y_vec, yhat_vec, mu_vec):
             def _get(_names, _vec, lbl):
@@ -4541,31 +4456,74 @@ class EPlusUtil:
                     d["_kf_sql_conn"] = None
                     d["_kf_sql_cur"]  = None
 
-        # which zones to run
+        # -------- zone loop: build common meas, then delegate to preparer + EKF --------
         if kf_zones:
             zones_use = [z for z in kf_zones if z in payload["zones"]]
         else:
-            zones_use = [z for z in payload["zones"].keys()
-                        if not any(p in z.upper() for p in excl_pats)]
+            zones_use = [z for z in payload["zones"].keys() if not any(p in z.upper() for p in excl_pats)]
 
-        # ---- main loop: prepare → EKF → persist (no KF math here) ----
-        for z in zones_use:
-            (f_x_prev, F, H, y, mu_prev, P_prev, Qk, Rk, names, ts) = prepare_fn(
-                s, payload, z,
-                d=d, mu0=mu0, S0_diag=S0_diag, Sigma_P=Q, Sigma_R=R
+        ts = payload["timestamp"]
+        oT = _ffill_out("T",  payload["outdoor"].get("Tdb_C"),     0.0)
+        ow = _ffill_out("w",  payload["outdoor"].get("w_kgperkg"), 0.0)
+        oc = _ffill_out("c",  payload["outdoor"].get("co2_ppm"),   0.0)
+        P_site = _v(d.get("_kf_h_Psite", -1)) if d.get("_kf_h_ready", False) else float("nan")
+
+        for zone in zones_use:
+            Z = payload["zones"][zone]
+
+            # air
+            yT = _ffill_zone("air", zone, "T", Z["air"].get("Tdb_C"), 0.0)
+            yw = Z["air"].get("w_kgperkg")
+            if not _fin(yw) and d.get("_kf_h_ready", False):
+                w_mean = _v(d["_kf_h_wmean"].get(zone, -1))
+                if _fin(w_mean):
+                    yw = w_mean
+                else:
+                    rh  = _v(d["_kf_h_rh"].get(zone, -1))
+                    Tz  = _v(d["_kf_h_T"].get(zone, -1))
+                    w_c = _w_from_T_RH_P(Tz, rh, P_site)
+                    if _fin(w_c): yw = w_c
+            yw = _ffill_zone("air", zone, "w", yw, 0.0)
+            yc = _ffill_zone("air", zone, "c", Z["air"].get("co2_ppm"), 0.0)
+
+            # supply
+            sT = _ffill_zone("sup", zone, "T", Z["supply"].get("Tdb_C"),     0.0)
+            sw = _ffill_zone("sup", zone, "w", Z["supply"].get("w_kgperkg"), 0.0)
+            sc = _ffill_zone("sup", zone, "c", Z["supply"].get("co2_ppm"),   0.0)
+
+            # common φ and y for all KFs that use this linear observation form
+            phi = _np.asarray([
+                [ (oT - sT), 1.0, 0.0,     0.0, 0.0 ],
+                [ 0.0,       0.0, (ow-sw), 1.0, 0.0 ],
+                [ 0.0,       0.0, (oc-sc), 0.0, 1.0 ],
+            ], dtype=float)
+            y   = _np.asarray([yT, yw, yc], dtype=float)
+
+            # prior
+            mu_prev, P_prev = _ensure_prior(zone)
+
+            # let the PREPARER decide model (RW→EKF form by default)
+            prep = kf_prepare_fn(
+                self,
+                zone=zone,
+                meas={"phi": phi, "y": y, "names": ["T","w","CO2"], "ts": ts},
+                mu_prev=mu_prev, P_prev=P_prev,
+                Sigma_P=Sigma_P, Sigma_R=Sigma_R
             )
 
-            # Run generic EKF step
+            # run the generic EKF
             mu_k, P_k, yhat_k, K = self._ekf_update(
-                f_x_prev, F, H, y, mu_prev, P_prev, Qk, Rk, use_pinv=True, jitter=1e-9
+                prep["x_prev"], prep["P_prev"],    # x_{k-1|k-1}, P_{k-1|k-1}
+                prep["f_x"], prep["F"],            # f(x_{k-1|k-1}), F_{k-1}
+                prep["H"], prep["Q"], prep["R"],   # H_k, Q, R
+                prep["y"]                           # y_k
             )
 
-            # stash back
-            d["_kf_mu"][z]    = mu_k
-            d["_kf_Sigma"][z] = P_k
+            # persist posterior
+            d["_kf_mu"][zone]    = mu_k
+            d["_kf_Sigma"][zone] = P_k
 
-            # write
-            _ins(ts, z, names, y, yhat_k, mu_k)
+            _ins(ts, zone, ["T","w","CO2"], y, yhat_k, mu_k)
 
             if do_log:
                 aT,bT,am,bw,bc = mu_k
@@ -4573,7 +4531,7 @@ class EPlusUtil:
                     1,
                     "[kf] %s %s | update | yhat_T=%.3f yhat_w=%.5f yhat_c=%.1f | "
                     "alpha_T=%.4f beta_T=%.4f alpha_m=%.4f beta_w=%.6f beta_c=%.2f"
-                    % (ts, z, yhat_k[0], yhat_k[1], yhat_k[2], aT, bT, am, bw, bc)
+                    % (ts, zone, yhat_k[0], yhat_k[1], yhat_k[2], aT, bT, am, bw, bc)
                 )
 
         return payload
