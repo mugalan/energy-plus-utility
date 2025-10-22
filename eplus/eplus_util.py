@@ -3711,6 +3711,102 @@ class EPlusUtil:
 
         return mu_k.reshape(-1), S_k, yhat_k.reshape(-1), K                 
 
+    def _ekf_update(
+        self,
+        f_x_prev,    # f(\hat{x}_{k-1|k-1})  → array-like shape (n,) or (n,1)
+        F,           # state Jacobian F_{k-1} → (n, n)
+        H,           # measurement Jacobian H_k → (m, n)
+        y,           # measurement y_k → (m,) or (m,1)
+        mu_prev,     # prior state \hat{x}_{k-1|k-1} → (n,) or (n,1)
+        P_prev,      # prior covariance P_{k-1|k-1} → (n, n)
+        Sigma_Q,     # process noise Σ_Q → (n, n)
+        Sigma_R,     # measurement noise Σ_R → (m, m)
+        *,
+        use_pinv=True,   # use Moore–Penrose inverse for robustness
+        jitter=1e-9,     # small PSD jitter added to innovation for stability
+    ):
+        """
+        One-step Extended Kalman Filter (EKF) update.
+
+        Implements:
+        # Predict
+        x_prior = f(\hat{x}_{k-1|k-1})
+        P_prior = F P_{k-1|k-1} F^T + Σ_Q
+
+        # Gain
+        S      = H P_prior H^T + Σ_R
+        K      = P_prior H^T S^{-1}
+
+        # Update
+        \hat{x}_{k|k} = x_prior + K (y - H x_prior)
+        P_{k|k}       = (I - K H) P_prior
+
+        Returns:
+        mu_k_flat : (n,)     posterior state
+        P_k       : (n,n)    posterior covariance
+        yhat_k    : (m,)     posterior predicted measurement H mu_k
+        K         : (n,m)    Kalman gain
+        """
+        import numpy as np
+
+        # --- coerce shapes/dtypes ---
+        f_x_prev = np.asarray(f_x_prev, dtype=float).reshape(-1, 1)   # (n,1)
+        F        = np.asarray(F,        dtype=float)                  # (n,n)
+        H        = np.asarray(H,        dtype=float)                  # (m,n)
+        y        = np.asarray(y,        dtype=float).reshape(-1, 1)   # (m,1)
+        mu_prev  = np.asarray(mu_prev,  dtype=float).reshape(-1, 1)   # (n,1)
+        P_prev   = np.asarray(P_prev,   dtype=float)                  # (n,n)
+        Q        = np.asarray(Sigma_Q,  dtype=float)                  # (n,n)
+        R        = np.asarray(Sigma_R,  dtype=float)                  # (m,m)
+
+        # --- dimensions & consistency checks ---
+        n = mu_prev.shape[0]
+        if f_x_prev.shape != (n, 1):
+            raise ValueError(f"f_x_prev shape {f_x_prev.shape} incompatible with n={n}. Expected {(n,1)}.")
+        if F.shape != (n, n):
+            raise ValueError(f"F shape {F.shape} must be {(n,n)}.")
+        if P_prev.shape != (n, n):
+            raise ValueError(f"P_prev shape {P_prev.shape} must be {(n,n)}.")
+        if Q.shape != (n, n):
+            raise ValueError(f"Sigma_Q shape {Q.shape} must be {(n,n)}.")
+        if H.ndim != 2 or H.shape[1] != n:
+            raise ValueError(f"H shape {H.shape} must be (m,{n}).")
+        m = H.shape[0]
+        if y.shape != (m, 1):
+            raise ValueError(f"y shape {y.shape} must be {(m,1)}.")
+        if R.shape != (m, m):
+            raise ValueError(f"Sigma_R shape {R.shape} must be {(m,m)}.")
+
+        # --- 1) Prediction ---
+        x_prior = f_x_prev                                # (n,1)
+        P_prior = F @ P_prev @ F.T + Q                    # (n,n)
+
+        # --- 2) Innovation / Gain ---
+        S_innov = H @ P_prior @ H.T + R                   # (m,m)
+        if jitter and jitter > 0.0:
+            S_innov = S_innov + jitter * np.eye(m)
+
+        if use_pinv:
+            S_inv = np.linalg.pinv(S_innov)
+            K = P_prior @ H.T @ S_inv                     # (n,m)
+        else:
+            # Solve S_innov * X = (H P_prior)^T  → K = X^T
+            K = np.linalg.solve(S_innov.T, (H @ P_prior).T).T
+
+        # --- 3) Update state & covariance ---
+        yhat_prior = H @ x_prior                          # (m,1)
+        innov      = y - yhat_prior                       # (m,1)
+        mu_k       = x_prior + K @ innov                  # (n,1)
+        P_k        = (np.eye(n) - K @ H) @ P_prior        # (n,n)
+
+        # Symmetrize P_k to counter numeric drift
+        P_k = 0.5 * (P_k + P_k.T)
+
+        # --- Posterior predicted measurement ---
+        yhat_k = (H @ mu_k).reshape(-1)                   # (m,)
+
+        return mu_k.reshape(-1), P_k, yhat_k, K
+
     def _kf_random_walk_update_simdkalman(
         self,
         phi,           # (m, n)
@@ -3772,432 +3868,334 @@ class EPlusUtil:
         return mu_k.reshape(-1), S_k, yhat_k.reshape(-1), K
 
 
-    def _kf_random_walk_update_simdkalman_v2(
-        self,
-        phi,           # (m, n)
-        y,             # (m,) or (m,1)
-        mu_prev,       # (n,) or (n,1)
-        S_prev,        # (n,n) or (n,) diag
-        Sigma_P,       # (n,n) or (n,) diag
-        Sigma_R,       # (m,m) or (m,) diag
-        *,
-        nonneg_idx=None,   # iterable of integer indices to clip to >= 0 (e.g. [3,4])
-        eps=1e-9           # tiny variance bump when clipping
-    ):
-        """
-        One-step Kalman update using simdkalman for a random-walk model (A=I).
-        Robust to 1-D vs 2-D covariance outputs and supports optional
-        nonnegativity projection on selected state components.
-        Returns: (mu_k_flat, S_k_mat, yhat_k_flat)
-        """
-        import numpy as np
-        import simdkalman
+    # def probe_zone_air_and_supply_with_kf(self, s, **opts):
+    #     """
+    #     Probe + Kalman filter + SQL persistence (uses probe payload only).
+    #     NOTE: No mass flow used; updates every tick.
 
-        # --- normalize shapes ---
-        phi     = np.asarray(phi, dtype=float)
-        y       = np.asarray(y, dtype=float).reshape(-1)
-        mu_prev = np.asarray(mu_prev, dtype=float).reshape(-1)
-        S_prev  = np.asarray(S_prev, dtype=float)
-        Sigma_P = np.asarray(Sigma_P, dtype=float)
-        Sigma_R = np.asarray(Sigma_R, dtype=float)
+    #     Missing-data policy:
+    #     - If current measurement is NA -> use last available for that zone/outdoor.
+    #     - If no history yet -> use 0.0.
+    #     - Zone w fallback chain: payload w → Zone Mean Air Humidity Ratio → w(T,RH,P_site).
+    #     """
+    #     ex = self.api.exchange
+    #     if ex.warmup_flag(s):
+    #         return
 
-        n = mu_prev.shape[0]
-        m = phi.shape[0]
+    #     import os, sqlite3, math
+    #     import numpy as _np
 
-        # ensure 2-D covariances for the filter construction
-        def _to_cov2d(C, dim):
-            C = np.asarray(C, dtype=float)
-            if C.ndim == 0:
-                return np.eye(dim) * float(C)
-            if C.ndim == 1:
-                # treat as diagonal
-                return np.diag(C.reshape(-1))
-            return C
+    #     # ---- run the working probe (unchanged) ----
+    #     probe_kwargs = {k:v for k,v in opts.items() if k not in {
+    #         "kf_sigma_P_diag","kf_sigma_R_diag","kf_init_mu","kf_init_cov_diag",
+    #         "kf_sql_table","kf_zones","kf_exclude_patterns","kf_log",
+    #         "kf_db_filename","kf_batch_size","kf_commit_every_batches","kf_checkpoint_every_commits",
+    #         "kf_journal_mode","kf_synchronous"}}
+    #     payload = self.probe_zone_air_and_supply(s, **probe_kwargs)
+    #     if not payload or "zones" not in payload:
+    #         return payload
 
-        P_prev = _to_cov2d(S_prev, n)
-        Q      = _to_cov2d(Sigma_P, n)
-        R      = _to_cov2d(Sigma_R, m)
+    #     d = self.__dict__
 
-        # build per-step KF (A = I for random walk; H = phi)
-        I = np.eye(n)
-        kf = simdkalman.KalmanFilter(
-            state_transition = I,
-            process_noise    = Q,
-            observation_model= phi,
-            observation_noise= R
-        )
+    #     # ---- KF config ----
+    #     Sigma_P_diag = _np.asarray(opts.get("kf_sigma_P_diag", [1e-6, 1e-3, 1e-6, 1e-6, 1e-4]), dtype=float)
+    #     Sigma_R_diag = _np.asarray(opts.get("kf_sigma_R_diag", [0.2**2, (2e-4)**2, 30.0**2]), dtype=float)
+    #     mu0          = _np.asarray(opts.get("kf_init_mu",      [0.0, 20.0, 0.0, 0.008, 400.0]), dtype=float)
+    #     S0_diag      = _np.asarray(opts.get("kf_init_cov_diag",[1.0, 25.0, 1.0, 1e-3, 1e3]), dtype=float)
+    #     table_name   = str(opts.get("kf_sql_table", "KalmanEstimates"))
+    #     kf_zones     = opts.get("kf_zones", None)
+    #     excl_pats    = tuple(opts.get("kf_exclude_patterns", ("PLENUM",)))
+    #     do_log       = bool(opts.get("kf_log", True))
 
-        # predict & update
-        m_minus, P_minus = kf.predict_next(mu_prev, P_prev)
-        m_post, P_post   = kf.update(m_minus, P_minus, y)
+    #     # Perf opts
+    #     db_filename  = str(opts.get("kf_db_filename", "eplusout.sql"))
+    #     batch_size   = int(opts.get("kf_batch_size", 50))
+    #     commit_every_batches = int(opts.get("kf_commit_every_batches", 10))
+    #     checkpoint_every_commits = int(opts.get("kf_checkpoint_every_commits", 5))
+    #     journal_mode = str(opts.get("kf_journal_mode", "WAL"))
+    #     synchronous  = str(opts.get("kf_synchronous", "NORMAL"))
 
-        # enforce nonnegativity if requested
-        if nonneg_idx:
-            m_post = np.asarray(m_post, dtype=float).reshape(-1)
-            P_post = np.asarray(P_post, dtype=float)
-            # covariance may be returned as 1-D (diag) or 2-D
-            if P_post.ndim == 1:
-                # bump diagonal variances for clipped components
-                for i in nonneg_idx:
-                    if i < 0 or i >= n: continue
-                    if m_post[i] < 0.0:
-                        m_post[i] = 0.0
-                        P_post[i] = float(P_post[i]) + eps
-                # turn into 2-D matrix for uniform downstream handling
-                P_post = np.diag(P_post)
-            else:
-                for i in nonneg_idx:
-                    if i < 0 or i >= n: continue
-                    if m_post[i] < 0.0:
-                        m_post[i] = 0.0
-                        P_post[i, i] = float(P_post[i, i]) + eps
-        else:
-            m_post = np.asarray(m_post, dtype=float).reshape(-1)
-            P_post = _to_cov2d(P_post, n)
+    #     Sigma_P = _np.diag(Sigma_P_diag)
+    #     Sigma_R_full = _np.diag(Sigma_R_diag)  # 3x3
 
-        # yhat = phi mu
-        yhat = phi @ m_post
+    #     # ---- Per-state init (unchanged) ----
+    #     if d.get("_kf_state_id") != id(self.state):
+    #         d["_kf_state_id"] = id(self.state)
+    #         d["_kf_mu"]    = {}
+    #         d["_kf_Sigma"] = {}
+    #         d["_kf_last_out"] = {}
+    #         d["_kf_last_air"] = {}
+    #         d["_kf_last_sup"] = {}
 
-        return m_post, P_post, np.asarray(yhat, dtype=float).reshape(-1)
+    #         if kf_zones:
+    #             zones = [z for z in kf_zones if z in payload["zones"]]
+    #         else:
+    #             zones = [z for z in payload["zones"].keys()
+    #                     if not any(p in z.upper() for p in excl_pats)]
+    #         d["_kf_zones_cached"] = zones
 
-    def probe_zone_air_and_supply_with_kf(self, s, **opts):
-        """
-        Probe + Kalman filter + SQL persistence (uses probe payload only).
-        NOTE: No mass flow used; updates every tick.
+    #         for z in zones:
+    #             for nm in ("Zone Mean Air Humidity Ratio",
+    #                     "Zone Air Relative Humidity",
+    #                     "Zone Mean Air Temperature"):
+    #                 try: ex.request_variable(s, nm, z)
+    #                 except Exception: pass
+    #         try: ex.request_variable(s, "Site Outdoor Air Barometric Pressure", "Environment")
+    #         except Exception: pass
 
-        Missing-data policy:
-        - If current measurement is NA -> use last available for that zone/outdoor.
-        - If no history yet -> use 0.0.
-        - Zone w fallback chain: payload w → Zone Mean Air Humidity Ratio → w(T,RH,P_site).
-        """
-        ex = self.api.exchange
-        if ex.warmup_flag(s):
-            return
+    #         d["_kf_h_ready"] = False
+    #         d["_kf_h_wmean"] = {}
+    #         d["_kf_h_rh"]    = {}
+    #         d["_kf_h_T"]     = {}
+    #         d["_kf_h_Psite"] = -1
 
-        import os, sqlite3, math
-        import numpy as _np
+    #     if not d.get("_kf_h_ready", False) and ex.api_data_fully_ready(s):
+    #         zones = d.get("_kf_zones_cached", [])
+    #         def H(nm, key):
+    #             try: return ex.get_variable_handle(s, nm, key)
+    #             except Exception: return -1
+    #         d["_kf_h_wmean"] = {z: H("Zone Mean Air Humidity Ratio", z) for z in zones}
+    #         d["_kf_h_rh"]    = {z: H("Zone Air Relative Humidity",   z) for z in zones}
+    #         d["_kf_h_T"]     = {z: H("Zone Mean Air Temperature",    z) for z in zones}
+    #         d["_kf_h_Psite"] = H("Site Outdoor Air Barometric Pressure", "Environment")
+    #         d["_kf_h_ready"] = True
 
-        # ---- run the working probe (unchanged) ----
-        probe_kwargs = {k:v for k,v in opts.items() if k not in {
-            "kf_sigma_P_diag","kf_sigma_R_diag","kf_init_mu","kf_init_cov_diag",
-            "kf_sql_table","kf_zones","kf_exclude_patterns","kf_log",
-            "kf_db_filename","kf_batch_size","kf_commit_every_batches","kf_checkpoint_every_commits",
-            "kf_journal_mode","kf_synchronous"}}
-        payload = self.probe_zone_air_and_supply(s, **probe_kwargs)
-        if not payload or "zones" not in payload:
-            return payload
+    #     # --- SQL open+schema once (unchanged) ---
+    #     def _ensure_sql():
+    #         if d.get("_kf_sql_disabled"):
+    #             return False
+    #         if d.get("_kf_sql_conn") and d.get("_kf_sql_cur") and d.get("_kf_sql_db") == db_filename:
+    #             return True
+    #         try:
+    #             assert self.out_dir, "set_model(...) first so out_dir is available."
+    #             path = os.path.join(self.out_dir, db_filename)
+    #             conn = sqlite3.connect(path, timeout=30.0)
+    #             cur  = conn.cursor()
+    #             try:
+    #                 cur.execute(f"PRAGMA journal_mode={journal_mode};")
+    #                 cur.execute(f"PRAGMA synchronous={synchronous};")
+    #             except Exception:
+    #                 pass
+    #             cur.execute(f"""
+    #                 CREATE TABLE IF NOT EXISTS {table_name} (
+    #                     Timestamp TEXT NOT NULL,
+    #                     Zone      TEXT NOT NULL,
+    #                     y_T   REAL, y_w   REAL, y_c   REAL,
+    #                     yhat_T REAL, yhat_w REAL, yhat_c REAL,
+    #                     alpha_T REAL, beta_T REAL, alpha_m REAL, beta_w REAL, beta_c REAL
+    #                 )
+    #             """)
+    #             conn.commit()
+    #             d["_kf_sql_conn"] = conn
+    #             d["_kf_sql_cur"]  = cur
+    #             d["_kf_sql_db"]   = db_filename
+    #             d["_kf_batch"]    = []
+    #             d["_kf_batches_written"] = 0
+    #             d["_kf_commits"]  = 0
+    #             d["_kf_sql_insert"] = f"""
+    #                 INSERT INTO {table_name}
+    #                 (Timestamp, Zone,
+    #                 y_T, y_w, y_c,
+    #                 yhat_T, yhat_w, yhat_c,
+    #                 alpha_T, beta_T, alpha_m, beta_w, beta_c)
+    #                 VALUES
+    #                 (:ts, :zone,
+    #                 :y_T, :y_w, :y_c,
+    #                 :yhat_T, :yhat_w, :yhat_c,
+    #                 :alpha_T, :beta_T, :alpha_m, :beta_w, :beta_c)
+    #             """
+    #             return True
+    #         except sqlite3.DatabaseError as e:
+    #             try: self._log(1, f"[kf-sql] DISABLED (open): {e}")
+    #             except Exception: pass
+    #             d["_kf_sql_disabled"] = True
+    #             return False
 
-        d = self.__dict__
+    #     if not _ensure_sql():
+    #         return payload
 
-        # ---- KF config ----
-        Sigma_P_diag = _np.asarray(opts.get("kf_sigma_P_diag", [1e-6, 1e-3, 1e-6, 1e-6, 1e-4]), dtype=float)
-        Sigma_R_diag = _np.asarray(opts.get("kf_sigma_R_diag", [0.2**2, (2e-4)**2, 30.0**2]), dtype=float)
-        mu0          = _np.asarray(opts.get("kf_init_mu",      [0.0, 20.0, 0.0, 0.008, 400.0]), dtype=float)
-        S0_diag      = _np.asarray(opts.get("kf_init_cov_diag",[1.0, 25.0, 1.0, 1e-3, 1e3]), dtype=float)
-        table_name   = str(opts.get("kf_sql_table", "KalmanEstimates"))
-        kf_zones     = opts.get("kf_zones", None)
-        excl_pats    = tuple(opts.get("kf_exclude_patterns", ("PLENUM",)))
-        do_log       = bool(opts.get("kf_log", True))
+    #     # ---- small helpers (unchanged) ----
+    #     def _to_iso_ts(ts_obj) -> str:
+    #         if ts_obj:
+    #             return str(ts_obj).replace("T", " ")
+    #         try:
+    #             yr = int(self.api.exchange.year(self.state))
+    #             m  = int(self.api.exchange.month(self.state))
+    #             d_ = int(self.api.exchange.day_of_month(self.state))
+    #             hh = int(self.api.exchange.hour(self.state))
+    #             mm = int(self.api.exchange.minute(self.state))
+    #             return f"{yr:04d}-{m:02d}-{d_:02d} {hh:02d}:{mm:02d}:00"
+    #         except Exception:
+    #             return ""
 
-        # Perf opts
-        db_filename  = str(opts.get("kf_db_filename", "eplusout.sql"))
-        batch_size   = int(opts.get("kf_batch_size", 50))
-        commit_every_batches = int(opts.get("kf_commit_every_batches", 10))
-        checkpoint_every_commits = int(opts.get("kf_checkpoint_every_commits", 5))
-        journal_mode = str(opts.get("kf_journal_mode", "WAL"))
-        synchronous  = str(opts.get("kf_synchronous", "NORMAL"))
+    #     def _to_num(x):
+    #         try:
+    #             if x is None: return None
+    #             xv = float(x)
+    #             if _np.isfinite(xv): return xv
+    #         except Exception: pass
+    #         return None
 
-        Sigma_P = _np.diag(Sigma_P_diag)
-        Sigma_R_full = _np.diag(Sigma_R_diag)  # 3x3
+    #     def _fin(x):
+    #         try: return _np.isfinite(float(x))
+    #         except Exception: return False
 
-        # ---- Per-state init (unchanged) ----
-        if d.get("_kf_state_id") != id(self.state):
-            d["_kf_state_id"] = id(self.state)
-            d["_kf_mu"]    = {}
-            d["_kf_Sigma"] = {}
-            d["_kf_last_out"] = {}
-            d["_kf_last_air"] = {}
-            d["_kf_last_sup"] = {}
+    #     def _v(h):
+    #         if h in (-1, None): return float("nan")
+    #         try:
+    #             x = float(ex.get_variable_value(s, h))
+    #             return x if (x == x) else float("nan")
+    #         except Exception:
+    #             return float("nan")
 
-            if kf_zones:
-                zones = [z for z in kf_zones if z in payload["zones"]]
-            else:
-                zones = [z for z in payload["zones"].keys()
-                        if not any(p in z.upper() for p in excl_pats)]
-            d["_kf_zones_cached"] = zones
+    #     def _w_from_T_RH_P(Tc, RH_pct, P_pa):
+    #         try:
+    #             if not (Tc == Tc and RH_pct == RH_pct and P_pa == P_pa and P_pa > 1000.0):
+    #                 return float("nan")
+    #             psat = 610.94 * math.exp(17.625 * Tc / (Tc + 243.04))
+    #             pw = max(0.0, min(1.0, RH_pct/100.0)) * psat
+    #             denom = max(1.0, P_pa - pw)
+    #             return 0.62198 * pw / denom
+    #         except Exception:
+    #             return float("nan")
 
-            for z in zones:
-                for nm in ("Zone Mean Air Humidity Ratio",
-                        "Zone Air Relative Humidity",
-                        "Zone Mean Air Temperature"):
-                    try: ex.request_variable(s, nm, z)
-                    except Exception: pass
-            try: ex.request_variable(s, "Site Outdoor Air Barometric Pressure", "Environment")
-            except Exception: pass
+    #     def _ffill_out(key, val, default=0.0):
+    #         if _fin(val):
+    #             d["_kf_last_out"][key] = float(val)
+    #             return float(val)
+    #         return d["_kf_last_out"].get(key, float(default))
 
-            d["_kf_h_ready"] = False
-            d["_kf_h_wmean"] = {}
-            d["_kf_h_rh"]    = {}
-            d["_kf_h_T"]     = {}
-            d["_kf_h_Psite"] = -1
+    #     def _ffill_zone(cat, z, key, val, default=0.0):
+    #         store = d["_kf_last_air"] if cat == "air" else d["_kf_last_sup"]
+    #         zm = store.setdefault(z, {})
+    #         if _fin(val):
+    #             zm[key] = float(val)
+    #             return float(val)
+    #         return float(zm.get(key, default))
 
-        if not d.get("_kf_h_ready", False) and ex.api_data_fully_ready(s):
-            zones = d.get("_kf_zones_cached", [])
-            def H(nm, key):
-                try: return ex.get_variable_handle(s, nm, key)
-                except Exception: return -1
-            d["_kf_h_wmean"] = {z: H("Zone Mean Air Humidity Ratio", z) for z in zones}
-            d["_kf_h_rh"]    = {z: H("Zone Air Relative Humidity",   z) for z in zones}
-            d["_kf_h_T"]     = {z: H("Zone Mean Air Temperature",    z) for z in zones}
-            d["_kf_h_Psite"] = H("Site Outdoor Air Barometric Pressure", "Environment")
-            d["_kf_h_ready"] = True
+    #     def _ins(ts, zone_name: str, names, y_vec, yhat_vec, mu_vec):
+    #         def _get(_names, _vec, lbl):
+    #             try:
+    #                 i = _names.index(lbl)
+    #                 return _to_num(_vec[i])
+    #             except Exception:
+    #                 return None
+    #         row = {
+    #             "ts":      _to_iso_ts(ts),
+    #             "zone":    str(zone_name),
+    #             "y_T":     _get(names, y_vec,   "T"),
+    #             "y_w":     _get(names, y_vec,   "w"),
+    #             "y_c":     _get(names, y_vec,   "CO2"),
+    #             "yhat_T":  _get(names, yhat_vec, "T"),
+    #             "yhat_w":  _get(names, yhat_vec, "w"),
+    #             "yhat_c":  _get(names, yhat_vec, "CO2"),
+    #             "alpha_T": _to_num(mu_vec[0]),
+    #             "beta_T":  _to_num(mu_vec[1]),
+    #             "alpha_m": _to_num(mu_vec[2]),
+    #             "beta_w":  _to_num(mu_vec[3]),
+    #             "beta_c":  _to_num(mu_vec[4]),
+    #         }
+    #         d["_kf_batch"].append(row)
+    #         if len(d["_kf_batch"]) >= batch_size:
+    #             cur = d["_kf_sql_cur"]; sql = d["_kf_sql_insert"]
+    #             try:
+    #                 cur.executemany(sql, d["_kf_batch"])
+    #                 d["_kf_batch"].clear()
+    #                 d["_kf_batches_written"] += 1
+    #                 if d["_kf_batches_written"] % commit_every_batches == 0:
+    #                     d["_kf_sql_conn"].commit()
+    #                     d["_kf_commits"] += 1
+    #                     if journal_mode.upper() == "WAL" and (d["_kf_commits"] % checkpoint_every_commits == 0):
+    #                         try: cur.execute("PRAGMA wal_checkpoint(TRUNCATE);")
+    #                         except Exception: pass
+    #             except sqlite3.DatabaseError as e:
+    #                 d["_kf_sql_disabled"] = True
+    #                 try: self._log(1, f"[kf-sql] insert disabled: {e}")
+    #                 except Exception: pass
+    #                 try: d["_kf_sql_conn"].close()
+    #                 except Exception: pass
+    #                 d["_kf_sql_conn"] = None
+    #                 d["_kf_sql_cur"]  = None
 
-        # --- SQL open+schema once (unchanged) ---
-        def _ensure_sql():
-            if d.get("_kf_sql_disabled"):
-                return False
-            if d.get("_kf_sql_conn") and d.get("_kf_sql_cur") and d.get("_kf_sql_db") == db_filename:
-                return True
-            try:
-                assert self.out_dir, "set_model(...) first so out_dir is available."
-                path = os.path.join(self.out_dir, db_filename)
-                conn = sqlite3.connect(path, timeout=30.0)
-                cur  = conn.cursor()
-                try:
-                    cur.execute(f"PRAGMA journal_mode={journal_mode};")
-                    cur.execute(f"PRAGMA synchronous={synchronous};")
-                except Exception:
-                    pass
-                cur.execute(f"""
-                    CREATE TABLE IF NOT EXISTS {table_name} (
-                        Timestamp TEXT NOT NULL,
-                        Zone      TEXT NOT NULL,
-                        y_T   REAL, y_w   REAL, y_c   REAL,
-                        yhat_T REAL, yhat_w REAL, yhat_c REAL,
-                        alpha_T REAL, beta_T REAL, alpha_m REAL, beta_w REAL, beta_c REAL
-                    )
-                """)
-                conn.commit()
-                d["_kf_sql_conn"] = conn
-                d["_kf_sql_cur"]  = cur
-                d["_kf_sql_db"]   = db_filename
-                d["_kf_batch"]    = []
-                d["_kf_batches_written"] = 0
-                d["_kf_commits"]  = 0
-                d["_kf_sql_insert"] = f"""
-                    INSERT INTO {table_name}
-                    (Timestamp, Zone,
-                    y_T, y_w, y_c,
-                    yhat_T, yhat_w, yhat_c,
-                    alpha_T, beta_T, alpha_m, beta_w, beta_c)
-                    VALUES
-                    (:ts, :zone,
-                    :y_T, :y_w, :y_c,
-                    :yhat_T, :yhat_w, :yhat_c,
-                    :alpha_T, :beta_T, :alpha_m, :beta_w, :beta_c)
-                """
-                return True
-            except sqlite3.DatabaseError as e:
-                try: self._log(1, f"[kf-sql] DISABLED (open): {e}")
-                except Exception: pass
-                d["_kf_sql_disabled"] = True
-                return False
+    #     def _ensure_zone(z):
+    #         if z not in d["_kf_mu"]:
+    #             d["_kf_mu"][z]    = mu0.copy()
+    #             d["_kf_Sigma"][z] = _np.diag(S0_diag)
 
-        if not _ensure_sql():
-            return payload
+    #     def _is_excluded(zone_name: str) -> bool:
+    #         zup = str(zone_name).upper()
+    #         return any(p in zup for p in excl_pats)
 
-        # ---- small helpers (unchanged) ----
-        def _to_iso_ts(ts_obj) -> str:
-            if ts_obj:
-                return str(ts_obj).replace("T", " ")
-            try:
-                yr = int(self.api.exchange.year(self.state))
-                m  = int(self.api.exchange.month(self.state))
-                d_ = int(self.api.exchange.day_of_month(self.state))
-                hh = int(self.api.exchange.hour(self.state))
-                mm = int(self.api.exchange.minute(self.state))
-                return f"{yr:04d}-{m:02d}-{d_:02d} {hh:02d}:{mm:02d}:00"
-            except Exception:
-                return ""
+    #     # Which zones to process
+    #     if kf_zones:
+    #         zones_use = [z for z in kf_zones if z in payload["zones"]]
+    #     else:
+    #         zones_use = [z for z in payload["zones"].keys() if not _is_excluded(z)]
 
-        def _to_num(x):
-            try:
-                if x is None: return None
-                xv = float(x)
-                if _np.isfinite(xv): return xv
-            except Exception: pass
-            return None
+    #     # --- Outdoor (ffill) ---
+    #     ts = payload["timestamp"]
+    #     oT = _ffill_out("T",  payload["outdoor"].get("Tdb_C"),     0.0)
+    #     ow = _ffill_out("w",  payload["outdoor"].get("w_kgperkg"), 0.0)
+    #     oc = _ffill_out("c",  payload["outdoor"].get("co2_ppm"),   0.0)
 
-        def _fin(x):
-            try: return _np.isfinite(float(x))
-            except Exception: return False
+    #     P_site = _v(d.get("_kf_h_Psite", -1)) if d.get("_kf_h_ready", False) else float("nan")
 
-        def _v(h):
-            if h in (-1, None): return float("nan")
-            try:
-                x = float(ex.get_variable_value(s, h))
-                return x if (x == x) else float("nan")
-            except Exception:
-                return float("nan")
+    #     for z in zones_use:
+    #         Z = payload["zones"][z]
 
-        def _w_from_T_RH_P(Tc, RH_pct, P_pa):
-            try:
-                if not (Tc == Tc and RH_pct == RH_pct and P_pa == P_pa and P_pa > 1000.0):
-                    return float("nan")
-                psat = 610.94 * math.exp(17.625 * Tc / (Tc + 243.04))
-                pw = max(0.0, min(1.0, RH_pct/100.0)) * psat
-                denom = max(1.0, P_pa - pw)
-                return 0.62198 * pw / denom
-            except Exception:
-                return float("nan")
+    #         yT = _ffill_zone("air", z, "T", Z["air"].get("Tdb_C"), 0.0)
 
-        def _ffill_out(key, val, default=0.0):
-            if _fin(val):
-                d["_kf_last_out"][key] = float(val)
-                return float(val)
-            return d["_kf_last_out"].get(key, float(default))
+    #         yw = Z["air"].get("w_kgperkg")
+    #         if not _fin(yw) and d.get("_kf_h_ready", False):
+    #             w_mean = _v(d["_kf_h_wmean"].get(z, -1))
+    #             if _fin(w_mean):
+    #                 yw = w_mean
+    #             else:
+    #                 rh  = _v(d["_kf_h_rh"].get(z, -1))
+    #                 Tz  = _v(d["_kf_h_T"].get(z, -1))
+    #                 w_c = _w_from_T_RH_P(Tz, rh, P_site)
+    #                 if _fin(w_c):
+    #                     yw = w_c
+    #         yw = _ffill_zone("air", z, "w", yw, 0.0)
 
-        def _ffill_zone(cat, z, key, val, default=0.0):
-            store = d["_kf_last_air"] if cat == "air" else d["_kf_last_sup"]
-            zm = store.setdefault(z, {})
-            if _fin(val):
-                zm[key] = float(val)
-                return float(val)
-            return float(zm.get(key, default))
+    #         yc = _ffill_zone("air", z, "c", Z["air"].get("co2_ppm"), 0.0)
 
-        def _ins(ts, zone_name: str, names, y_vec, yhat_vec, mu_vec):
-            def _get(_names, _vec, lbl):
-                try:
-                    i = _names.index(lbl)
-                    return _to_num(_vec[i])
-                except Exception:
-                    return None
-            row = {
-                "ts":      _to_iso_ts(ts),
-                "zone":    str(zone_name),
-                "y_T":     _get(names, y_vec,   "T"),
-                "y_w":     _get(names, y_vec,   "w"),
-                "y_c":     _get(names, y_vec,   "CO2"),
-                "yhat_T":  _get(names, yhat_vec, "T"),
-                "yhat_w":  _get(names, yhat_vec, "w"),
-                "yhat_c":  _get(names, yhat_vec, "CO2"),
-                "alpha_T": _to_num(mu_vec[0]),
-                "beta_T":  _to_num(mu_vec[1]),
-                "alpha_m": _to_num(mu_vec[2]),
-                "beta_w":  _to_num(mu_vec[3]),
-                "beta_c":  _to_num(mu_vec[4]),
-            }
-            d["_kf_batch"].append(row)
-            if len(d["_kf_batch"]) >= batch_size:
-                cur = d["_kf_sql_cur"]; sql = d["_kf_sql_insert"]
-                try:
-                    cur.executemany(sql, d["_kf_batch"])
-                    d["_kf_batch"].clear()
-                    d["_kf_batches_written"] += 1
-                    if d["_kf_batches_written"] % commit_every_batches == 0:
-                        d["_kf_sql_conn"].commit()
-                        d["_kf_commits"] += 1
-                        if journal_mode.upper() == "WAL" and (d["_kf_commits"] % checkpoint_every_commits == 0):
-                            try: cur.execute("PRAGMA wal_checkpoint(TRUNCATE);")
-                            except Exception: pass
-                except sqlite3.DatabaseError as e:
-                    d["_kf_sql_disabled"] = True
-                    try: self._log(1, f"[kf-sql] insert disabled: {e}")
-                    except Exception: pass
-                    try: d["_kf_sql_conn"].close()
-                    except Exception: pass
-                    d["_kf_sql_conn"] = None
-                    d["_kf_sql_cur"]  = None
+    #         sT = _ffill_zone("sup", z, "T", Z["supply"].get("Tdb_C"),     0.0)
+    #         sw = _ffill_zone("sup", z, "w", Z["supply"].get("w_kgperkg"), 0.0)
+    #         sc = _ffill_zone("sup", z, "c", Z["supply"].get("co2_ppm"),   0.0)
 
-        def _ensure_zone(z):
-            if z not in d["_kf_mu"]:
-                d["_kf_mu"][z]    = mu0.copy()
-                d["_kf_Sigma"][z] = _np.diag(S0_diag)
+    #         phi = _np.asarray([
+    #             [ (oT - sT), 1.0, 0.0,     0.0, 0.0 ],
+    #             [ 0.0,       0.0, (ow-sw), 1.0, 0.0 ],
+    #             [ 0.0,       0.0, (oc-sc), 0.0, 1.0 ],
+    #         ], dtype=float)
+    #         y   = _np.asarray([yT, yw, yc], dtype=float)
 
-        def _is_excluded(zone_name: str) -> bool:
-            zup = str(zone_name).upper()
-            return any(p in zup for p in excl_pats)
+    #         _ensure_zone(z)
+    #         mu_prev = d["_kf_mu"][z]
+    #         S_prev  = d["_kf_Sigma"][z]
 
-        # Which zones to process
-        if kf_zones:
-            zones_use = [z for z in kf_zones if z in payload["zones"]]
-        else:
-            zones_use = [z for z in payload["zones"].keys() if not _is_excluded(z)]
+    #         # === Kalman update via helper ===
+    #         mu_k, S_k, yhat_k, _K = self._kf_random_walk_update(
+    #             phi, y, mu_prev, S_prev, Sigma_P, Sigma_R_full, use_pinv=True
+    #         )
+    #         mu_k, S_k, yhat_k, K = self._kf_random_walk_update_simdkalman(
+    #             phi, y, mu_prev, S_prev, Sigma_P, Sigma_R_full
+    #         )
 
-        # --- Outdoor (ffill) ---
-        ts = payload["timestamp"]
-        oT = _ffill_out("T",  payload["outdoor"].get("Tdb_C"),     0.0)
-        ow = _ffill_out("w",  payload["outdoor"].get("w_kgperkg"), 0.0)
-        oc = _ffill_out("c",  payload["outdoor"].get("co2_ppm"),   0.0)
+    #         d["_kf_mu"][z]    = mu_k
+    #         d["_kf_Sigma"][z] = S_k
 
-        P_site = _v(d.get("_kf_h_Psite", -1)) if d.get("_kf_h_ready", False) else float("nan")
+    #         _ins(ts, z, ["T","w","CO2"], y, yhat_k, mu_k)
 
-        for z in zones_use:
-            Z = payload["zones"][z]
+    #         if do_log:
+    #             aT,bT,am,bw,bc = mu_k
+    #             self._log(
+    #                 1,
+    #                 "[kf] %s %s | update | yhat_T=%.3f yhat_w=%.5f yhat_c=%.1f | "
+    #                 "alpha_T=%.4f beta_T=%.4f alpha_m=%.4f beta_w=%.6f beta_c=%.2f"
+    #                 % (ts, z, yhat_k[0], yhat_k[1], yhat_k[2], aT, bT, am, bw, bc)
+    #             )
 
-            yT = _ffill_zone("air", z, "T", Z["air"].get("Tdb_C"), 0.0)
-
-            yw = Z["air"].get("w_kgperkg")
-            if not _fin(yw) and d.get("_kf_h_ready", False):
-                w_mean = _v(d["_kf_h_wmean"].get(z, -1))
-                if _fin(w_mean):
-                    yw = w_mean
-                else:
-                    rh  = _v(d["_kf_h_rh"].get(z, -1))
-                    Tz  = _v(d["_kf_h_T"].get(z, -1))
-                    w_c = _w_from_T_RH_P(Tz, rh, P_site)
-                    if _fin(w_c):
-                        yw = w_c
-            yw = _ffill_zone("air", z, "w", yw, 0.0)
-
-            yc = _ffill_zone("air", z, "c", Z["air"].get("co2_ppm"), 0.0)
-
-            sT = _ffill_zone("sup", z, "T", Z["supply"].get("Tdb_C"),     0.0)
-            sw = _ffill_zone("sup", z, "w", Z["supply"].get("w_kgperkg"), 0.0)
-            sc = _ffill_zone("sup", z, "c", Z["supply"].get("co2_ppm"),   0.0)
-
-            phi = _np.asarray([
-                [ (oT - sT), 1.0, 0.0,     0.0, 0.0 ],
-                [ 0.0,       0.0, (ow-sw), 1.0, 0.0 ],
-                [ 0.0,       0.0, (oc-sc), 0.0, 1.0 ],
-            ], dtype=float)
-            y   = _np.asarray([yT, yw, yc], dtype=float)
-
-            _ensure_zone(z)
-            mu_prev = d["_kf_mu"][z]
-            S_prev  = d["_kf_Sigma"][z]
-
-            # === Kalman update via helper ===
-            mu_k, S_k, yhat_k, _K = self._kf_random_walk_update(
-                phi, y, mu_prev, S_prev, Sigma_P, Sigma_R_full, use_pinv=True
-            )
-            mu_k, S_k, yhat_k, K = self._kf_random_walk_update_simdkalman(
-                phi, y, mu_prev, S_prev, Sigma_P, Sigma_R_full
-            )
-
-            # mu_k, S_k, yhat_k = self._kf_random_walk_update_simdkalman_v2(
-            #     phi=phi,
-            #     y=y.reshape(-1),
-            #     mu_prev=d["_kf_mu"][z],
-            #     S_prev=d["_kf_Sigma"][z],
-            #     Sigma_P=Sigma_P,
-            #     Sigma_R=Sigma_R_full,
-            #     nonneg_idx=opts.get("kf_nonneg_idx")  # e.g., [3,4]
-            # )
-           
-            d["_kf_mu"][z]    = mu_k
-            d["_kf_Sigma"][z] = S_k
-
-            _ins(ts, z, ["T","w","CO2"], y, yhat_k, mu_k)
-
-            if do_log:
-                aT,bT,am,bw,bc = mu_k
-                self._log(
-                    1,
-                    "[kf] %s %s | update | yhat_T=%.3f yhat_w=%.5f yhat_c=%.1f | "
-                    "alpha_T=%.4f beta_T=%.4f alpha_m=%.4f beta_w=%.6f beta_c=%.2f"
-                    % (ts, z, yhat_k[0], yhat_k[1], yhat_k[2], aT, bT, am, bw, bc)
-                )
-
-        return payload
+    #     return payload
 
