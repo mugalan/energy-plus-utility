@@ -123,209 +123,6 @@ class EPlusUtil:
         if self.verbose >= level:
             print(msg)
 
-    # --- register callbacks ----
-
-    # --- unified "begin-iteration" callback registry (with kwargs) ---
-
-    # def _init_begin_tick_registry(self):
-    #     if not hasattr(self, "_begin_tick_enabled"):
-    #         self._begin_tick_enabled: bool = True
-    #         self._begin_tick_run_during_warmup: bool = False
-    #         # names kept for simple listing
-    #         self._begin_tick_names: list[str] = []
-    #         # callable + kwargs specs (ordered)
-    #         self._begin_tick_specs: list[tuple[callable, dict]] = []
-
-    # def _begin_tick_dispatcher(self, s):
-    #     """Master dispatcher at the beginning of each system timestep."""
-    #     if not getattr(self, "_begin_tick_run_during_warmup", False) and self.api.exchange.warmup_flag(s):
-    #         return
-    #     if not getattr(self, "_begin_tick_enabled", True):
-    #         return
-    #     # snapshot to avoid mutation issues mid-iteration
-    #     specs = list(getattr(self, "_begin_tick_specs", []))
-    #     for func, kw in specs:
-    #         try:
-    #             func(s, **kw)
-    #         except Exception as e:
-    #             try:
-    #                 nm = getattr(func, "__name__", "handler")
-    #                 self._log(1, f"[begin-tick] {nm} failed: {e}")
-    #             except Exception:
-    #                 pass
-
-    # def _ensure_begin_tick_registered(self):
-    #     self._init_begin_tick_registry()
-    #     pair = (self.api.runtime.callback_begin_system_timestep_before_predictor, self._begin_tick_dispatcher)
-    #     if pair not in self._extra_callbacks:
-    #         self._extra_callbacks.append(pair)
-    #     if getattr(self, "state", None):
-    #         try:
-    #             self.api.runtime.callback_begin_system_timestep_before_predictor(self.state, self._begin_tick_dispatcher)
-    #         except Exception:
-    #             pass
-
-    # def register_begin_iteration(self, methods, *, clear: bool = False,
-    #                             enable: bool = True,
-    #                             run_during_warmup: bool | None = None):
-    #     """
-    #     Register handlers to run at the **beginning of each EnergyPlus system timestep**
-    #     (the “before predictor” phase). Handlers are methods on this class and are
-    #     invoked as **bound** callables with the signature:
-    #     `handler(self, state, **kwargs)`.
-
-    #     Accepted `methods` formats (order matters):
-    #     • `Sequence[str]` — method names on this instance, e.g.
-    #         `["occupancy_handler", "co2_set_outdoor_ppm"]`
-    #     • `Sequence[dict]` — objects with a method name and optional kwargs, e.g.
-    #         `[{"method_name": "occupancy_handler", "kwargs": {"lam": 25}},
-    #         {"name": "co2_set_outdoor_ppm", "params": {"value_ppm": 450}}]`
-
-    #     For convenience, the kwargs key may also be given as `"key_wargs"` (typo accepted)
-    #     or `"key_kwargs"`; all are treated identically to `"kwargs"`/`"params"`.
-
-    #     Behavior & ordering rules
-    #     -------------------------
-    #     - If `clear=True`, any previously registered handlers are removed before adding new ones.
-    #     - Handlers are **de-duplicated by method name**; when a name appears multiple times,
-    #     the **last occurrence wins** (its kwargs are kept).
-    #     - The resulting order preserves any existing kept handlers, then appends new names
-    #     in the order provided.
-    #     - If `enable` is `False`, the registry is kept but **dispatch is disabled** until
-    #     re-enabled (see `enable_begin_iteration()` / `disable_begin_iteration()`).
-    #     - By default, handlers **do not run during warmup**. Set `run_during_warmup=True`
-    #     to allow warmup execution, or `False` to force skip. `None` leaves the current
-    #     registry setting unchanged.
-
-    #     Side effects
-    #     ------------
-    #     Ensures the underlying EnergyPlus callback
-    #     (`callback_begin_system_timestep_before_predictor`) is registered on the current
-    #     state so handlers will be dispatched on the next run.
-
-    #     Returns
-    #     -------
-    #     list[str]
-    #         The **ordered list of registered method names** after this call.
-
-    #     Raises
-    #     ------
-    #     TypeError
-    #         If a method spec is not `str` or `dict`, or if provided kwargs are not a `dict`.
-    #     ValueError
-    #         If a dict spec is missing a method name or it is empty after stripping.
-    #     AttributeError
-    #         If a named method does not exist on this instance or is not callable.
-
-    #     Examples
-    #     --------
-    #     Basic registration with defaults:
-
-    #     >>> util.register_begin_iteration([
-    #     ...     "occupancy_handler",
-    #     ...     {"method_name": "co2_set_outdoor_ppm", "kwargs": {"value_ppm": 450.0, "log_every_minutes": None}},
-    #     ... ])
-
-    #     Replace any existing handlers and **do not** run during warmup:
-
-    #     >>> util.register_begin_iteration(
-    #     ...     [{"name": "occupancy_handler", "params": {"lam": 30, "min": 10, "max": 40}}],
-    #     ...     clear=True, run_during_warmup=False
-    #     ... )
-
-    #     Keep the current set but temporarily disable dispatch:
-
-    #     >>> util.register_begin_iteration([], enable=False)   # methods unchanged; dispatcher paused
-    #     """
-
-    #     self._init_begin_tick_registry()
-    #     if clear:
-    #         self._begin_tick_names = []
-    #         self._begin_tick_specs = []
-
-    #     def _extract(method_item):
-    #         # returns (name: str, func: callable, kwargs: dict)
-    #         if isinstance(method_item, str):
-    #             name, kwargs = method_item.strip(), {}
-    #         elif isinstance(method_item, dict):
-    #             name = str(method_item.get("method_name") or method_item.get("name") or "").strip()
-    #             # tolerate 'key_wargs' typo and a few aliases
-    #             kwargs = (method_item.get("key_wargs")
-    #                     or method_item.get("kwargs")
-    #                     or method_item.get("key_kwargs")
-    #                     or method_item.get("params")
-    #                     or {})
-    #             if not isinstance(kwargs, dict):
-    #                 raise TypeError(f"kwargs for '{name}' must be a dict")
-    #         else:
-    #             raise TypeError(f"Unsupported method spec: {method_item!r}")
-
-    #         if not name:
-    #             raise ValueError(f"Invalid method name in spec: {method_item!r}")
-
-    #         func = getattr(self, name, None)
-    #         if func is None or not callable(func):
-    #             raise AttributeError(f"No callable '{name}' found on {self.__class__.__name__}")
-    #         return name, func, dict(kwargs)
-
-    #     # dedupe by method name (last one wins for kwargs)
-    #     seen = {nm: (fn, kw) for nm, (fn, kw) in zip(self._begin_tick_names, self._begin_tick_specs)}
-    #     for item in methods:
-    #         nm, fn, kw = _extract(item)
-    #         seen[nm] = (fn, kw)
-
-    #     # re-materialize ordered lists (preserve prior order, append new names at end)
-    #     ordered = []
-    #     for nm in self._begin_tick_names:
-    #         if nm in seen and nm not in ordered:
-    #             ordered.append(nm)
-    #     for item in methods:
-    #         nm = item if isinstance(item, str) else (item.get("method_name") or item.get("name"))
-    #         nm = str(nm).strip()
-    #         if nm and nm not in ordered:
-    #             ordered.append(nm)
-
-    #     self._begin_tick_names = ordered
-    #     self._begin_tick_specs = [seen[nm] for nm in ordered]
-
-    #     self._begin_tick_enabled = bool(enable)
-    #     if run_during_warmup is not None:
-    #         self._begin_tick_run_during_warmup = bool(run_during_warmup)
-
-    #     self._ensure_begin_tick_registered()
-    #     return list(self._begin_tick_names)
-
-    # def unregister_begin_iteration(self, method_names: Sequence[str] | None = None) -> list[str]:
-    #     """Remove one/more handlers by name. If None, remove all."""
-    #     self._init_begin_tick_registry()
-    #     if method_names is None:
-    #         self._begin_tick_names, self._begin_tick_specs = [], []
-    #         return []
-    #     remove = {str(n).strip() for n in method_names}
-    #     new_names = [nm for nm in self._begin_tick_names if nm not in remove]
-    #     self._begin_tick_names = new_names
-    #     self._begin_tick_specs = [getattr(self, nm) for nm in new_names]  # will be fixed below
-    #     # rebuild specs from names keeping stored kwargs if available
-    #     name_to_spec = {nm: spec for nm, spec in zip(self._begin_tick_names, getattr(self, "_begin_tick_specs", []))}
-    #     specs = []
-    #     for nm in new_names:
-    #         fn = getattr(self, nm)
-    #         kw = name_to_spec.get(nm, (None, {}))[1]
-    #         specs.append((fn, kw))
-    #     self._begin_tick_specs = specs
-    #     return list(self._begin_tick_names)
-
-    # def enable_begin_iteration(self):  self._init_begin_tick_registry(); self._begin_tick_enabled = True
-    # def disable_begin_iteration(self): self._init_begin_tick_registry(); self._begin_tick_enabled = False
-
-    # def list_begin_iteration(self) -> list[dict]:
-    #     """Return the ordered list of registered handlers at begin iterationwith kwargs."""
-    #     self._init_begin_tick_registry()
-    #     out = []
-    #     for nm, (fn, kw) in zip(self._begin_tick_names, self._begin_tick_specs):
-    #         out.append({"method_name": nm, "kwargs": dict(kw)})
-    #     return out
-
     # --- Generi Callback registering hub ---
 
     def _init_callback_hub(self):
@@ -346,7 +143,6 @@ class EPlusUtil:
             self._cb_registries = {}
         if not hasattr(self, "_extra_callbacks"):
             self._extra_callbacks = []  # used by your class to rebind on reset
-
 
     def _resolve_runtime_register(self, hook) -> tuple[str, callable]:
         """
@@ -440,32 +236,172 @@ class EPlusUtil:
     def register_handlers(self, hook, methods, *, clear: bool = False,
                         enable: bool = True, run_during_warmup: bool | None = None) -> list[str]:
         """
-        Register bound methods to run at a given EnergyPlus runtime hook.
+        Register one or more **bound instance methods** to run at a specific
+        EnergyPlus runtime **callback hook** (e.g., *begin system timestep*,
+        *before HVAC managers*, *after HVAC reporting*, etc.).
+
+        This API lets you compose a **runtime control loop** in pure Python:
+        you choose *when* your code runs (the hook) and *what* runs (a list of
+        instance methods, each with optional kwargs). Under the hood, a single
+        dispatcher is attached to the EnergyPlus callback and invokes your
+        methods in-order every time that hook fires.
 
         Parameters
         ----------
         hook : str | callable
-            Either:
-            - string alias: one of {"begin","before_hvac","inside_iter","after_hvac","after_zone","after_warmup","after_get_input"}
-            - full runtime attr name (e.g. "callback_after_predictor_before_hvac_managers")
-            - the registration callable itself (e.g. api.runtime.callback_inside_system_iteration_loop)
+            Where to attach the dispatcher. Accepts:
+            - **Alias string** (recommended):
+
+            ========  ==============================================
+            alias     EnergyPlus runtime callback attribute
+            --------  ----------------------------------------------
+            "begin"   callback_begin_system_timestep_before_predictor
+            "before_hvac"
+                        callback_after_predictor_before_hvac_managers
+            "inside_iter"
+                        callback_inside_system_iteration_loop
+            "after_hvac"
+                        callback_end_system_timestep_after_hvac_reporting
+            "after_zone"
+                        callback_end_zone_timestep_after_zone_reporting
+            "after_warmup"
+                        callback_after_new_environment_warmup_complete
+            "after_get_input"
+                        callback_after_component_get_input
+            ========  ==============================================
+
+            - **Full attribute name** as a string, e.g.
+            ``"callback_after_predictor_before_hvac_managers"``.
+            - **The registration callable itself**, e.g.
+            ``api.runtime.callback_inside_system_iteration_loop``.
         methods : Sequence[str | dict]
-            Handler specs. Each handler is a *method* on this instance called as: method(self, state, **kwargs).
-            Acceptable forms:
-            - "method_name"
-            - {"method_name":"...", "kwargs": {...}}  # also accepts keys "params","key_kwargs","key_wargs"
-        clear : bool
-            If True, drop any previously registered handlers for this hook before adding new ones.
-        enable : bool
-            If False, keep the registry but do not dispatch until re-enabled.
-        run_during_warmup : bool | None
-            If True, dispatch even during E+ warmup. If False, skip during warmup.
-            If None, leave current setting unchanged.
+            Handler specs. Each handler must be a **method on this instance**
+            and is invoked as: ``method(self, state, **kwargs)``.
+
+            Acceptable forms (order matters):
+            - ``"method_name"``                       → no kwargs
+            - ``{"method_name": "...", "kwargs": {...}}``
+
+            For convenience, the kwargs key also accepts:
+            ``"params"``, ``"key_kwargs"``, or even the misspelling
+            ``"key_wargs"`` (all treated the same).
+        clear : bool, default False
+            If True, **drop any previously registered handlers for this hook**
+            before adding the new set.
+        enable : bool, default True
+            If False, keep the registry but **pause dispatch** for this hook
+            (handlers remain registered and can be re-enabled later).
+        run_during_warmup : bool | None, default None
+            Warmup dispatch policy for this hook:
+            - True  → run handlers **during warmup**;
+            - False → **skip during warmup**;
+            - None  → leave the current setting unchanged.
 
         Returns
         -------
         list[str]
-            Ordered list of registered method names (post-update).
+            The **ordered list of registered method names** for this hook
+            *after* the update.
+
+        Behavior & Ordering
+        -------------------
+        - Handlers are **de-duplicated by method name**; if the same method
+        appears multiple times, the **last occurrence wins** (its kwargs
+        are kept).
+        - Final order preserves any **existing kept** handlers, then appends
+        **new names in the order provided**.
+        - A single dispatcher is attached to the chosen runtime hook; later
+        calls only update the internal registry and flags.
+        - The dispatcher checks the EnergyPlus warmup flag each tick and
+        abides by ``run_during_warmup`` for this hook.
+
+        Side Effects
+        ------------
+        - Ensures the underlying EnergyPlus callback is **registered on the
+        current state** so the dispatcher will fire in the next run.
+        - If your workflow replaces the E+ state (e.g., via ``reset_state``),
+        this class re-applies all previously attached dispatchers.
+
+        Raises
+        ------
+        TypeError
+            If a handler spec is not ``str`` or ``dict``, if kwargs is not a
+            ``dict``, or if ``hook`` is neither a string nor a callable.
+        ValueError
+            If a dict spec is missing a method name or it is empty/blank.
+        AttributeError
+            - If a named method does not exist on this instance or is not callable.
+            - If a string hook cannot be resolved to a valid runtime callback.
+
+        Examples
+        --------
+        Basic: run two methods at the **beginning of each system timestep**:
+
+        >>> util.register_handlers(
+        ...     "begin",
+        ...     [
+        ...         "occupancy_handler",
+        ...         {"method_name": "co2_set_outdoor_ppm",
+        ...          "kwargs": {"value_ppm": 450.0, "log_every_minutes": None}}
+        ...     ],
+        ...     run_during_warmup=False
+        ... )
+
+        Use a **full attribute name** for the hook:
+
+        >>> util.register_handlers(
+        ...     "callback_end_system_timestep_after_hvac_reporting",
+        ...     ["probe_zone_air_and_supply"]
+        ... )
+
+        Pass the **registration callable** directly (no strings involved):
+
+        >>> util.register_handlers(
+        ...     util.api.runtime.callback_inside_system_iteration_loop,
+        ...     [{"method_name": "my_iterative_controller", "params": {"gain": 0.2}}]
+        ... )
+
+        Temporarily **pause** a hook without changing its handlers:
+
+        >>> util.register_handlers("begin", [], enable=False)
+
+        Replace existing handlers and **update kwargs** (de-dup by name, last wins):
+
+        >>> util.register_handlers(
+        ...     "after_hvac",
+        ...     [
+        ...         {"method_name": "probe_zone_air_and_supply_with_kf",
+        ...          "kwargs": {"kf_db_filename": "kf.sqlite", "kf_batch_size": 100}},
+        ...         {"method_name": "probe_zone_air_and_supply_with_kf",
+        ...          "kwargs": {"kf_db_filename": "kf_big.sqlite", "kf_batch_size": 250}}
+        ...     ],
+        ...     clear=True
+        ... )
+        # → only one entry remains for 'probe_zone_air_and_supply_with_kf' with batch_size=250
+
+        Practical pattern: **controls early, analytics late**:
+
+        >>> util.register_handlers(
+        ...     "begin",
+        ...     [{"method_name": "zone_pid_controller",
+        ...       "kwargs": {"setpoint_C": 22.0, "humidity_w": 0.008}}],
+        ...     clear=True
+        ... )
+        >>> util.register_handlers(
+        ...     "after_hvac",
+        ...     [{"method_name": "probe_zone_air_and_supply_with_kf",
+        ...       "kwargs": {"kf_db_filename": "eplusout_kf.sqlite"}}],
+        ...     clear=True
+        ... )
+
+        Notes
+        -----
+        - Handler signature is **``handler(self, state, **kwargs)``**. If your
+        logic requires resolved API handles, consider waiting for
+        ``exchange.api_data_fully_ready(state)`` or registering at
+        ``"after_get_input"`` / ``"after_warmup"`` to initialize and cache them.
+        - Keep handlers **fast and non-blocking**—they execute in the simulation
+        loop at every hook invocation.
         """
         hook_key, reg = self._get_or_init_hook_registry(hook)
 
@@ -524,12 +460,96 @@ class EPlusUtil:
         return list(reg["names"])
 
     def list_handlers(self, hook) -> list[str]:
-        """Return the ordered list of method names registered for the given hook."""
+        """
+        Return the **ordered list of method names** registered for a given
+        EnergyPlus runtime hook.
+
+        Parameters
+        ----------
+        hook : str | callable
+            The hook to inspect. Accepts the same identifiers as
+            `register_handlers`:
+            - Alias: "begin", "before_hvac", "inside_iter", "after_hvac",
+            "after_zone", "after_warmup", "after_get_input"
+            - Full runtime callback attribute name (str), e.g.
+            "callback_end_system_timestep_after_hvac_reporting"
+            - The registration callable itself, e.g.
+            `api.runtime.callback_begin_system_timestep_before_predictor`
+
+        Returns
+        -------
+        list[str]
+            The handlers registered **for that hook**, in dispatch order.
+
+        Examples
+        --------
+        >>> util.list_handlers("begin")
+        ['occupancy_handler', 'co2_set_outdoor_ppm']
+
+        >>> util.list_handlers("callback_end_system_timestep_after_hvac_reporting")
+        ['probe_zone_air_and_supply_with_kf']
+
+        >>> util.list_handlers(util.api.runtime.callback_inside_system_iteration_loop)
+        ['zone_pid_controller']
+        """
         hook_key, reg = self._get_or_init_hook_registry(hook)
         return list(reg["names"])
 
     def unregister_handlers(self, hook, names: list[str]) -> list[str]:
-        """Remove specific handlers by name for the given hook; returns remaining names."""
+        """
+        Unregister (by name) one or more handlers for a given EnergyPlus runtime hook.
+
+        This removes matching method names from the internal registry for `hook`
+        but does **not** detach the underlying EnergyPlus callback itself; any
+        remaining handlers for that hook will still be dispatched.
+
+        Parameters
+        ----------
+        hook : str | callable
+            The hook to modify. Accepts the same identifiers as `register_handlers`:
+            - Alias: "begin", "before_hvac", "inside_iter", "after_hvac",
+            "after_zone", "after_warmup", "after_get_input"
+            - Full runtime attribute name (str), e.g.
+            "callback_end_system_timestep_after_hvac_reporting"
+            - The registration callable itself, e.g.
+            `api.runtime.callback_begin_system_timestep_before_predictor`
+        names : list[str]
+            Method names to remove (e.g., ["co2_set_outdoor_ppm", "occupancy_handler"]).
+            Names that are not currently registered are ignored.
+
+        Returns
+        -------
+        list[str]
+            The **remaining handlers** registered for this hook, in dispatch order.
+
+        Notes
+        -----
+        - Matching is done by **method name** (string equality).
+        - If a handler name appeared multiple times (should not under normal use),
+        **all occurrences** will be removed.
+        - Passing an empty list leaves the registry unchanged.
+
+        Examples
+        --------
+        Remove a single handler from the "begin" (before predictor) hook:
+
+        >>> util.unregister_handlers("begin", ["co2_set_outdoor_ppm"])
+        ['occupancy_handler', 'probe_zone_air_and_supply_with_kf']
+
+        Remove two handlers using the explicit runtime attribute name:
+
+        >>> util.unregister_handlers(
+        ...     "callback_end_system_timestep_after_hvac_reporting",
+        ...     ["probe_zone_air_and_supply_with_kf", "my_logger"]
+        ... )
+        []
+
+        Use the registration callable directly:
+
+        >>> util.unregister_handlers(util.api.runtime.callback_inside_system_iteration_loop,
+        ...                          ["zone_pid_controller"])
+        []
+        """
         hook_key, reg = self._get_or_init_hook_registry(hook)
         keep = [(nm, spec) for nm, spec in zip(reg["names"], reg["specs"]) if nm not in set(names)]
         reg["names"] = [nm for nm, _ in keep]
@@ -556,204 +576,8 @@ class EPlusUtil:
         return self.register_handlers("after_hvac", methods, **kw)    
 
 
-    # --- unified "after-HVAC-reporting" callback registry (with kwargs) ---
+   # ---------- common SQL helpers ----------
 
-    # def _init_after_hvac_registry(self):
-    #     if not hasattr(self, "_after_hvac_enabled"):
-    #         self._after_hvac_enabled: bool = True
-    #         self._after_hvac_run_during_warmup: bool = False
-    #         self._after_hvac_names: list[str] = []
-    #         self._after_hvac_specs: list[tuple[callable, dict]] = []
-
-    # def _after_hvac_dispatcher(self, s):
-    #     """Master dispatcher right AFTER HVAC reporting each system timestep (node data finalized)."""
-    #     ex = self.api.exchange
-    #     if not getattr(self, "_after_hvac_run_during_warmup", False) and ex.warmup_flag(s):
-    #         return
-    #     if not getattr(self, "_after_hvac_enabled", True):
-    #         return
-    #     # snapshot to avoid mutation during iteration
-    #     specs = list(getattr(self, "_after_hvac_specs", []))
-    #     for func, kw in specs:
-    #         try:
-    #             func(s, **kw)   # NOTE: bound method; signature def method(self, state, **kwargs)
-    #         except Exception as e:
-    #             try:
-    #                 nm = getattr(func, "__name__", "handler")
-    #                 self._log(1, f"[after-hvac] {nm} failed: {e}")
-    #             except Exception:
-    #                 pass
-
-    # def _ensure_after_hvac_registered(self):
-    #     self._init_after_hvac_registry()
-    #     if not hasattr(self, "_extra_callbacks"):
-    #         self._extra_callbacks = []
-    #     pair = (self.api.runtime.callback_end_system_timestep_after_hvac_reporting, self._after_hvac_dispatcher)
-    #     if pair not in self._extra_callbacks:
-    #         self._extra_callbacks.append(pair)
-    #     if getattr(self, "state", None):
-    #         try:
-    #             self.api.runtime.callback_end_system_timestep_after_hvac_reporting(self.state, self._after_hvac_dispatcher)
-    #         except Exception:
-    #             pass
-
-    # def register_after_hvac_reporting(self, methods, *, clear: bool = False,
-    #                                 enable: bool = True,
-    #                                 run_during_warmup: bool | None = None) -> list[str]:
-    #     """
-    #     Register handlers to run **after HVAC reporting** at each system timestep
-    #     (i.e., right after node data are finalized). Handlers must be methods on
-    #     this class and are invoked as **bound** callables with the signature:
-    #     `handler(self, state, **kwargs)`.
-
-    #     Accepted `methods` formats (order matters):
-    #     • `Sequence[str]` — method names on this instance, e.g.
-    #         `["probe_zone_air_and_supply", "my_logger"]`
-    #     • `Sequence[dict]` — objects with a method name and optional kwargs, e.g.
-    #         `[{"method_name": "probe_zone_air_and_supply", "kwargs": {"log_every_minutes": 5}},
-    #         {"name": "my_logger", "params": {"level": "debug"}}]`
-
-    #     Notes on kwargs keys:
-    #     You may use `"kwargs"`, `"params"`, `"key_kwargs"`, or even the tolerated typo
-    #     `"key_wargs"`—they are all treated equivalently.
-
-    #     Behavior & ordering rules
-    #     -------------------------
-    #     - If `clear=True`, previously registered handlers are removed before adding new ones.
-    #     - Handlers are **de-duplicated by method name**; the **last occurrence wins** (its
-    #     kwargs override prior ones).
-    #     - Final order preserves surviving existing handlers, then appends any new names in
-    #     the order provided.
-    #     - If `enable` is `False`, the registry is kept but **dispatch is disabled** until
-    #     re-enabled (see `enable_after_hvac_reporting()` / `disable_after_hvac_reporting()`).
-    #     - Warmup behavior: by default, handlers **do not run during warmup**. Pass
-    #     `run_during_warmup=True` to enable, `False` to force-disable, or `None` to leave
-    #     the existing setting unchanged.
-
-    #     Side effects
-    #     ------------
-    #     Ensures the underlying EnergyPlus callback
-    #     (`callback_end_system_timestep_after_hvac_reporting`) is registered on the current
-    #     state so handlers will be dispatched on the next run.
-
-    #     Returns
-    #     -------
-    #     list[str]
-    #         The **ordered list of registered method names** after this call.
-
-    #     Raises
-    #     ------
-    #     TypeError
-    #         If a method spec is not `str` or `dict`, or if provided kwargs are not a `dict`.
-    #     ValueError
-    #         If a dict spec lacks a method name or it is empty after stripping.
-    #     AttributeError
-    #         If a named method does not exist on this instance or is not callable.
-
-    #     Examples
-    #     --------
-    #     Register a probe and a logger with custom parameters:
-
-    #     >>> util.register_after_hvac_reporting([
-    #     ...     {"method_name": "probe_zone_air_and_supply", "kwargs": {"log_every_minutes": 1, "precision": 2}},
-    #     ...     {"name": "my_logger", "params": {"tag": "after-hvac"}}
-    #     ... ])
-
-    #     Replace any existing handlers and keep them from running during warmup:
-
-    #     >>> util.register_after_hvac_reporting(
-    #     ...     ["probe_zone_air_and_supply"],
-    #     ...     clear=True, run_during_warmup=False
-    #     ... )
-
-    #     Keep the current set but pause dispatch:
-
-    #     >>> util.register_after_hvac_reporting([], enable=False)  # handlers unchanged; dispatcher paused
-    #     """
-
-
-    #     self._init_after_hvac_registry()
-    #     if clear:
-    #         self._after_hvac_names = []
-    #         self._after_hvac_specs = []
-
-    #     def _extract(method_item):
-    #         # returns (name: str, func: callable, kwargs: dict)
-    #         if isinstance(method_item, str):
-    #             name, kwargs = method_item.strip(), {}
-    #         elif isinstance(method_item, dict):
-    #             name = str(method_item.get("method_name") or method_item.get("name") or "").strip()
-    #             kwargs = (method_item.get("key_wargs")
-    #                     or method_item.get("kwargs")
-    #                     or method_item.get("key_kwargs")
-    #                     or method_item.get("params")
-    #                     or {})
-    #             if not isinstance(kwargs, dict):
-    #                 raise TypeError(f"kwargs for '{name}' must be a dict")
-    #         else:
-    #             raise TypeError(f"Unsupported method spec: {method_item!r}")
-
-    #         if not name:
-    #             raise ValueError(f"Invalid method name in spec: {method_item!r}")
-
-    #         func = getattr(self, name, None)
-    #         if func is None or not callable(func):
-    #             raise AttributeError(f"No callable '{name}' found on {self.__class__.__name__}")
-    #         return name, func, dict(kwargs)
-
-    #     # de-dupe by method name (last wins)
-    #     seen = {nm: (fn, kw) for nm, (fn, kw) in zip(self._after_hvac_names, self._after_hvac_specs)}
-    #     for item in methods:
-    #         nm, fn, kw = _extract(item)
-    #         seen[nm] = (fn, kw)
-
-    #     # rebuild ordered list: keep existing order, then append any new ones
-    #     ordered = []
-    #     for nm in self._after_hvac_names:
-    #         if nm in seen and nm not in ordered:
-    #             ordered.append(nm)
-    #     for item in methods:
-    #         nm = item if isinstance(item, str) else (item.get("method_name") or item.get("name"))
-    #         nm = str(nm).strip()
-    #         if nm and nm not in ordered:
-    #             ordered.append(nm)
-
-    #     self._after_hvac_names = ordered
-    #     self._after_hvac_specs = [seen[nm] for nm in ordered]
-
-    #     self._after_hvac_enabled = bool(enable)
-    #     if run_during_warmup is not None:
-    #         self._after_hvac_run_during_warmup = bool(run_during_warmup)
-
-    #     self._ensure_after_hvac_registered()
-    #     return list(self._after_hvac_names)
-
-    # def unregister_after_hvac_reporting(self, method_names: list[str] | None = None) -> list[str]:
-    #     """Remove one/more handlers by name. If None, remove all."""
-    #     self._init_after_hvac_registry()
-    #     if method_names is None:
-    #         self._after_hvac_names, self._after_hvac_specs = [], []
-    #         return []
-    #     remove = {str(n).strip() for n in method_names}
-    #     # map current -> specs to preserve kwargs
-    #     current = {nm: spec for nm, spec in zip(self._after_hvac_names, self._after_hvac_specs)}
-    #     new_names = [nm for nm in self._after_hvac_names if nm not in remove]
-    #     self._after_hvac_names = new_names
-    #     self._after_hvac_specs = [current[nm] for nm in new_names]
-    #     return list(self._after_hvac_names)
-
-    # def enable_after_hvac_reporting(self):  self._init_after_hvac_registry(); self._after_hvac_enabled = True
-    # def disable_after_hvac_reporting(self): self._init_after_hvac_registry(); self._after_hvac_enabled = False
-
-    # def list_after_hvac_reporting(self) -> list[dict]:
-    #     """Return the ordered list of registered handlers with kwargs."""
-    #     self._init_after_hvac_registry()
-    #     out = []
-    #     for nm, (fn, kw) in zip(self._after_hvac_names, self._after_hvac_specs):
-    #         out.append({"method_name": nm, "kwargs": dict(kw)})
-    #     return out
-
-    # ---------- common SQL helpers ----------
     def _sql_minute_col(self, conn) -> str:
         """Detect the minute column name in the Time table ('Minute' vs 'Minutes')."""
         try:
