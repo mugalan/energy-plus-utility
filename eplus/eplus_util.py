@@ -3670,6 +3670,260 @@ class EPlusUtil:
         sels = [{"kind":"meter", "name": m} for m in meter_names]
         return self.plot_sql_series(sels, **kwargs)
 
+    def plot_sql_cov_heatmap(
+        self,
+        control_sels: list[dict],
+        output_sels: list[dict],
+        *,
+        reporting_freq: tuple[str, ...] | None = ("TimeStep", "Hourly"),
+        include_design_days: bool = False,
+        start=None,
+        end=None,
+        resample: str | None = "1h",
+        reduce: str = "mean",
+        meters_to_kwh: bool = True,
+        stat: str = "cov",               # 'cov' or 'corr'
+        min_periods: int = 8,
+        title: str | None = None,
+        show: bool = True,
+    ):
+        """
+        Compute and plot a **covariance / correlation heatmap** between “controls”
+        and “outputs” extracted from `eplusout.sql`.
+
+        Each entry in `control_sels` and `output_sels` is a selection dict compatible
+        with `plot_sql_series(...)`, e.g.:
+
+            {"kind": "var"|"meter", "name": "<E+ name>", "key": "<KeyValue|*|''>", "label": "<optional display name>"}
+
+        The function:
+        1) Pulls each selection via `plot_sql_series(..., show=False)` (so it reuses
+            the same SQL pipeline, frequency filtering, time-windowing, resampling,
+            and meter J→kWh conversion).
+        2) Converts the returned traces into time-indexed `pandas.Series`.
+        3) If a selection expands to multiple traces (e.g., multiple zone keys), it
+            reduces them to a single series using `reduce`:
+                - `"mean"` (default): average across traces by timestamp
+                - `"sum"`: sum across traces
+                - `"first"`: take the first trace as-is
+        4) Concatenates all series, aligns them on timestamps, and computes the pairwise
+            **covariance** (`stat="cov"`) or **correlation** (`stat="corr"`), using `min_periods`
+            for robustness to missing data.
+        5) Renders a heatmap with **Outputs** on the Y axis and **Controls** on the X axis.
+
+        Parameters
+        ----------
+        control_sels : list[dict]
+            One or more control-side selections (e.g., setpoints, HVAC power meters).
+            Same schema as `plot_sql_series`. Each selection becomes one column in the heatmap
+            (after optional reduction if the selection yields multiple traces).
+        output_sels : list[dict]
+            One or more output-side selections (e.g., zone temperatures, coil loads).
+            Each selection becomes one row in the heatmap (post-reduction).
+        reporting_freq : tuple[str, ...] | None, default ("TimeStep", "Hourly")
+            SQL frequency filter passed through to `plot_sql_series`. Use `None` to disable.
+        include_design_days : bool, default False
+            If `False`, sizing periods are excluded. If a selection yields no data, the
+            function **auto-retries once** with `include_design_days=True` for that selection.
+        start, end : any, optional
+            Optional time window. Passed through to `plot_sql_series` and applied before stats.
+        resample : str | None, default "1h"
+            Resampling step (Pandas offset alias) applied by `plot_sql_series`. Use `None`
+            to keep native resolution. For variables, `aggregate_vars="mean"` is used;
+            meters are summed by interval.
+        reduce : {"mean","sum","first"}, default "mean"
+            How to collapse multi-trace selections into a single series.
+        meters_to_kwh : bool, default True
+            If selections include meters, convert Joules → kWh (and relabel units) before stats.
+        stat : {"cov","corr"}, default "cov"
+            Matrix to compute/display: covariance or Pearson correlation.
+        min_periods : int, default 8
+            Minimum overlapping timestamps required for each pairwise stat (`pandas` behavior).
+        title : str | None, optional
+            Plot title. Defaults to "Covariance heatmap: outputs vs controls" (or "Correlation ...").
+        show : bool, default True
+            If True, displays the figure. The figure is returned either way.
+
+        Returns
+        -------
+        plotly.graph_objects.Figure
+            Heatmap with controls on X, outputs on Y. Color scale is zero-centered and
+            symmetric (RdBu); colorbar label reflects the chosen statistic.
+
+        Raises
+        ------
+        ValueError
+            If no data are found for a required selection (even after the auto-retry),
+            if there is no overlapping data to compute the matrix, or if the matrix is all-NaN.
+
+        Notes
+        -----
+        - Series names are taken from `selection["label"]` when provided; otherwise from the
+        E+ name (and key). If collisions occur, unique suffixes like " #2" are added.
+        - This function **does not** alter units beyond the optional meter kWh conversion.
+        - For large native time steps, consider resampling (e.g., `"15T"` or `"1H"`) to
+        stabilize covariance/correlation and speed up plotting.
+
+        Examples
+        --------
+        1) Correlate zone air temps (outputs) against thermostat setpoints (controls):
+
+        >>> controls = [
+        ...     {"kind": "var", "name": "Zone Thermostat Heating Setpoint Temperature", "key": "LIVING",  "label": "Heat SP — LIVING"},
+        ...     {"kind": "var", "name": "Zone Thermostat Heating Setpoint Temperature", "key": "BEDROOM", "label": "Heat SP — BEDROOM"},
+        ... ]
+        >>> outputs = [
+        ...     {"kind": "var", "name": "Zone Air Temperature", "key": "LIVING",  "label": "Tair — LIVING"},
+        ...     {"kind": "var", "name": "Zone Air Temperature", "key": "BEDROOM", "label": "Tair — BEDROOM"},
+        ... ]
+        >>> fig = util.plot_sql_cov_heatmap(
+        ...     control_sels=controls,
+        ...     output_sels=outputs,
+        ...     reporting_freq=("TimeStep","Hourly"),
+        ...     resample="1H",
+        ...     stat="corr",
+        ... )
+
+        2) Covariance between HVAC/equipment electricity (controls) and total cooling rates (outputs):
+
+        >>> controls = [
+        ...     {"kind": "meter", "name": "Electricity:HVAC", "label": "HVAC kWh"},
+        ...     {"kind": "meter", "name": "Electricity:Facility", "label": "Facility kWh"},
+        ... ]
+        >>> outputs = [
+        ...     {"kind": "var", "name": "Zone Total Cooling Rate", "key": "*", "label": "Zone cooling (avg)"},
+        ... ]
+        >>> fig = util.plot_sql_cov_heatmap(
+        ...     control_sels=controls,
+        ...     output_sels=outputs,
+        ...     resample="1H",
+        ...     reduce="mean",     # average across zones expanded by key="*"
+        ...     stat="cov",
+        ... )
+        """
+
+        import pandas as pd
+        import numpy as np
+        import plotly.express as px
+
+        if not control_sels or not output_sels:
+            raise ValueError("Provide at least one control selection and one output selection.")
+
+        def _series_from_selection(sel: dict, *, _include_dd: bool):
+            # pull via existing plot_sql_series (no SQL duplication)
+            def _pull(_include_dd_flag: bool):
+                return self.plot_sql_series(
+                    selections=[sel],
+                    reporting_freq=reporting_freq,
+                    include_design_days=_include_dd_flag,
+                    start=start,
+                    end=end,
+                    resample=resample,
+                    meters_to_kwh=meters_to_kwh,
+                    aggregate_vars="mean",
+                    title=None,
+                    show=False,
+                )
+            try:
+                fig = _pull(_include_dd)
+                if not fig.data:
+                    raise ValueError("no-data")
+            except Exception as e:
+                # auto-retry including sizing periods if first pass yielded nothing
+                if (not _include_dd) and ("No rows matched" in str(e) or "include_design_days=True" in str(e)):
+                    fig = _pull(True)
+                    if not fig.data:
+                        raise
+                else:
+                    raise
+
+            cols = []
+            for tr in fig.data:
+                nm = tr.name or sel.get("label") or sel.get("name")
+                s = pd.Series(tr.y, index=pd.to_datetime(tr.x), name=str(nm))
+                cols.append(s)
+            dfw = pd.concat(cols, axis=1).sort_index()
+
+            if dfw.shape[1] == 1 or reduce == "first":
+                series = dfw.iloc[:, 0]
+            elif reduce == "sum":
+                series = dfw.sum(axis=1, min_count=1)
+            else:
+                series = dfw.mean(axis=1)
+
+            return series.dropna().rename(str(sel.get("label") or sel.get("name") or "series"))
+
+        # build labeled series
+        controls, outputs, used = [], [], set()
+        def _unique(lab: str):
+            base = str(lab)
+            if base not in used:
+                used.add(base); return base
+            i = 2
+            while f"{base} #{i}" in used:
+                i += 1
+            used.add(f"{base} #{i}")
+            return f"{base} #{i}"
+
+        for cs in control_sels:
+            s = _series_from_selection(cs, _include_dd=include_design_days)
+            s.name = _unique(s.name); controls.append(s)
+        for osel in output_sels:
+            s = _series_from_selection(osel, _include_dd=include_design_days)
+            s.name = _unique(s.name); outputs.append(s)
+
+        # assemble matrix input
+        df_all = pd.concat(controls + outputs, axis=1).sort_index()
+        # (optional speed-up) downcast
+        try: df_all = df_all.astype("float32", copy=False)
+        except Exception: pass
+
+        if stat.lower() == "corr":
+            mat = df_all.corr(min_periods=min_periods); zlabel = "Correlation"
+        else:
+            mat = df_all.cov(min_periods=min_periods);   zlabel = "Covariance"
+
+        if mat.empty:
+            raise ValueError("Could not compute matrix (no overlapping data).")
+
+        out_names = [s.name for s in outputs]
+        ctl_names = [s.name for s in controls]
+        sub = mat.loc[out_names, ctl_names]
+        if sub.isna().all().all():
+            raise ValueError("All entries are NaN. Not enough overlapping data across pairs.")
+
+        vals = sub.values.astype(float)
+        finite = np.isfinite(vals)
+        vmax = float(np.nanmax(np.abs(vals[finite]))) if finite.any() else 1.0
+
+        # Use range_color to zero-center; fallback to go.Heatmap if this PX version lacks range_color
+        try:
+            fig = px.imshow(
+                vals,
+                x=ctl_names,
+                y=out_names,
+                origin="lower",
+                aspect="auto",
+                color_continuous_scale="RdBu_r",
+                range_color=(-vmax, vmax),
+                labels=dict(x="Controls", y="Outputs", color=zlabel),
+                title=title or f"{zlabel} heatmap: outputs vs controls",
+            )
+        except TypeError:
+            import plotly.graph_objects as go
+            fig = go.Figure(data=go.Heatmap(
+                z=vals, x=ctl_names, y=out_names,
+                colorscale="RdBu", zmin=-vmax, zmax=vmax,
+                colorbar=dict(title=zlabel),
+            ))
+            fig.update_layout(
+                title=title or f"{zlabel} heatmap: outputs vs controls",
+                xaxis_title="Controls", yaxis_title="Outputs",
+            )
+
+        if show:
+            fig.show()
+        return fig
 
     # --------------- weather data ---------
 
@@ -3685,9 +3939,113 @@ class EPlusUtil:
         print_summary: bool = True,
     ):
         """
-        Extract weather 'Site ...' variables from eplusout.sql, save as CSV (wide),
-        and return (csv_path, summary_df).
+        Export weather (“Site …”) variables from `eplusout.sql` to a **wide** CSV and
+        return a quick numeric summary.
+
+        This helper pulls keyless/environment-scoped site variables from the EnergyPlus
+        SQL output, aligns them on timestamps, optionally resamples/aggregates, writes a
+        single wide table to `<out_dir>/<csv_filename>`, and returns both the path and a
+        compact summary DataFrame.
+
+        Parameters
+        ----------
+        variables : list[str] | None, default None
+            Variable names to extract (e.g., "Site Outdoor Air Drybulb Temperature").
+            If `None`, a useful default set is used:
+            - "Site Outdoor Air Drybulb Temperature"
+            - "Site Outdoor Air Dewpoint Temperature"
+            - "Site Outdoor Air Humidity Ratio"
+            - "Site Outdoor Air Barometric Pressure"
+            - "Site Wind Speed"
+            - "Site Wind Direction"
+            - "Site Diffuse Solar Radiation Rate per Area"
+            - "Site Direct Solar Radiation Rate per Area"
+            - "Site Horizontal Infrared Radiation Rate per Area"
+            - "Site Sky Temperature"
+
+            Only entries with `KeyValue` of `''`, `NULL`, or `'Environment'` are selected.
+            (Zone-scoped keys are intentionally ignored for weather export.)
+
+        reporting_freq : tuple[str, ...] | None, default ("TimeStep", "Hourly")
+            Filter by SQL reporting frequency. Pass `None` to disable frequency filtering.
+
+        include_design_days : bool, default False
+            Include sizing/design-day environments from the SQL (when False, they are excluded).
+
+        resample : str | None, default "1H"
+            Pandas offset alias for resampling the variables after alignment (e.g., "30T", "1D").
+            Use `None` to keep native simulation resolution.
+
+        aggregate : str, default "mean"
+            Aggregation to apply per column during resampling (e.g., "mean", "median", "max").
+
+        csv_filename : str, default "weather_timeseries.csv"
+            Output CSV file name (written to `self.out_dir`). Columns:
+            - "timestamp"
+            - one column per variable, labeled as `"Name [units]"` when units are known.
+
+        print_summary : bool, default True
+            If True, logs a short summary and attempts to display the summary DataFrame.
+
+        Returns
+        -------
+        (str, pandas.DataFrame)
+            A tuple `(csv_path, summary_df)` where:
+            - `csv_path` is the absolute path to the written CSV.
+            - `summary_df` has columns: `["series", "rows", "min", "mean", "max"]`
+            and `attrs`:
+            - `window_start`: timestamp of first row in the CSV
+            - `window_end`: timestamp of last row in the CSV
+            - `rows`: number of rows in the CSV
+
+        Raises
+        ------
+        AssertionError
+            If `set_model(...)` has not been called to define `idf`, `epw`, and `out_dir`.
+        FileNotFoundError
+            If `<out_dir>/eplusout.sql` is missing. Call `ensure_output_sqlite()` and rerun the simulation.
+        ValueError
+            If none of the requested variables are found in SQL (a sample of available
+            "Site %" names is included in the error message).
+
+        Notes
+        -----
+        - Timestamps: EnergyPlus records times at **end-of-interval**; this shifts to the
+        interval start for plotting/analysis consistency. `Year=0` is mapped to `2002`.
+        - Units are **not** converted; each column header appends `[units]` when available.
+        - Alignment: variables are outer-joined on timestamp; output is sorted by time.
+        - This function only queries variables (not meters).
+
+        Examples
+        --------
+        Export the default set at hourly resolution:
+
+        >>> csv_path, summary = util.export_weather_sql_to_csv()
+
+        Export a custom subset at native resolution (no resample) and include sizing periods:
+
+        >>> csv_path, summary = util.export_weather_sql_to_csv(
+        ...     variables=["Site Wind Speed", "Site Outdoor Air Drybulb Temperature"],
+        ...     resample=None,
+        ...     include_design_days=True,
+        ...     reporting_freq=None
+        ... )
+
+        30-minute median aggregation and a custom file name:
+
+        >>> csv_path, summary = util.export_weather_sql_to_csv(
+        ...     resample="30T",
+        ...     aggregate="median",
+        ...     csv_filename="weather_30min_median.csv",
+        ...     print_summary=False
+        ... )
+
+        Inspect the overall time window encoded in the summary:
+
+        >>> summary.attrs["window_start"], summary.attrs["window_end"], summary.attrs["rows"]
         """
+
+
         assert self.out_dir, "Call set_model(idf, epw, out_dir) first."
         sql_path = os.path.join(self.out_dir, "eplusout.sql")
         if not os.path.exists(sql_path):
@@ -3828,148 +4186,6 @@ class EPlusUtil:
             return out_path, summary_df
         finally:
             conn.close()
-
-    # ----------------------- statistical analysis --------------------------------
-
-    def plot_sql_cov_heatmap(
-        self,
-        control_sels: list[dict],
-        output_sels: list[dict],
-        *,
-        reporting_freq: tuple[str, ...] | None = ("TimeStep", "Hourly"),
-        include_design_days: bool = False,
-        start=None,
-        end=None,
-        resample: str | None = "1h",
-        reduce: str = "mean",
-        meters_to_kwh: bool = True,
-        stat: str = "cov",               # 'cov' or 'corr'
-        min_periods: int = 8,
-        title: str | None = None,
-        show: bool = True,
-    ):
-        import pandas as pd
-        import numpy as np
-        import plotly.express as px
-
-        if not control_sels or not output_sels:
-            raise ValueError("Provide at least one control selection and one output selection.")
-
-        def _series_from_selection(sel: dict, *, _include_dd: bool):
-            # pull via existing plot_sql_series (no SQL duplication)
-            def _pull(_include_dd_flag: bool):
-                return self.plot_sql_series(
-                    selections=[sel],
-                    reporting_freq=reporting_freq,
-                    include_design_days=_include_dd_flag,
-                    start=start,
-                    end=end,
-                    resample=resample,
-                    meters_to_kwh=meters_to_kwh,
-                    aggregate_vars="mean",
-                    title=None,
-                    show=False,
-                )
-            try:
-                fig = _pull(_include_dd)
-                if not fig.data:
-                    raise ValueError("no-data")
-            except Exception as e:
-                # auto-retry including sizing periods if first pass yielded nothing
-                if (not _include_dd) and ("No rows matched" in str(e) or "include_design_days=True" in str(e)):
-                    fig = _pull(True)
-                    if not fig.data:
-                        raise
-                else:
-                    raise
-
-            cols = []
-            for tr in fig.data:
-                nm = tr.name or sel.get("label") or sel.get("name")
-                s = pd.Series(tr.y, index=pd.to_datetime(tr.x), name=str(nm))
-                cols.append(s)
-            dfw = pd.concat(cols, axis=1).sort_index()
-
-            if dfw.shape[1] == 1 or reduce == "first":
-                series = dfw.iloc[:, 0]
-            elif reduce == "sum":
-                series = dfw.sum(axis=1, min_count=1)
-            else:
-                series = dfw.mean(axis=1)
-
-            return series.dropna().rename(str(sel.get("label") or sel.get("name") or "series"))
-
-        # build labeled series
-        controls, outputs, used = [], [], set()
-        def _unique(lab: str):
-            base = str(lab)
-            if base not in used:
-                used.add(base); return base
-            i = 2
-            while f"{base} #{i}" in used:
-                i += 1
-            used.add(f"{base} #{i}")
-            return f"{base} #{i}"
-
-        for cs in control_sels:
-            s = _series_from_selection(cs, _include_dd=include_design_days)
-            s.name = _unique(s.name); controls.append(s)
-        for osel in output_sels:
-            s = _series_from_selection(osel, _include_dd=include_design_days)
-            s.name = _unique(s.name); outputs.append(s)
-
-        # assemble matrix input
-        df_all = pd.concat(controls + outputs, axis=1).sort_index()
-        # (optional speed-up) downcast
-        try: df_all = df_all.astype("float32", copy=False)
-        except Exception: pass
-
-        if stat.lower() == "corr":
-            mat = df_all.corr(min_periods=min_periods); zlabel = "Correlation"
-        else:
-            mat = df_all.cov(min_periods=min_periods);   zlabel = "Covariance"
-
-        if mat.empty:
-            raise ValueError("Could not compute matrix (no overlapping data).")
-
-        out_names = [s.name for s in outputs]
-        ctl_names = [s.name for s in controls]
-        sub = mat.loc[out_names, ctl_names]
-        if sub.isna().all().all():
-            raise ValueError("All entries are NaN. Not enough overlapping data across pairs.")
-
-        vals = sub.values.astype(float)
-        finite = np.isfinite(vals)
-        vmax = float(np.nanmax(np.abs(vals[finite]))) if finite.any() else 1.0
-
-        # Use range_color to zero-center; fallback to go.Heatmap if this PX version lacks range_color
-        try:
-            fig = px.imshow(
-                vals,
-                x=ctl_names,
-                y=out_names,
-                origin="lower",
-                aspect="auto",
-                color_continuous_scale="RdBu_r",
-                range_color=(-vmax, vmax),
-                labels=dict(x="Controls", y="Outputs", color=zlabel),
-                title=title or f"{zlabel} heatmap: outputs vs controls",
-            )
-        except TypeError:
-            import plotly.graph_objects as go
-            fig = go.Figure(data=go.Heatmap(
-                z=vals, x=ctl_names, y=out_names,
-                colorscale="RdBu", zmin=-vmax, zmax=vmax,
-                colorbar=dict(title=zlabel),
-            ))
-            fig.update_layout(
-                title=title or f"{zlabel} heatmap: outputs vs controls",
-                xaxis_title="Controls", yaxis_title="Outputs",
-            )
-
-        if show:
-            fig.show()
-        return fig
 
     # ------------------ HVAC kill switch -----------------
 
