@@ -180,20 +180,22 @@ Here is the leanest sequence to run a model, ensure SQL outputs (optional), and 
 
 What’s required vs optional
 ### Required
-	•	set_model(...) — define idf, epw, out_dir.
-	•	register_begin_iteration([...]) — attach your runtime callbacks (e.g., probe_zone_air_and_supply_with_kf).
-	•	run_design_day() or run_annual() — actually run the sim.
+*	set_model(...) — define idf, epw, out_dir.
+*	register_begin_iteration([...]) — attach your runtime callbacks (e.g., probe_zone_air_and_supply_with_kf).
+*	run_design_day() or run_annual() — actually run the sim.
 ### Optional / situational
-	•	ensure_output_variables([...]) / ensure_output_meters([...]) — only if you want those series saved to eplusout.sql.
-	•	ensure_output_sqlite() — only if you need SQL outputs for analysis/plots.
-	•	delete_out_dir() — only if you want a fully clean folder (runs already clear stale SQL/ERR/AUDIT files).
-	•	enable_runtime_logging() — helpful for debugging; not required.
-	•	Manual new_state() — not needed; EPlusUtil manages the state internally.
+*	ensure_output_variables([...]) / ensure_output_meters([...]) — only if you want those series saved to eplusout.sql.
+*	ensure_output_sqlite() — only if you need SQL outputs for analysis/plots.
+*	delete_out_dir() — only if you want a fully clean folder (runs already clear stale SQL/ERR/AUDIT files).
+*	enable_runtime_logging() — helpful for debugging; not required.
+*	Manual new_state() — not needed; EPlusUtil manages the state internally.
 
 ### Minimal example (EKF callback + optional SQL outputs)
 
+```python
 idf = f"{EPLUS}/ExampleFiles/5ZoneAirCooled.idf"
 epw = f"{EPLUS}/WeatherData/USA_CA_San.Francisco.Intl.AP.724940_TMY3.epw"
+
 
 util = EPlusUtil(verbose=1, out_dir=out_dir)
 util.set_model(
@@ -201,8 +203,10 @@ util.set_model(
     outdoor_co2_ppm=400.0,          # optional (CO₂ helper)
     per_person_m3ps_per_W=3.82e-8   # optional (CO₂ helper)
 )
+```
 
 ### (Optional) ensure SQL time series exist for post-run analysis
+```python
 specs = [
     {"name": "Zone Mean Air Temperature",            "key": "*",           "freq": "TimeStep"},
     {"name": "Zone Mean Air Humidity Ratio",         "key": "*",           "freq": "TimeStep"},
@@ -259,13 +263,14 @@ util.register_begin_iteration([
 
 ### Run the simulation (design-day or annual)
 rc = util.run_annual()
+```
 
 ### Why callbacks at runtime?
-	•	register_begin_iteration([...]) lets you inject logic while EnergyPlus is running:
-	•	Live probing of zone/supply conditions (T, w, CO₂, flows, etc.).
-	•	On-the-fly Kalman filtering / EKF to estimate hidden states and persist them
+* register_begin_iteration([...]) lets you inject logic while EnergyPlus is running:
+* Live probing of zone/supply conditions (T, w, CO₂, flows, etc.).
+* On-the-fly Kalman filtering / EKF to estimate hidden states and persist them
 (batched writes to a dedicated SQLite like eplusout_kf_test.sqlite).
-	•	Control/actuation logic (e.g., schedules, People actuators) if you add such callbacks.
+* Control/actuation logic (e.g., schedules, People actuators) if you add such callbacks.
 
 The EKF runs without needing eplusout.sql. SQL is only required if you want to do post-run analysis, plots, or discovery using the included helpers.
 
