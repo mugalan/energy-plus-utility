@@ -1341,12 +1341,102 @@ class EPlusUtil:
         save_csv=True
     ) -> list[dict]:
         """
-        Preferred order:
-        1) Parse existing dictionary files in self.out_dir (fast, comprehensive).
-        2) If absent, generate dictionaries in a temp dir and parse them.
-        3) If that fails, fall back to live API catalog (vars only).
+        Discover reportable **variables** and/or **meters** for the active model using a
+        robust, fallback-heavy strategy that avoids fragile dependencies on any single
+        artifact.
 
-        `kinds`: 'var' | 'meter' | ('var','meter')
+        Discovery order
+        ---------------
+        1) **Existing dictionary files in `out_dir`** (fast; comprehensive):
+        - Parses `eplusout.rdd` for variables and (when present) meters,
+        - Parses `eplusout.mdd` for meters.
+        Returns rows with `source` set to `"rdd"` / `"mdd"`.
+        2) **Generate dictionaries in a temporary directory** (no writes to `out_dir`):
+        - If not already present, patches a temporary IDF with:
+            `Output:VariableDictionary, IDF;`
+        - Runs EnergyPlus once (design-day not required here) to emit RDD/MDD,
+            then parses those.
+        3) **Live API catalog fallback (variables only)**:
+        - Runs a tiny **design-day** in a temp dir, then queries the runtime API
+            catalog after warmup.
+        - Can optionally auto-discover per-zone keys and environment keys and
+            (optionally) verify handles.
+        - Meters are **not** available from this path.
+
+        Parameters
+        ----------
+        kinds : Sequence[str], default ("var", "meter")
+            What to return: `"var"`, `"meter"`, or both. The alias `"both"` is also
+            accepted. Order is ignored.
+        discover_zone_keys : bool, default True
+            (API fallback only) Expand zone-like variables by enumerating **Zone**
+            object keys when possible.
+        discover_environment_keys : bool, default True
+            (API fallback only) Add environment-keyed variables (e.g., *Site…* with
+            key `"Environment"`).
+        verify_handles : bool, default True
+            (API fallback only) Attempt to resolve a `handle` for each (name, key)
+            via `get_variable_handle`; unresolved items may be dropped.
+            Dictionary-derived rows have `handle=-1`.
+        save_csv : bool, default True
+            Write a CSV summary to `out_dir` when rows are found:
+            - `"variables_only.csv"`   if only variables,
+            - `"meters_only.csv"`      if only meters,
+            - `"dictionary_combined.csv"` if RDD/MDD were used,
+            - `"variables_with_desc.csv"` if API fallback was used.
+
+        Returns
+        -------
+        list[dict]
+            Each record contains:
+            `{"kind": "var"|"meter", "name": str, "key": str, "units": str,
+            "desc": str, "handle": int, "source": "rdd"|"mdd"|"api"}`
+
+            Notes:
+            - The legacy `'freq'` field (when present in some sources) is **removed**.
+            - Dictionary-derived rows usually have `handle=-1`.
+
+        Raises
+        ------
+        AssertionError
+            If `set_model(idf, epw, out_dir)` has not been called.
+        (Otherwise, errors during probing are caught; when all fallbacks fail,
+        the function returns an empty list after logging a warning.)
+
+        Notes
+        -----
+        - The dictionary probe is preferred because it lists **all** variables/meters
+        that would be reportable from the current IDF, regardless of whether they
+        appear in Output objects yet.
+        - The API fallback only includes variables that the runtime catalog exposes;
+        it cannot list meters, and availability may differ by EnergyPlus version.
+        - Temporary runs use a **fresh state** and a temp directory; they do not touch
+        `out_dir` or the active state.
+
+        Examples
+        --------
+        Get everything from whatever source is available (and save CSV):
+
+        >>> rows = util.list_variables_safely()
+        >>> rows[0]
+        {'kind': 'var', 'name': 'Zone Air Temperature', 'key': 'SPACE1-1',
+        'units': 'C', 'desc': 'Average', 'handle': -1, 'source': 'rdd'}
+
+        Variables only, forcing API behavior (if no RDD/MDD exist), and ensuring
+        zone/environment expansions with handle verification:
+
+        >>> rows = util.list_variables_safely(
+        ...     kinds=('var',),
+        ...     discover_zone_keys=True,
+        ...     discover_environment_keys=True,
+        ...     verify_handles=True
+        ... )
+
+        Meters only (requires RDD/MDD path to succeed):
+
+        >>> meters = util.list_variables_safely(kinds=('meter',))
+        >>> [m['name'] for m in meters[:5]]
+        ['Electricity:Facility', 'Cooling:Electricity', 'Heating:Electricity', ...]
         """
         import tempfile, re, os, shutil, subprocess, pathlib
 
@@ -1634,7 +1724,65 @@ class EPlusUtil:
 
     def list_actuators_safely(self, *, verify_handles=True) -> List[Dict]:
         """
-        Back-compat wrapper. Uses the richer API-only controllables enumerator.
+        Enumerate controllable **actuators** for the active model using a safe,
+        API-only workflow (no dependency on `eplusout.edd`). This is a thin,
+        backward-compatible wrapper around `_list_controllables_api_only(...)`.
+
+        What it does
+        ------------
+        - Runs a tiny **design-day** in a temporary directory to query the runtime
+        actuator catalog and live object names.
+        - Expands wildcard/blank **People** actuators (e.g., `"Number of People"`)
+        into concrete `People` object keys.
+        - Includes **Schedule Value** actuators for common schedule types
+        (`Schedule:Compact`, `Schedule:Constant`, `Schedule:File`, `Schedule:Year`).
+        - (Optional) **verifies** handles in a fresh state so returned items are
+        actually controllable for this IDF/EPW.
+        - Writes a CSV summary to `<out_dir>/controllables_api_only.csv`.
+
+        Parameters
+        ----------
+        verify_handles : bool, default True
+            Resolve a `handle` for each `(component_type, control_type, actuator_key)`
+            via `get_actuator_handle`. When `True`, rows without a valid handle are
+            filtered out. (Note: these handles are resolved in a **temporary state**
+            and are **not reusable** across runs.)
+
+        Returns
+        -------
+        List[Dict]
+            Each record has:
+            `{"component_type": str,
+            "control_type": str,
+            "actuator_key": str,
+            "units": str,
+            "handle": int,        # -1 if not verified or unavailable
+            "source": str}`       # e.g., "api", "api-expanded", "api-schedule"
+
+        Requirements
+        ------------
+        Call `set_model(idf, epw, out_dir)` first; this method asserts that `idf`,
+        `epw`, and `out_dir` are configured.
+
+        Notes
+        -----
+        - This approach does **not** require `eplusout.edd` and is resilient across
+        EnergyPlus versions.
+        - CSV output is only written when at least one actuator is discovered.
+
+        Examples
+        --------
+        Discover and verify all controllables; save CSV:
+
+        >>> acts = util.list_actuators_safely()
+        >>> acts[0]
+        {'component_type': 'People', 'control_type': 'Number of People',
+        'actuator_key': 'OPEN OFFICE PEOPLE', 'units': '', 'handle': 12345,
+        'source': 'api-expanded'}
+
+        Skip handle verification (keep all catalog entries):
+
+        >>> acts = util.list_actuators_safely(verify_handles=False)
         """
         return self._list_controllables_api_only(
             verify_handles=verify_handles,
@@ -1825,15 +1973,7 @@ class EPlusUtil:
 
         return records
 
-    # ---------- occupancy (CSV → People actuators) ----------
-
-    def _occ_canonical_zone(self, name, zones):
-        """Case-insensitive match a CSV header to actual Zone object name."""
-        target = (name or "").strip()
-        if not target:
-            return None
-        zl = {z.lower(): z for z in zones}
-        return zl.get(target.lower(), None)
+    # ---------- occupancy (People actuators) ----------
 
     def _occ_default_map_zone_to_people(self, s, zones_subset=None, *, verbose=True) -> dict[str, list[str]]:
         """
@@ -1867,100 +2007,6 @@ class EPlusUtil:
         ts = max(1, self.api.exchange.zone_time_step_number(s))
         minute = int(round((ts - 1) * 60 / N))
         return pd.Timestamp(year=2002, month=m, day=d, hour=h, minute=minute)
-
-    def enable_csv_occupancy(
-        self,
-        csv_path: str,
-        *,
-        time_col: str | None = None,
-        fill: str = "ffill",
-        zone_to_people: dict[str, list[str]] | None = None,
-        verbose: bool = True
-    ):
-        assert self.out_dir, "Call set_model(idf, epw, out_dir) first."
-        if not os.path.exists(csv_path):
-            raise FileNotFoundError(csv_path)
-
-        # read & normalize headers
-        raw = pd.read_csv(csv_path)
-        raw.columns = [str(c).strip().lstrip("\ufeff") for c in raw.columns]
-        if "Unnamed: 0" in raw.columns:
-            raw = raw.drop(columns=["Unnamed: 0"])
-
-        # detect/parse time column → normalized 'timestamp'
-        cand = time_col or next((c for c in raw.columns if c.lower().startswith("time")), None)
-        if not cand or cand not in raw.columns:
-            raise ValueError("CSV must include a time column like 'timestamp' or 'time_step'.")
-
-        s = raw[cand].astype(str)
-        has_year = s.str.contains(r"\b\d{4}\b", regex=True).any()
-        if has_year:
-            dt = pd.to_datetime(s, errors="coerce")
-        else:
-            dt = pd.to_datetime("2002 " + s, errors="coerce")
-            if dt.isna().all():
-                dt = pd.to_datetime("2002/" + s, errors="coerce")
-        if dt.isna().all():
-            raise ValueError("Could not parse time column; use ISO or 'MM/DD HH:MM:SS'.")
-
-        df = raw.copy()
-        df["timestamp"] = dt
-        df = df.dropna(subset=["timestamp"])
-        if cand.strip().lower() != "timestamp":
-            df = df.drop(columns=[cand], errors="ignore")
-        df = df.set_index("timestamp")
-
-        # zone headers → match against model zones (robust: SQL→API→IDF)
-        zones = self.list_zone_names(preferred_sources=("sql","api","idf"))
-        z_lut = {z.lower(): z for z in zones}
-        keep = []
-        for col in df.columns:
-            actual = z_lut.get(str(col).strip().lower())
-            if actual:
-                if col != actual:
-                    df = df.rename(columns={col: actual})
-                keep.append(actual)
-            elif verbose:
-                self._log(1, f"[OCC] WARNING: '{col}' did not match any Zone; dropping.")
-        df = df[keep]
-        if df.empty:
-            raise ValueError("None of the CSV columns matched Zone names in the model.")
-
-        # validate fill policy and remember it
-        fill = (fill or "ffill").strip().lower()
-        if fill not in ("ffill", "interpolate"):
-            raise ValueError("fill must be 'ffill' or 'interpolate'")
-        self._occ_fill = fill
-
-        # integer counts + fill policy (preprocess base df)
-        df = df.apply(pd.to_numeric, errors="coerce").fillna(0).round().astype("int64")
-        if self._occ_fill == "interpolate":
-            df = df.sort_index().interpolate(method="time").ffill().fillna(0).astype("int64")
-        else:
-            df = df.sort_index().ffill().fillna(0).astype("int64")
-
-        # defer mapping; allow empty mapping here
-        self._occ_df = df
-        self._occ_enabled = True
-        self._occ_verbose = verbose
-        self._zone_to_people = dict(zone_to_people or {})
-        self._people_handles = {}
-        self._occ_ready = False
-        self._register_callbacks()  # unified registrar
-        if verbose:
-            cols = list(self._occ_df.columns)
-            self._log(1, f"[OCC] Enabled CSV occupancy from {csv_path}")
-            self._log(1, f"[OCC] Zones in CSV: {cols[:6]}{'...' if len(cols)>6 else ''}")
-
-    def disable_csv_occupancy(self):
-        """Disable CSV-driven occupancy (does not unregister callbacks already set on the current state)."""
-        self._occ_init_state()
-        self._occ_enabled = False
-        self._occ_df = None
-        self._zone_to_people = {}
-        self._people_handles = {}
-        if self._occ_verbose:
-            self._log(1, "[OCC] Disabled CSV occupancy.")
 
     def _occ_cb_tick(self, s):
         # only if feature enabled and data present
@@ -2022,73 +2068,60 @@ class EPlusUtil:
             for h in handles:
                 self.api.exchange.set_actuator_value(s, h, per)
 
-    # helper for disable_csv_occupancy symmetry
-    def _occ_init_state(self):
-        self._people_handles = {}
-        self._occ_ready = False
-
-    def generate_random_occupancy_csv(
-        self,
-        *,
-        start: str,
-        end: str,
-        freq: str = "15min",
-        mean: float = 2.0,
-        sigma: float = 0.8,
-        zone_means: dict[str, float] | None = None,
-        min_count: int = 0,
-        max_count: int | None = None,
-        zones: list[str] | None = None,
-        seed: int | None = 42,
-        filename: str = "occ_schedule.csv"
-    ) -> str:
-        """
-        Create a random occupancy schedule CSV with columns = zones and index timestamps.
-        Values are integer headcounts per zone per step. Uses a clipped normal by default.
-        Returns the CSV path.
-        """
-        assert self.out_dir, "Call set_model(idf, epw, out_dir) first."
-        rng = np.random.default_rng(seed)
-
-        # decide zones
-        all_zones = self.list_zone_names(preferred_sources=("sql","api","idf"))
-        use_zones = [z for z in (zones or all_zones) if z in all_zones]
-        if not use_zones:
-            raise ValueError("No zones available to generate occupancy for.")
-
-        # timeline
-        idx = pd.date_range(start=pd.to_datetime(start), end=pd.to_datetime(end), freq=freq, inclusive="both")
-        if len(idx) == 0:
-            raise ValueError("Empty date_range — check start/end/freq")
-        dt_minutes = pd.tseries.frequencies.to_offset(freq).n
-        steps_per_hour = max(1, int(round(60 / dt_minutes))) if dt_minutes else 1
-
-        # per-zone draws
-        data = {}
-        for z in use_zones:
-            mu = (zone_means or {}).get(z, mean)
-            arr = rng.normal(loc=mu, scale=sigma, size=len(idx))
-            arr = np.clip(arr, a_min=min_count, a_max=(max_count if max_count is not None else None))
-            data[z] = np.rint(arr).astype(int)
-        df = pd.DataFrame(data, index=idx)
-        df.index.name = "timestamp"
-
-        # write CSV
-        out_path = os.path.join(self.out_dir, filename)
-        df.to_csv(out_path)
-
-        # quick stats
-        means = {z: float(df[z].mean()) for z in use_zones}
-        hours_per_step = dt_minutes / 60.0
-        p_hours = {z: int(df[z].sum() * hours_per_step) for z in use_zones}
-        self._log(1, f"[occ→csv] Wrote {out_path}  shape={df.shape}  freq={freq}  steps/hour={steps_per_hour}")
-        self._log(1, f"  mean persons by zone: {means}")
-        self._log(1, f"  person-hours by zone: {p_hours}")
-        return out_path
-
     # ---------- run methods (single, non-duplicated) ----------
 
     def run_annual(self) -> int:
+        """
+        Run a full **annual** EnergyPlus simulation with the currently configured
+        `idf`, `epw`, and `out_dir`.
+
+        What this method does
+        ---------------------
+        1) Verifies that `set_model(idf, epw, out_dir)` has been called and that
+        `out_dir` is writable.
+        2) Proactively removes common stale outputs
+        (`eplusout.sql`, `eplusout.err`, `eplusout.audit`) to avoid locked/dirty
+        files causing SQLite/open errors.
+        3) Resets the EnergyPlus API **state** (clean run).
+        4) Re-registers any queued callbacks (e.g., those added via
+        `register_begin_iteration(...)`, `register_after_hvac_reporting(...)`,
+        `enable_runtime_logging()`, or CSV occupancy handlers).
+        5) Executes EnergyPlus with arguments:
+        `['-w', self.epw, '-d', self.out_dir, self.idf]`.
+
+        Returns
+        -------
+        int
+            EnergyPlus process exit code (0 indicates success).
+
+        Raises
+        ------
+        AssertionError
+            If `idf`, `epw`, or `out_dir` is not set (call `set_model(...)` first).
+
+        Side effects
+        ------------
+        - Writes standard EnergyPlus outputs into `out_dir` (e.g., `eplusout.err`,
+        `eplusout.eso`, `eplusout.mtr`, etc.).
+        - If your active IDF includes `Output:SQLite`, also writes `eplusout.sql`.
+
+        Tips
+        ----
+        - If you need the SQLite database, ensure your active IDF includes
+        `Output:SQLite` or call `ensure_output_sqlite(activate=True)` before running.
+        - For a quick probe that only runs sizing/design days, use `run_design_day()`.
+
+        Examples
+        --------
+        Basic annual run:
+        >>> util.set_model("models/bldg.idf", "weather/site.epw", out_dir="runs/annual")
+        >>> code = util.run_annual()
+        >>> assert code == 0
+
+        Ensure SQL is produced, then run:
+        >>> util.ensure_output_sqlite()  # appends Output:SQLite and activates patched IDF
+        >>> util.run_annual()
+        """
         assert self.idf and self.epw and self.out_dir, "Call set_model(idf, epw, out_dir) first."
         self._assert_out_dir_writable()
         # prevent SQLite open errors from a stale file
