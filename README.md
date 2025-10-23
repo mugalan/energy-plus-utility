@@ -173,6 +173,102 @@ util.register_begin_iteration([
 util.run_design_day()
 ```
 
+
+## 🔁 Minimal run sequence (with runtime callbacks & EKF)
+
+Here is the leanest sequence to run a model, ensure SQL outputs (optional), and register a runtime callback that executes an Extended Kalman Filter (EKF) during the simulation.
+
+What’s required vs optional
+### Required
+	•	set_model(...) — define idf, epw, out_dir.
+	•	register_begin_iteration([...]) — attach your runtime callbacks (e.g., probe_zone_air_and_supply_with_kf).
+	•	run_design_day() or run_annual() — actually run the sim.
+### Optional / situational
+	•	ensure_output_variables([...]) / ensure_output_meters([...]) — only if you want those series saved to eplusout.sql.
+	•	ensure_output_sqlite() — only if you need SQL outputs for analysis/plots.
+	•	delete_out_dir() — only if you want a fully clean folder (runs already clear stale SQL/ERR/AUDIT files).
+	•	enable_runtime_logging() — helpful for debugging; not required.
+	•	Manual new_state() — not needed; EPlusUtil manages the state internally.
+
+### Minimal example (EKF callback + optional SQL outputs)
+
+idf = f"{EPLUS}/ExampleFiles/5ZoneAirCooled.idf"
+epw = f"{EPLUS}/WeatherData/USA_CA_San.Francisco.Intl.AP.724940_TMY3.epw"
+
+util = EPlusUtil(verbose=1, out_dir=out_dir)
+util.set_model(
+    idf, epw,
+    outdoor_co2_ppm=400.0,          # optional (CO₂ helper)
+    per_person_m3ps_per_W=3.82e-8   # optional (CO₂ helper)
+)
+
+### (Optional) ensure SQL time series exist for post-run analysis
+specs = [
+    {"name": "Zone Mean Air Temperature",            "key": "*",           "freq": "TimeStep"},
+    {"name": "Zone Mean Air Humidity Ratio",         "key": "*",           "freq": "TimeStep"},
+    {"name": "Zone Air CO2 Concentration",           "key": "*",           "freq": "TimeStep"},
+    {"name": "Site Outdoor Air Drybulb Temperature", "key": "Environment", "freq": "TimeStep"},
+    {"name": "Site Outdoor Air Humidity Ratio",      "key": "Environment", "freq": "TimeStep"},
+    {"name": "Site Outdoor Air Barometric Pressure", "key": "Environment", "freq": "TimeStep"},
+    {"name": "System Node Temperature",              "key": "*",           "freq": "TimeStep"},
+    {"name": "System Node Mass Flow Rate",           "key": "*",           "freq": "TimeStep"},
+    {"name": "System Node Humidity Ratio",           "key": "*",           "freq": "TimeStep"},
+]
+util.ensure_output_variables(specs)
+
+output_meters = [
+    "InteriorLights:Electricity:Zone:SPACE5-1",
+    "Cooling:EnergyTransfer:Zone:SPACE1-1",
+    "Cooling:EnergyTransfer",
+    "Electricity:Facility",
+    "ElectricityPurchased:Facility",
+    "ElectricitySurplusSold:Facility",
+]
+util.ensure_output_meters(output_meters, freq="TimeStep")
+util.ensure_output_sqlite()  # produce eplusout.sql
+
+### ✅ The important part: register a runtime callback that runs every iteration
+util.register_begin_iteration([
+    {"method_name": "probe_zone_air_and_supply_with_kf",
+     "key_wargs": {
+         "log_every_minutes": 15,   # prints every N minutes of model time
+         "precision": 3,
+
+         # --- EKF persistence to SQLite (separate from eplusout.sql) ---
+         "kf_db_filename": "eplusout_kf_test.sqlite",
+         "kf_batch_size": 50,
+         "kf_commit_every_batches": 10,
+         "kf_checkpoint_every_commits": 5,
+         "kf_journal_mode": "WAL",
+         "kf_synchronous": "NORMAL",
+
+         # --- 10-state EKF init: (αo, αs, αe, βo, βs, βe, γe, Tz, wz, cz)
+         "kf_init_mu":        [0.1, 0.1, 0.0,  0.1, 0.1, 0.0,  0.0,  20.0, 0.008, 400.0],
+         "kf_init_cov_diag":  [1.0, 1.0, 1.0,  1.0, 1.0, 1.0,  1.0,  25.0, 1e-3,  1e3  ],
+         "kf_sigma_P_diag":   [1e-6,1e-6,1e-6, 1e-6,1e-6,1e-6, 1e-6, 1e-5, 1e-6,  1e-4],
+
+         # Optional: pretty column names for state persistence (dynamic schema)
+         "kf_state_col_names": [
+             "alpha_o","alpha_s","alpha_e","beta_o","beta_s","beta_e","gamma_e","Tz","wz","cz"
+         ],
+
+         # Use the 10-state preparer (pluggable)
+         "kf_prepare_fn": util._kf_prepare_inputs_zone_energy_model
+     }}
+], run_during_warmup=False)
+
+### Run the simulation (design-day or annual)
+rc = util.run_annual()
+
+### Why callbacks at runtime?
+	•	register_begin_iteration([...]) lets you inject logic while EnergyPlus is running:
+	•	Live probing of zone/supply conditions (T, w, CO₂, flows, etc.).
+	•	On-the-fly Kalman filtering / EKF to estimate hidden states and persist them
+(batched writes to a dedicated SQLite like eplusout_kf_test.sqlite).
+	•	Control/actuation logic (e.g., schedules, People actuators) if you add such callbacks.
+
+The EKF runs without needing eplusout.sql. SQL is only required if you want to do post-run analysis, plots, or discovery using the included helpers.
+
 ---
 
 ## 🔁 Runtime callbacks & event model (register at runtime)
