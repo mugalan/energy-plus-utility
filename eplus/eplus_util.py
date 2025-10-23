@@ -2094,6 +2094,68 @@ class EPlusUtil:
                 self.reset_state()
         return str(out_path)
 
+    def ensure_output_meters(self, names: list[str], *, freq: str = "TimeStep",
+                            activate: bool = True, reset: bool = True) -> str:
+        """
+        Ensure specific meters are reported (to SQL) via Output:Meter objects.
+
+        names: e.g., ["Electricity:Facility", "ElectricityPurchased:Facility"]
+        freq:  "TimeStep" or "Hourly"
+        """
+        assert self.idf and self.out_dir, "Call set_model(idf, epw, out_dir) first."
+        src = pathlib.Path(self.idf)
+        text = src.read_text(errors="ignore")
+
+        existing = self._scan_output_meters(text)
+        blocks = []
+        for nm in names:
+            pair = (nm.strip(), freq.strip())
+            if pair in existing:
+                continue
+            block = f"""Output:Meter,
+            {nm},                       !- Meter Name
+            {freq};                     !- Reporting Frequency
+            """
+            blocks.append(block)
+
+        if not blocks:
+            return str(src)
+
+        out_path = pathlib.Path(self.out_dir) / f"{src.stem}__meters.idf"
+        out_path.write_text(text.rstrip() + "\n\n" + "\n\n".join(b.rstrip() for b in blocks) + "\n")
+        if activate:
+            if not getattr(self, "_orig_idf_path", None):
+                self._orig_idf_path = self.idf
+            self.idf = str(out_path)
+            if reset:
+                self.reset_state()
+        return str(out_path)
+
+    def inspect_sql_meter(self, name: str, *, include_design_days: bool = False):
+        """Return available frequencies/units/counts for a given meter name in SQL."""
+        assert self.out_dir, "Call set_model(...) first."
+        sql_path = os.path.join(self.out_dir, "eplusout.sql")
+        if not os.path.exists(sql_path):
+            raise FileNotFoundError(f"{sql_path} not found.")
+        conn = sqlite3.connect(sql_path)
+        try:
+            env_clause = "" if include_design_days else \
+                "AND (ep.EnvironmentName IS NULL OR ep.EnvironmentName NOT LIKE 'SizingPeriod:%')"
+            q = f"""
+            SELECT d.Name, d.ReportingFrequency, COALESCE(d.Units,'') AS Units, COUNT(*) AS n_rows
+            FROM ReportData r
+            JOIN ReportDataDictionary d ON r.ReportDataDictionaryIndex = d.ReportDataDictionaryIndex
+            JOIN Time t ON r.TimeIndex = t.TimeIndex
+            LEFT JOIN EnvironmentPeriods ep ON t.EnvironmentPeriodIndex = ep.EnvironmentPeriodIndex
+            WHERE d.IsMeter = 1 AND d.Name = ?
+                {env_clause}
+            GROUP BY d.Name, d.ReportingFrequency, d.Units
+            ORDER BY n_rows DESC
+            """
+            return pd.read_sql_query(q, conn, params=[name])
+        finally:
+            conn.close()
+
     def get_sql_series_dataframe(
         self,
         selections: list[dict],
@@ -2340,11 +2402,6 @@ class EPlusUtil:
             fig.show()
         return fig
 
-    def plot_sql_meters(self, meter_names: list[str], **kwargs):
-        """Convenience wrapper to plot one or more meters from SQL."""
-        sels = [{"kind":"meter", "name": m} for m in meter_names]
-        return self.plot_sql_series(sels, **kwargs)
-
     def list_sql_zone_variables(
         self,
         *,
@@ -2445,181 +2502,11 @@ class EPlusUtil:
             show=show
         )
 
-    def ensure_output_meters(self, names: list[str], *, freq: str = "TimeStep",
-                            activate: bool = True, reset: bool = True) -> str:
-        """
-        Ensure specific meters are reported (to SQL) via Output:Meter objects.
+    def plot_sql_meters(self, meter_names: list[str], **kwargs):
+        """Convenience wrapper to plot one or more meters from SQL."""
+        sels = [{"kind":"meter", "name": m} for m in meter_names]
+        return self.plot_sql_series(sels, **kwargs)
 
-        names: e.g., ["Electricity:Facility", "ElectricityPurchased:Facility"]
-        freq:  "TimeStep" or "Hourly"
-        """
-        assert self.idf and self.out_dir, "Call set_model(idf, epw, out_dir) first."
-        src = pathlib.Path(self.idf)
-        text = src.read_text(errors="ignore")
-
-        existing = self._scan_output_meters(text)
-        blocks = []
-        for nm in names:
-            pair = (nm.strip(), freq.strip())
-            if pair in existing:
-                continue
-            block = f"""Output:Meter,
-            {nm},                       !- Meter Name
-            {freq};                     !- Reporting Frequency
-            """
-            blocks.append(block)
-
-        if not blocks:
-            return str(src)
-
-        out_path = pathlib.Path(self.out_dir) / f"{src.stem}__meters.idf"
-        out_path.write_text(text.rstrip() + "\n\n" + "\n\n".join(b.rstrip() for b in blocks) + "\n")
-        if activate:
-            if not getattr(self, "_orig_idf_path", None):
-                self._orig_idf_path = self.idf
-            self.idf = str(out_path)
-            if reset:
-                self.reset_state()
-        return str(out_path)
-
-    def inspect_sql_meter(self, name: str, *, include_design_days: bool = False):
-        """Return available frequencies/units/counts for a given meter name in SQL."""
-        assert self.out_dir, "Call set_model(...) first."
-        sql_path = os.path.join(self.out_dir, "eplusout.sql")
-        if not os.path.exists(sql_path):
-            raise FileNotFoundError(f"{sql_path} not found.")
-        conn = sqlite3.connect(sql_path)
-        try:
-            env_clause = "" if include_design_days else \
-                "AND (ep.EnvironmentName IS NULL OR ep.EnvironmentName NOT LIKE 'SizingPeriod:%')"
-            q = f"""
-            SELECT d.Name, d.ReportingFrequency, COALESCE(d.Units,'') AS Units, COUNT(*) AS n_rows
-            FROM ReportData r
-            JOIN ReportDataDictionary d ON r.ReportDataDictionaryIndex = d.ReportDataDictionaryIndex
-            JOIN Time t ON r.TimeIndex = t.TimeIndex
-            LEFT JOIN EnvironmentPeriods ep ON t.EnvironmentPeriodIndex = ep.EnvironmentPeriodIndex
-            WHERE d.IsMeter = 1 AND d.Name = ?
-                {env_clause}
-            GROUP BY d.Name, d.ReportingFrequency, d.Units
-            ORDER BY n_rows DESC
-            """
-            return pd.read_sql_query(q, conn, params=[name])
-        finally:
-            conn.close()
-
-    def plot_sql_net_purchased_electricity(self, *, reporting_freq=("TimeStep","Hourly"),
-                                        include_design_days=False, resample="1H",
-                                        title="Net Purchased Electricity (kWh)", show=True):
-        """
-        Plot Net Purchased = ElectricityPurchased:Facility − ElectricitySurplusSold:Facility.
-        Robust to freq naming ("Zone Timestep", "Detailed"), and meter name variants.
-        Falls back to Electricity:Facility when purchased/sold are absent.
-        """
-        assert self.out_dir, "Call set_model(...) first."
-        sql_path = os.path.join(self.out_dir, "eplusout.sql")
-        if not os.path.exists(sql_path):
-            raise FileNotFoundError(f"{sql_path} not found. Ensure Output:SQLite and re-run.")
-
-        conn = sqlite3.connect(sql_path)
-        try:
-            minute_col = self._sql_minute_col(conn)
-            env_clause = "" if include_design_days else \
-                "AND (ep.EnvironmentName IS NULL OR ep.EnvironmentName NOT LIKE 'SizingPeriod:%')"
-            fclause, fparams = self._sql_freq_clause(reporting_freq)
-
-            # discover candidates by name pattern
-            def _list_meters_like(substrs):
-                likes = " OR ".join(["UPPER(d.Name) LIKE ?"] * len(substrs))
-                params = [f"%{s.upper()}%" for s in substrs] + fparams
-                q = f"""
-                SELECT DISTINCT d.Name
-                FROM ReportData r
-                JOIN ReportDataDictionary d ON r.ReportDataDictionaryIndex = d.ReportDataDictionaryIndex
-                JOIN Time t ON r.TimeIndex = t.TimeIndex
-                LEFT JOIN EnvironmentPeriods ep ON t.EnvironmentPeriodIndex = ep.EnvironmentPeriodIndex
-                WHERE d.IsMeter = 1
-                    AND ({likes})
-                    {fclause}
-                    {env_clause}
-                """
-                return [r[0] for r in conn.execute(q, params).fetchall()]
-
-            purchased_cands = _list_meters_like(["Purchased"])
-            sold_cands      = _list_meters_like(["Surplus", "Sold", "Export"])
-            facility_cands  = _list_meters_like(["Electricity:Facility"])
-
-            def _prefer(cands, preferred):
-                for p in preferred:
-                    if p in cands: return p
-                return cands[0] if cands else None
-
-            m_buy  = _prefer(purchased_cands, ["ElectricityPurchased:Facility"])
-            m_sell = _prefer(sold_cands,      ["ElectricitySurplusSold:Facility"])
-            m_fac  = _prefer(facility_cands,  ["Electricity:Facility"])
-
-            # fetch a single meter series -> DataFrame with timestamp/value
-            def _grab_exact(name):
-                if not name: return pd.DataFrame(columns=["timestamp","value"])
-                params = [name, *fparams]
-                q = f"""
-                SELECT t.Year y, t.Month m, t.Day d, t.Hour h, t.{minute_col} mi, r.Value val
-                FROM ReportData r
-                JOIN ReportDataDictionary d ON r.ReportDataDictionaryIndex = d.ReportDataDictionaryIndex
-                JOIN Time t ON r.TimeIndex = t.TimeIndex
-                LEFT JOIN EnvironmentPeriods ep ON t.EnvironmentPeriodIndex = ep.EnvironmentPeriodIndex
-                WHERE d.IsMeter = 1 AND d.Name = ?
-                    {fclause}
-                    {env_clause}
-                """
-                rows = conn.execute(q, params).fetchall()
-                df = pd.DataFrame(rows, columns=["y","m","d","h","min","value"])
-                if df.empty: return df
-                y = df["y"].replace(0, 2002)
-                df["timestamp"] = pd.to_datetime(
-                    dict(year=y, month=df["m"], day=df["d"], hour=(df["h"] - 1).clip(lower=0), minute=df["min"]),
-                    errors="coerce"
-                )
-                return df.dropna(subset=["timestamp"])[["timestamp","value"]]
-
-            df_buy  = _grab_exact(m_buy)
-            df_sell = _grab_exact(m_sell)
-
-            # choose source for "net"
-            if not df_buy.empty or not df_sell.empty:
-                s_buy  = df_buy.set_index("timestamp")["value"]  if not df_buy.empty  else pd.Series(dtype=float)
-                s_sell = df_sell.set_index("timestamp")["value"] if not df_sell.empty else pd.Series(dtype=float)
-                s_net  = s_buy.sub(s_sell, fill_value=0.0)   # J
-                source_label = (m_buy or "0") + (f" − {m_sell}" if m_sell else "")
-            elif m_fac:
-                # fallback: use Electricity:Facility as proxy (warn via title suffix)
-                df_fac = _grab_exact(m_fac)
-                if df_fac.empty:
-                    raise ValueError("No rows for purchased/sold or facility meters. Add Output:Meter and re-run.")
-                s_net = df_fac.set_index("timestamp")["value"]
-                source_label = f"{m_fac} (proxy for net purchased)"
-            else:
-                # last resort: hint what exists
-                avail = _list_meters_like(["Electricity"])
-                raise ValueError(
-                    "Could not find purchased/sold meters, nor Electricity:Facility.\n"
-                    f"Available electricity-like meters include: {avail[:10]}"
-                )
-
-            # convert to kWh and resample (sum)
-            s = s_net / 3.6e6
-            if resample:
-                s = s.resample(resample).sum()
-
-            s = s.rename("value")
-            df_plot = s.reset_index()
-            fig = px.line(df_plot, x="timestamp", y="value",
-                        title=title + f" — {source_label}")
-            fig.update_traces(name="Net Purchased [kWh]", showlegend=True)
-            fig.update_layout(xaxis_title="Time", yaxis_title="kWh")
-            if show: fig.show()
-            return fig
-        finally:
-            conn.close()
 
     # --------------- weather data ---------
 
@@ -3659,7 +3546,7 @@ class EPlusUtil:
             except Exception: pass
             shown += 1   
 
-    # KF
+    # KF Implementation
 
     def _kf_random_walk_update(
         self,
@@ -3771,7 +3658,6 @@ class EPlusUtil:
 
         return mu_k.reshape(-1), S_k, yhat_k.reshape(-1), K
 
-
     def _ekf_update(
         self,
         x_prev, P_prev,         # (n,), (n,n)
@@ -3829,30 +3715,6 @@ class EPlusUtil:
         yhat_post = H @ x_post
 
         return x_post.reshape(-1), P_post, yhat_post.reshape(-1), K
-
-
-    def _kf_prepare_inputs_random_walk(self, *, zone, meas, mu_prev, P_prev, Sigma_P, Sigma_R):
-        """
-        Map the random-walk linear model into EKF inputs so the driver can always call _ekf_update.
-        Expects: meas = {"phi": (m,n), "y": (m,)}.
-        """
-        import numpy as np
-
-        phi = np.asarray(meas["phi"], dtype=float)      # H_k
-        y   = np.asarray(meas["y"],   dtype=float).reshape(-1)
-        n   = int(np.asarray(mu_prev).reshape(-1).size)
-
-        F   = np.eye(n)                                 # random-walk: x_k = I x_{k-1} + w
-        f_x = np.asarray(mu_prev, dtype=float).reshape(-1)  # f(x) = x
-        Q   = np.asarray(Sigma_P, dtype=float)
-        R   = np.asarray(Sigma_R, dtype=float)
-
-        return dict(
-            x_prev=np.asarray(mu_prev, dtype=float).reshape(-1),
-            P_prev=np.asarray(P_prev,  dtype=float),
-            f_x=f_x, F=F, H=phi, Q=Q, R=R, y=y
-        )
-
 
     def probe_zone_air_and_supply_with_kf(self, s, **opts):
         """
@@ -3915,7 +3777,7 @@ class EPlusUtil:
         Sigma_R = _np.diag(Sigma_R_diag)  # 3x3 by construction
 
         # ---- pick preparer (pluggable) ----
-        kf_prepare_fn = opts.get("kf_prepare_fn") or self._kf_prepare_inputs_zone_energy_balance
+        kf_prepare_fn = opts.get("kf_prepare_fn") or self._kf_prepare_inputs_zone_energy_model
 
         def _call_preparer(fn, **kw):
             """Call `fn` correctly whether it is bound (method) or free function."""
@@ -3926,7 +3788,7 @@ class EPlusUtil:
             return fn(**kw) if is_bound else fn(self, **kw)
 
         if not callable(kf_prepare_fn):
-            kf_prepare_fn = getattr(self, "_kf_prepare_inputs_zone_energy_balance")
+            kf_prepare_fn = getattr(self, "_kf_prepare_inputs_zone_energy_model")
 
         # ---- one-time initialization (state, handles, SQL) ----
         if d.get("_kf_state_id") != id(self.state):
@@ -4267,7 +4129,7 @@ class EPlusUtil:
 
         return payload
 
-    def _kf_prepare_inputs_zone_energy_balance(
+    def _kf_prepare_inputs_zone_energy_model(
         self, *,
         zone,
         meas,          # dict with: y=[Tz, wz, cz], dt, To, wo, co, Tsa, wsa, csa, msa
