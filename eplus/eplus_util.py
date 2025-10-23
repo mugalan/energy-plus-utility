@@ -97,6 +97,13 @@ class EPlusUtil:
                 except PermissionError: pass  # leave it if OS blocks; at least we tried
 
     def delete_out_dir(self):
+        """
+        Delete the output directory (`self.out_dir`) and all of its contents, if it exists.
+
+        The directory is removed recursively via `shutil.rmtree(..., ignore_errors=True)`.
+        Missing directories or removal errors are silently ignored. This only affects the
+        on-disk folder; the `self.out_dir` attribute is not modified.
+        """        
         import shutil, os
         if self.out_dir and os.path.exists(self.out_dir):
             shutil.rmtree(self.out_dir, ignore_errors=True)
@@ -152,15 +159,75 @@ class EPlusUtil:
                                 enable: bool = True,
                                 run_during_warmup: bool | None = None):
         """
-        Register begin-iteration handlers.
+        Register handlers to run at the **beginning of each EnergyPlus system timestep**
+        (the “before predictor” phase). Handlers are methods on this class and are
+        invoked as **bound** callables with the signature:
+        `handler(self, state, **kwargs)`.
 
-        Accepts EITHER:
-        • Sequence[str]: ["occupancy_handler", "tick_hvac_kill"]
-        • Sequence[dict]: [{"method_name": "...", "key_wargs": {...}}]
-            (also accepts keys "kwargs", "key_kwargs", or "params" for the dict)
+        Accepted `methods` formats (order matters):
+        • `Sequence[str]` — method names on this instance, e.g.
+            `["occupancy_handler", "co2_set_outdoor_ppm"]`
+        • `Sequence[dict]` — objects with a method name and optional kwargs, e.g.
+            `[{"method_name": "occupancy_handler", "kwargs": {"lam": 25}},
+            {"name": "co2_set_outdoor_ppm", "params": {"value_ppm": 450}}]`
 
-        Each method will be called as: method(self, state, **kwargs)
+        For convenience, the kwargs key may also be given as `"key_wargs"` (typo accepted)
+        or `"key_kwargs"`; all are treated identically to `"kwargs"`/`"params"`.
+
+        Behavior & ordering rules
+        -------------------------
+        - If `clear=True`, any previously registered handlers are removed before adding new ones.
+        - Handlers are **de-duplicated by method name**; when a name appears multiple times,
+        the **last occurrence wins** (its kwargs are kept).
+        - The resulting order preserves any existing kept handlers, then appends new names
+        in the order provided.
+        - If `enable` is `False`, the registry is kept but **dispatch is disabled** until
+        re-enabled (see `enable_begin_iteration()` / `disable_begin_iteration()`).
+        - By default, handlers **do not run during warmup**. Set `run_during_warmup=True`
+        to allow warmup execution, or `False` to force skip. `None` leaves the current
+        registry setting unchanged.
+
+        Side effects
+        ------------
+        Ensures the underlying EnergyPlus callback
+        (`callback_begin_system_timestep_before_predictor`) is registered on the current
+        state so handlers will be dispatched on the next run.
+
+        Returns
+        -------
+        list[str]
+            The **ordered list of registered method names** after this call.
+
+        Raises
+        ------
+        TypeError
+            If a method spec is not `str` or `dict`, or if provided kwargs are not a `dict`.
+        ValueError
+            If a dict spec is missing a method name or it is empty after stripping.
+        AttributeError
+            If a named method does not exist on this instance or is not callable.
+
+        Examples
+        --------
+        Basic registration with defaults:
+
+        >>> util.register_begin_iteration([
+        ...     "occupancy_handler",
+        ...     {"method_name": "co2_set_outdoor_ppm", "kwargs": {"value_ppm": 450.0, "log_every_minutes": None}},
+        ... ])
+
+        Replace any existing handlers and **do not** run during warmup:
+
+        >>> util.register_begin_iteration(
+        ...     [{"name": "occupancy_handler", "params": {"lam": 30, "min": 10, "max": 40}}],
+        ...     clear=True, run_during_warmup=False
+        ... )
+
+        Keep the current set but temporarily disable dispatch:
+
+        >>> util.register_begin_iteration([], enable=False)   # methods unchanged; dispatcher paused
         """
+
         self._init_begin_tick_registry()
         if clear:
             self._begin_tick_names = []
@@ -242,7 +309,7 @@ class EPlusUtil:
     def disable_begin_iteration(self): self._init_begin_tick_registry(); self._begin_tick_enabled = False
 
     def list_begin_iteration(self) -> list[dict]:
-        """Return the ordered list of registered handlers with kwargs."""
+        """Return the ordered list of registered handlers at begin iterationwith kwargs."""
         self._init_begin_tick_registry()
         out = []
         for nm, (fn, kw) in zip(self._begin_tick_names, self._begin_tick_specs):
@@ -295,15 +362,77 @@ class EPlusUtil:
                                     enable: bool = True,
                                     run_during_warmup: bool | None = None) -> list[str]:
         """
-        Register handlers to run AFTER HVAC reporting (system timestep).
+        Register handlers to run **after HVAC reporting** at each system timestep
+        (i.e., right after node data are finalized). Handlers must be methods on
+        this class and are invoked as **bound** callables with the signature:
+        `handler(self, state, **kwargs)`.
 
-        Accepts EITHER:
-        • Sequence[str]: ["probe_zone_air_and_supply", "my_logger"]
-        • Sequence[dict]: [{"method_name": "...", "key_wargs": {...}}]
-            (also accepts keys "kwargs", "key_kwargs", or "params" for the dict)
+        Accepted `methods` formats (order matters):
+        • `Sequence[str]` — method names on this instance, e.g.
+            `["probe_zone_air_and_supply", "my_logger"]`
+        • `Sequence[dict]` — objects with a method name and optional kwargs, e.g.
+            `[{"method_name": "probe_zone_air_and_supply", "kwargs": {"log_every_minutes": 5}},
+            {"name": "my_logger", "params": {"level": "debug"}}]`
 
-        Each method is invoked as: method(self, state, **kwargs)
+        Notes on kwargs keys:
+        You may use `"kwargs"`, `"params"`, `"key_kwargs"`, or even the tolerated typo
+        `"key_wargs"`—they are all treated equivalently.
+
+        Behavior & ordering rules
+        -------------------------
+        - If `clear=True`, previously registered handlers are removed before adding new ones.
+        - Handlers are **de-duplicated by method name**; the **last occurrence wins** (its
+        kwargs override prior ones).
+        - Final order preserves surviving existing handlers, then appends any new names in
+        the order provided.
+        - If `enable` is `False`, the registry is kept but **dispatch is disabled** until
+        re-enabled (see `enable_after_hvac_reporting()` / `disable_after_hvac_reporting()`).
+        - Warmup behavior: by default, handlers **do not run during warmup**. Pass
+        `run_during_warmup=True` to enable, `False` to force-disable, or `None` to leave
+        the existing setting unchanged.
+
+        Side effects
+        ------------
+        Ensures the underlying EnergyPlus callback
+        (`callback_end_system_timestep_after_hvac_reporting`) is registered on the current
+        state so handlers will be dispatched on the next run.
+
+        Returns
+        -------
+        list[str]
+            The **ordered list of registered method names** after this call.
+
+        Raises
+        ------
+        TypeError
+            If a method spec is not `str` or `dict`, or if provided kwargs are not a `dict`.
+        ValueError
+            If a dict spec lacks a method name or it is empty after stripping.
+        AttributeError
+            If a named method does not exist on this instance or is not callable.
+
+        Examples
+        --------
+        Register a probe and a logger with custom parameters:
+
+        >>> util.register_after_hvac_reporting([
+        ...     {"method_name": "probe_zone_air_and_supply", "kwargs": {"log_every_minutes": 1, "precision": 2}},
+        ...     {"name": "my_logger", "params": {"tag": "after-hvac"}}
+        ... ])
+
+        Replace any existing handlers and keep them from running during warmup:
+
+        >>> util.register_after_hvac_reporting(
+        ...     ["probe_zone_air_and_supply"],
+        ...     clear=True, run_during_warmup=False
+        ... )
+
+        Keep the current set but pause dispatch:
+
+        >>> util.register_after_hvac_reporting([], enable=False)  # handlers unchanged; dispatcher paused
         """
+
+
         self._init_after_hvac_registry()
         if clear:
             self._after_hvac_names = []
@@ -471,6 +600,69 @@ class EPlusUtil:
             self.api.runtime.callback_message(self.state, self._runtime_log_func)
 
     def set_model(self, idf: str, epw: str, out_dir: Optional[str] = None, *, reset: bool = True, add_co2: bool = True, outdoor_co2_ppm: float = 420.0,per_person_m3ps_per_W: float = 3.82e-8) -> None:
+        """
+        Configure the active EnergyPlus model paths and (optionally) inject a minimal
+        CO₂ setup, ready for subsequent runs.
+
+        This sets `self.idf`, `self.epw`, and `self.out_dir` (creating the output
+        directory if needed). If `reset=True`, the EnergyPlus state is reset so that
+        subsequent runs start clean.
+
+        If `add_co2=True`, this calls `prepare_run_with_co2(...)` to:
+        - enable zone CO₂ accounting via `ZoneAirContaminantBalance`,
+        - create/bind an **outdoor CO₂ schedule** seeded to `outdoor_co2_ppm`,
+        - patch each `People` object with a **CO₂ generation rate coefficient**
+            (`per_person_m3ps_per_W`, in m³·s⁻¹ per W per person),
+        - write a patched IDF in `out_dir` and switch `self.idf` to that file.
+        (That helper also resets state by default, so the model will be ready to run
+        with the CO₂ features active.)
+
+        Parameters
+        ----------
+        idf : str
+            Path to the IDF model to load.
+        epw : str
+            Path to the EPW weather file to use.
+        out_dir : Optional[str], default None
+            Directory for EnergyPlus outputs; created if missing. Defaults to
+            ``"eplus_out"`` when not provided.
+        reset : bool, default True
+            If True, reset the EnergyPlus API state immediately after setting paths.
+        add_co2 : bool, default True
+            If True, inject the minimal CO₂ workflow via `prepare_run_with_co2(...)`
+            and switch `self.idf` to the patched file.
+        outdoor_co2_ppm : float, default 420.0
+            Initial value for the outdoor CO₂ schedule (ppm) when `add_co2=True`.
+        per_person_m3ps_per_W : float, default 3.82e-8
+            People CO₂ generation coefficient (m³/s per W per person). EnergyPlus’s
+            default is 3.82e-8; values are clamped to the model’s allowed range
+            inside the helper.
+
+        Notes
+        -----
+        - This method **does not run** a simulation; it only configures paths/state.
+        - When `add_co2=True`, `self._orig_idf_path` is remembered and `self.idf`
+        points to the newly written CO₂-patched IDF in `out_dir`.
+
+        Returns
+        -------
+        None
+
+        Examples
+        --------
+        Basic setup with CO₂ enabled (default):
+        >>> util.set_model("models/small_office.idf", "weather/USA_CA_San-Francisco.epw",
+        ...                out_dir="runs/run1")
+
+        Custom outdoor CO₂ and generation rate:
+        >>> util.set_model("bldg.idf", "site.epw", out_dir="out",
+        ...                add_co2=True, outdoor_co2_ppm=450.0,
+        ...                per_person_m3ps_per_W=3.5e-8)
+
+        Skip CO₂ patching entirely:
+        >>> util.set_model("bldg.idf", "site.epw", out_dir="out", add_co2=False)
+        """
+
         self.idf = str(idf)
         self.epw = str(epw)
         self.out_dir = str(out_dir or "eplus_out")
@@ -489,12 +681,72 @@ class EPlusUtil:
         csv_path: str | None = None,
     ) -> list[str]:
         """
-        Return the list of Zone object names. Tries sources in order:
-        - 'sql': eplusout.sql -> Zones table
-        - 'api': tiny design-day run (to a temp dir), grab names after inputs parsed
-        - 'idf': regex-parse the IDF for Zone blocks
+        Return the list of **Zone** object names for the current model, probing one or
+        more sources **in order** until names are found.
 
-        If save_csv=True, writes a single-column CSV 'zones.csv' (or csv_path) in out_dir.
+        Probe order & methods
+        ---------------------
+        - **"sql"**: Read `eplusout.sql` → `Zones` table (fastest; requires a prior run
+        with `Output:SQLite` enabled). Falls back to a DISTINCT query if `ZoneIndex`
+        isn’t present.
+        - **"api"**: Perform a tiny **design-day** run in a temporary directory and query
+        object names **after inputs are parsed** (uses a throwaway state; does not
+        affect the main state or output folder).
+        - **"idf"**: Regex-parse the active IDF for `Zone, ...;` blocks and take the first
+        field as the zone name (comments removed first).
+
+        The first source in `preferred_sources` that yields any names is used; later
+        sources are skipped.
+
+        Parameters
+        ----------
+        preferred_sources : Sequence[str], default ("sql", "api", "idf")
+            Ordered list of sources to try. Any subset/ordering is allowed, e.g.
+            `("idf",)` to avoid running EnergyPlus.
+        save_csv : bool, default False
+            If `True`, write a one-column CSV (`zone_name`) with the discovered names.
+        csv_path : str | None, default None
+            Path for the CSV when `save_csv=True`. Defaults to `<out_dir>/zones.csv`.
+
+        Returns
+        -------
+        list[str]
+            Ordered, de-duplicated list of zone names (whitespace-trimmed; empty/blank
+            names filtered).
+
+        Raises
+        ------
+        AssertionError
+            If `set_model(idf, epw, out_dir)` has not been called (requires `self.idf`
+            and `self.out_dir`; the `"api"` path also requires `self.epw` to be set).
+
+        Notes
+        -----
+        - The `"sql"` path is fastest when `eplusout.sql` already exists; otherwise the
+        function transparently falls through to the next source.
+        - The `"api"` probe runs EnergyPlus with `--design-day` in a temp dir using a
+        **new state**, then immediately stops after inputs are parsed.
+        - The `"idf"` parser is intentionally simple but robust enough for typical IDFs.
+
+        Examples
+        --------
+        Basic usage (prefer SQL, then API, then IDF):
+
+        >>> zones = util.list_zone_names()
+        >>> zones[:3]
+        ['CORE_ZN', 'PERIMETER_ZN_1', 'PERIMETER_ZN_2']
+
+        Avoid any runs; parse only the IDF:
+
+        >>> zones = util.list_zone_names(preferred_sources=("idf",))
+
+        Try API first, then IDF; also save a CSV:
+
+        >>> zones = util.list_zone_names(
+        ...     preferred_sources=("api", "idf"),
+        ...     save_csv=True,
+        ...     csv_path="runs/zones.csv"
+        ... )
         """
         assert self.idf and self.out_dir, "Call set_model(idf, epw, out_dir) first."
         names: list[str] = []
