@@ -338,7 +338,7 @@ class EPlusUtil:
             self._extra_callbacks = []  # used by your class to rebind on reset
 
     # Common aliases → api.runtime.callback_* names
-    _CALLBACK_ALIASES = {
+    self.CALLBACK_ALIASES = {
         "begin": "callback_begin_system_timestep_before_predictor",
         "before_hvac": "callback_after_predictor_before_hvac_managers",
         "inside_iter": "callback_inside_system_iteration_loop",
@@ -351,7 +351,7 @@ class EPlusUtil:
     def _resolve_runtime_register(self, hook) -> tuple[str, callable]:
         """
         Accepts:
-        - a string alias from _CALLBACK_ALIASES
+        - a string alias from CALLBACK_ALIASES
         - a full api.runtime attribute name (string)
         - a direct callable (api.runtime.callback_*)
         Returns (hook_key, runtime_register_callable).
@@ -364,7 +364,7 @@ class EPlusUtil:
         if not isinstance(hook, str):
             raise TypeError(f"hook must be a string alias/name or a callable; got {type(hook)}")
 
-        attr = _CALLBACK_ALIASES.get(hook, hook)  # allow direct attr names too
+        attr = self.CALLBACK_ALIASES.get(hook, hook)  # allow direct attr names too
         fn = getattr(rt, attr, None)
         if not callable(fn):
             raise AttributeError(f"EnergyPlus runtime has no callable '{attr}'")
