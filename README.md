@@ -1,27 +1,49 @@
 # energy-plus-utility
 
-Utilities and helpers for running EnergyPlus from Python notebooks (Colab-friendly) via pyenergyplus.
-Includes a silent Colab bootstrapper that installs system libraries, fetches EnergyPlus 25.1, and wires env/paths so pyenergyplus imports cleanly.
+Utilities and helpers for running [EnergyPlus](https://energyplus.net/) from Python notebooks (Colab-friendly) via `pyenergyplus`.
+Includes a **silent Colab bootstrapper** that installs system libraries, fetches EnergyPlus 25.1, and wires env/paths so `pyenergyplus` imports cleanly.
 
-✨ Features
-	•	One-line Colab bootstrap: prepares apt packages, installs libssl1.1, downloads EnergyPlus 25.1, sets ENERGYPLUSDIR and LD_LIBRARY_PATH, and updates sys.path (no prints).
-	•	A high-level EPlusUtil class with:
-	•	A runtime callback registry (no subclassing needed): register/enable/disable/clear handlers at any time prior to a run for:
-	•	Begin of iteration (zone/system timestep) hooks
-	•	After HVAC reporting hooks
-	•	Built-in callbacks:
-	•	probe_zone_air_and_supply (fast per-zone snapshot of air state + supply aggregates)
-	•	probe_zone_air_and_supply_with_kf (persistent Kalman/EKF, pluggable model, fast SQL logging)
-	•	CO₂ helpers, CSV-driven occupancy, HVAC “kill switch,” and more
-	•	Safely list variables/meters/actuators (no fragile dependencies on RDD/MDD/EDD, with smart fallbacks)
-	•	Ensure/patch Output:SQLite, Output:Variable, Output:Meter
-	•	Query/plot series directly from eplusout.sql (variables & meters, resampling, unit conversion)
-	•	Weather extraction to CSV, covariance/correlation heatmaps, etc.
+---
 
-⸻
+## Table of Contents
 
-# 🧩 Package layout
+1. [Features](#-features)
+2. [Package Layout](#-package-layout)
+3. [Supported](#-supported)
+4. [Quick Start (Colab)](#-quick-start-colab)
+5. [Local (non-Colab) Setup](#-local-non-colab-setup)
+6. [Quick Usage](#-quick-usage)
+7. [Runtime Callbacks & Event Model](#-runtime-callbacks--event-model-register-at-runtime)
+8. [Kalman/EKF: Persistent Per-Zone Estimation](#-kalmaneqkf-persistent-per-zone-estimation-pluggable)
+9. [API Highlights](#-api-highlights-eplusutil)
+10. [Troubleshooting](#-troubleshooting)
+11. [SQL Explorer](#-sql-explorer-inspect--extract-from-eplusoutsql)
+12. [License](#-license)
+13. [Acknowledgements](#-acknowledgements)
 
+---
+
+## ✨ Features
+
+* One-line **Colab bootstrap**: prepares apt packages, installs `libssl1.1`, downloads EnergyPlus 25.1, sets `ENERGYPLUSDIR` and `LD_LIBRARY_PATH`, and updates `sys.path` (no prints).
+* A high-level `EPlusUtil` class with:
+  * A **runtime callback registry** (no subclassing needed): register/enable/disable/clear handlers **at any time prior to a run** for:
+    * **Begin of iteration (zone/system timestep)** hooks
+    * **After HVAC reporting** hooks
+  * Built-in callbacks:
+    * `probe_zone_air_and_supply` (fast per-zone snapshot of air state + supply aggregates)
+    * `probe_zone_air_and_supply_with_kf` (**persistent Kalman/EKF**, pluggable model, fast SQL logging)
+    * CO₂ helpers, CSV-driven occupancy, HVAC “kill switch,” and more
+  * Safely **list variables/meters/actuators** (no fragile dependencies on RDD/MDD/EDD, with smart fallbacks)
+  * Ensure/patch **Output:SQLite**, **Output:Variable**, **Output:Meter**
+  * Query/plot series directly from **`eplusout.sql`** (variables & meters, resampling, unit conversion)
+  * Weather extraction to CSV, covariance/correlation heatmaps, etc.
+
+---
+
+## 🧩 Package layout
+
+```
 energy-plus-utility/
 ├─ pyproject.toml
 ├─ README.md  ← you’re reading this
@@ -29,23 +51,25 @@ energy-plus-utility/
    ├─ __init__.py            # exposes prepare_colab_eplus (lazy loads EPlusUtil)
    ├─ colab_bootstrap.py     # silent Colab runtime prep
    └─ eplus_util.py          # the EPlusUtil class
+```
 
+---
 
-⸻
+## 🐍 Supported
 
-🐍 Supported
-	•	Python 3.9–3.12
-	•	Ubuntu 20.04/22.04 (Google Colab default is fine)
-	•	EnergyPlus 25.1.0 (downloaded by the bootstrap)
+* Python 3.9–3.12
+* Ubuntu 20.04/22.04 (Google Colab default is fine)
+* EnergyPlus **25.1.0** (downloaded by the bootstrap)
 
-⸻
+---
 
-# 🚀 Quick start (Colab)
+## 🚀 Quick start (Colab)
 
-Replace dev with a tag when you cut one.
+> Replace `dev` with a tag when you cut one.
 
-## Option A — Python API (silent bootstrap)
+### Option A — Python API (silent bootstrap)
 
+```python
 %pip install -q "energy-plus-utility @ git+https://github.com/mugalan/energy-plus-utility.git@dev"
 
 from eplus.colab_bootstrap import prepare_colab_eplus
@@ -53,132 +77,175 @@ prepare_colab_eplus()  # runs apt, libssl1.1, downloads E+, sets env/paths (no p
 
 from eplus.eplus_util import EPlusUtil
 util = EPlusUtil(verbose=1)
+```
 
-## Option B — CLI helper (same bootstrap)
+### Option B — CLI helper (same bootstrap)
 
+```python
 %pip install -q "energy-plus-utility @ git+https://github.com/mugalan/energy-plus-utility.git@dev"
 !eplus-prepare-colab    # add --verbose to see logs
 
 from eplus.eplus_util import EPlusUtil
 util = EPlusUtil(verbose=1)
+```
 
-Important: We lazy-load EPlusUtil. Always run prepare_colab_eplus() before importing EPlusUtil (if importing from eplus.__init__). Importing from eplus.eplus_util after bootstrap is always safe.
+> **Important:** We lazy-load `EPlusUtil`. Always run `prepare_colab_eplus()` **before** importing `EPlusUtil` (if importing from `eplus.__init__`). Importing from `eplus.eplus_util` after bootstrap is always safe.
 
-⸻
+---
 
-# 🔧 Local (non-Colab) setup
+## 🔧 Local (non-Colab) setup
 
 If you already have EnergyPlus installed locally:
 
+```bash
 export ENERGYPLUSDIR="/path/to/EnergyPlus-25-1-0"
 export LD_LIBRARY_PATH="$ENERGYPLUSDIR:$LD_LIBRARY_PATH"
-**ensure EnergyPlus' Python site-packages (pyenergyplus) is importable**
+# ensure EnergyPlus' Python site-packages (pyenergyplus) is importable
+```
 
 Then:
 
+```bash
 pip install "energy-plus-utility @ git+https://github.com/mugalan/energy-plus-utility.git@dev"
+```
 
+---
 
-⸻
+## 🧪 Quick usage
 
-# 🧪 Quick usage
+### 1) Minimal run and SQL output
 
-1) Minimal run and SQL output
-
+```python
 from eplus.eplus_util import EPlusUtil
 
 util = EPlusUtil(verbose=1, out_dir="eplus_out")
 util.set_model(idf="/content/model.idf", epw="/content/weather.epw", out_dir="eplus_out")
 
-## Ensure SQL is enabled, then run a design-day
+# Ensure SQL is enabled, then run a design-day
 util.ensure_output_sqlite()
 util.run_design_day()
 
-## Plot a meter (auto-converts J → kWh)
+# Plot a meter (auto-converts J → kWh)
 util.plot_sql_meters(["Electricity:Facility"], reporting_freq=("TimeStep","Hourly"), resample="1H")
+```
 
-2) Add variables/meters programmatically
+### 2) Add variables/meters programmatically
 
-## Add Zone Air Temperature for all zones (hourly), and a meter
+```python
+# Add Zone Air Temperature for all zones (hourly), and a meter
 util.ensure_output_variables([
     {"name": "Zone Air Temperature", "key": "*", "freq": "Hourly"},
 ])
 util.ensure_output_meters(["Electricity:Facility"], freq="TimeStep")
 util.run_annual()
+```
 
-3) Explore what’s available
+### 3) Explore what’s available
 
+```python
 vars_and_meters = util.list_variables_safely()  # robust, with RDD/MDD/API fallbacks
 acts = util.list_actuators_safely()
 zones = util.list_zone_names(save_csv=True)     # writes zones.csv into out_dir
+```
 
-4) Weather to CSV
+### 4) Weather to CSV
 
+```python
 csv_path, summary = util.export_weather_sql_to_csv(resample="1H")
 csv_path
+```
 
+### 5) CSV-driven occupancy
 
-⸻
+```python
+# CSV must have a time column (e.g., 'timestamp') and zone-named columns
+util.enable_csv_occupancy("/content/occ_schedule.csv", fill="ffill")
+util.run_design_day()
+```
 
-# 🔁 Runtime callbacks & event model (register at runtime)
+### 6) CO₂ prep + outdoor setpoint actuation
 
-EnergyPlus exposes multiple hook points in the runtime API. EPlusUtil wraps these with registries that you can modify at runtime (in Python) without subclassing:
-	•	register_begin_iteration(methods, *, clear=False, enable=True, run_during_warmup=None)
-	•	Handlers run at the beginning of each iteration (zone/system timestep).
-	•	register_after_hvac_reporting(methods, *, clear=False, enable=True, run_during_warmup=None)
-	•	Handlers run after HVAC reporting at the system timestep.
+```python
+util.prepare_run_with_co2(outdoor_co2_ppm=420.0)
+util.register_begin_iteration([
+  {"method_name":"co2_set_outdoor_ppm", "kwargs":{"value_ppm": 450}}
+])
+util.run_design_day()
+```
 
-Both accept:
-	•	["handler_name", "another_handler"] or
-	•	[{"method_name": "handler_name", "kwargs": {...}}, ...]
-	•	Aliases accepted for kwargs: key_wargs (typo tolerated), kwargs, key_kwargs, params.
-	•	Handlers are called as: handler(self, state, **kwargs)
+---
 
-Key properties
-	•	Hot-swap friendly: You can call register_* multiple times between runs; set clear=True to replace, or re-register a name to update its kwargs (last wins).
-	•	Order preservation with de-dupe: Existing order is preserved; new names are appended. Re-registering a name updates its kwargs without duplicating it.
-	•	Warmup control: run_during_warmup lets you run handlers during sizing/warmup if you want (default is skipped during warmup).
-	•	Enable/disable: Toggle with enable=; you can list_* or unregister_* as needed.
+## 🔁 Runtime callbacks & event model (register at runtime)
 
-Examples
+EnergyPlus exposes multiple hook points in the runtime API. `EPlusUtil` wraps these with **registries** that you can **modify at runtime (in Python) without subclassing**:
 
-A) Minimal: log zone state each timestep
+- `register_begin_iteration(methods, *, clear=False, enable=True, run_during_warmup=None)`  
+  Handlers run at the **beginning of each iteration** (zone/system timestep).
 
+- `register_after_hvac_reporting(methods, *, clear=False, enable=True, run_during_warmup=None)`  
+  Handlers run **after HVAC reporting** at the system timestep.
+
+**Both accept:**
+
+- `["handler_name", "another_handler"]` or
+- `[{"method_name": "handler_name", "kwargs": {...}}, ...]`  
+  (Aliases accepted for kwargs: `key_wargs` (typo tolerated), `kwargs`, `key_kwargs`, `params`.)
+
+**Call signature:** `handler(self, state, **kwargs)`
+
+### Key properties
+
+- **Hot-swap friendly:** Call `register_*` multiple times between runs. Use `clear=True` to replace, or re-register a name to update its kwargs (last wins).
+- **Order preservation with de-dupe:** Existing order preserved; new names appended. Re-registering a name updates its kwargs without duplication.
+- **Warmup control:** `run_during_warmup` allows handlers to run during sizing/warmup (default: skipped during warmup).
+- **Enable/disable:** Toggle with `enable=`; you can also `list_*` or `unregister_*` as needed.
+
+### Examples
+
+#### A) Minimal: log zone state each timestep
+
+```python
 util.register_begin_iteration([
   {"method_name": "probe_zone_air_and_supply", "kwargs": {"log_every_minutes": 1}}
 ])
 util.run_design_day()
+```
 
-B) Add + remove at runtime (before next run)
+#### B) Add + update at runtime (before next run)
 
-## Add a logger and a CO2 outdoor setpoint actuator
+```python
+# Add a logger and a CO₂ outdoor setpoint actuator
 util.register_begin_iteration([
   "my_logger",
   {"method_name": "co2_set_outdoor_ppm", "kwargs": {"value_ppm": 450}},
 ])
 
-## Later, update CO2 setpoint without changing order (last wins for kwargs)
+# Update the CO₂ setpoint without changing order (last wins for kwargs)
 util.register_begin_iteration([
   {"method_name": "co2_set_outdoor_ppm", "kwargs": {"value_ppm": 500}},
 ])
 
-## Disable handlers for a run:
+# Disable handlers for a run:
 util.register_begin_iteration([], enable=False)
 util.run_design_day()
 
-## Re-enable + clear to start fresh:
+# Re-enable + clear to start fresh:
 util.register_begin_iteration([], clear=True, enable=True)
+```
 
-C) After-HVAC reporting hook (system-level post-processing)
+#### C) After-HVAC reporting hook (system-level post-processing)
 
+```python
 util.register_after_hvac_reporting([
   {"method_name": "probe_zone_air_and_supply", "kwargs": {"log_every_minutes": None}}
 ])
 util.run_annual()
+```
 
-D) CSV-driven occupancy + HVAC kill switch combo
+#### D) CSV-driven occupancy + HVAC kill switch combo
 
-## Prepare convenience states
+```python
+# Prepare convenience states
 util.enable_csv_occupancy("/content/occ_schedule.csv", fill="ffill")
 util.enable_hvac_off_via_schedules(["Always_On_Discrete"])
 
@@ -187,45 +254,50 @@ util.register_begin_iteration([
   "tick_hvac_kill"         # forces target availability schedules to zero
 ])
 util.run_design_day()
+```
 
-Tip: You can test your registry without running a full annual sim by using run_design_day() or even dry_run_min() (for dictionary generation). For performance, turn off frequent prints via log_every_minutes=None.
+> **Tip:** You can test your registry without running a full annual sim via `run_design_day()` or even `dry_run_min()` (for dictionary generation). For performance, set `log_every_minutes=None` to silence frequent prints.
 
-⸻
+---
 
-# 📈 Kalman/EKF: persistent per-zone estimation (pluggable)
+## 📈 Kalman/EKF: persistent per-zone estimation (pluggable)
 
-probe_zone_air_and_supply_with_kf layers a Kalman/Extended Kalman filter on top of the fast probe:
-	•	Inputs (measurement policy):
-	•	Outdoor & per-zone air (T, w, CO₂) with forward-fill.
-	•	Supply aggregates via inlet nodes: mass flow, T, w, CO₂.
-	•	Humidity ratio w falls back to: payload → Zone Mean Air Humidity Ratio → derived from (T, RH, P_site) using Tetens.
-	•	Pluggable model (“preparer”):
-	•	Provide kf_prepare_fn(self?, *, zone, meas, mu_prev, P_prev, Sigma_P, Sigma_R) -> dict
-	•	Return EKF inputs {x_prev, P_prev, f_x, F, H, Q, R, y}.
-	•	Default preparer (_kf_prepare_inputs_zone_energy_model) implements a practical random-walk style thermal/moisture/CO₂ model with regressors from outdoor/supply deltas.
-	•	Persistence to SQLite (fast, batched):
-	•	Default DB file: out_dir/eplusout.sql (coexists with EnergyPlus tables), or set kf_db_filename="kalman.sqlite"
-	•	Table (default KalmanEstimates): columns for measured y_*, predicted yhat_*, and state vector mu_* (auto-adds columns on first insert; can provide names)
+`probe_zone_air_and_supply_with_kf` layers a **Kalman/Extended Kalman filter** on top of the fast probe:
 
-One-liner example
+- **Inputs (measurement policy):**
+  - Outdoor & per-zone **air** (T, w, CO₂) with **forward-fill**.
+  - **Supply** aggregates via inlet nodes: mass flow, T, w, CO₂.
+  - Humidity ratio `w` falls back to: payload → Zone Mean Air Humidity Ratio → derived from `(T, RH, P_site)` using Tetens.
+- **Pluggable model (“preparer”):**
+  - Provide `kf_prepare_fn(self?, *, zone, meas, mu_prev, P_prev, Sigma_P, Sigma_R) -> dict`
+  - Return EKF inputs `{x_prev, P_prev, f_x, F, H, Q, R, y}`.
+  - Default preparer (`_kf_prepare_inputs_zone_energy_model`) implements a practical random-walk style thermal/moisture/CO₂ model with regressors from outdoor/supply deltas.
+- **Persistence to SQLite** (fast, batched):
+  - Default DB file: `out_dir/eplusout.sql` (coexists with EnergyPlus tables), or set `kf_db_filename="kalman.sqlite"`
+  - Table (default `KalmanEstimates`): columns for measured `y_*`, predicted `yhat_*`, and **state vector** `mu_*` (auto-adds columns on first insert; can provide names)
 
-## Register the EKF probe (suppress frequent console prints from the raw probe)
+### One-liner example
+
+```python
+# Register the EKF probe (suppress frequent console prints from the raw probe)
 util.register_begin_iteration([
   {"method_name": "probe_zone_air_and_supply_with_kf",
    "kwargs": {"log_every_minutes": None, "kf_log": True}}
 ])
 util.run_annual()
+```
 
 This will:
-	•	Run the fast probe each timestep,
-	•	Apply forward-fill/fallbacks for y = [T, w, CO₂],
-	•	Build a simple regressor matrix from supply/outdoor,
-	•	Call the preparer to assemble EKF inputs,
-	•	Run an EKF update,
-	•	Persist y, yhat, and mu to SQLite in batches.
+- Run the fast probe each timestep,
+- Apply forward-fill/fallbacks for y = [T, w, CO₂],
+- Build a simple regressor matrix from supply/outdoor,
+- Call the **preparer** to assemble EKF inputs,
+- Run an EKF update,
+- **Persist** `y`, `yhat`, and `mu` to SQLite in batches.
 
-Configure noise, priors, and zones
+### Configure noise, priors, and zones
 
+```python
 util.register_begin_iteration([
   {"method_name": "probe_zone_air_and_supply_with_kf",
    "kwargs": {
@@ -241,9 +313,11 @@ util.register_begin_iteration([
    }}
 ])
 util.run_design_day()
+```
 
-Bring your own model (custom preparer)
+### Bring your own model (custom preparer)
 
+```python
 def my_prepare(self, *, zone, meas, mu_prev, P_prev, Sigma_P, Sigma_R):
     import numpy as np
     # Observations: y = [T, w, CO2]
@@ -262,103 +336,124 @@ util.register_begin_iteration([
    "kwargs": {"kf_prepare_fn": my_prepare, "kf_log": True}}
 ])
 util.run_annual()
+```
 
-Read your estimates back
+### Read your estimates back
 
+```python
 import os, sqlite3, pandas as pd
 db = os.path.join(util.out_dir, "kalman.sqlite")  # or "eplusout.sql" if you used default
 conn = sqlite3.connect(db)
 df = pd.read_sql_query("SELECT * FROM ZoneEKF WHERE Zone='LIVING' ORDER BY Timestamp", conn)
 conn.close()
 df.head()
+```
 
-Performance & reliability knobs
-	•	Batching: kf_batch_size (default 50), kf_commit_every_batches (default 10)
-	•	SQLite pragmas: kf_journal_mode="WAL", kf_synchronous="NORMAL"
-	•	Checkpoints: kf_checkpoint_every_commits (default 5)
-	•	Graceful degrade: If SQLite errors occur, persistence disables itself (your simulation proceeds; probe payloads still available in memory).
+### Performance & reliability knobs
 
-⸻
+- **Batching:** `kf_batch_size` (default 50), `kf_commit_every_batches` (default 10)
+- **SQLite pragmas:** `kf_journal_mode="WAL"`, `kf_synchronous="NORMAL"`
+- **Checkpoints:** `kf_checkpoint_every_commits` (default 5)
+- **Graceful degrade:** On SQLite errors, persistence disables itself (simulation proceeds; probe payloads still available in memory).
 
-## 📚 API highlights (EPlusUtil)
-	•	Model/run
-set_model(...), run_design_day(), run_annual(), dry_run_min(...), set_simulation_params(...)
-	•	Callbacks (runtime registry)
-register_begin_iteration([...]), register_after_hvac_reporting([...]), plus list_* / unregister_*
-	•	Dictionary & discovery
-list_variables_safely(...), list_actuators_safely(...), list_zone_names(...)
-	•	Outputs / SQL
-ensure_output_sqlite(), ensure_output_variables([...]), ensure_output_meters([...]),
-get_sql_series_dataframe([...]), plot_sql_series([...]), plot_sql_meters([...]), plot_sql_zone_variable(...)
-	•	Weather & stats
-export_weather_sql_to_csv(...), plot_sql_cov_heatmap(control_sels, output_sels, ...)
-	•	Occupancy & HVAC
-enable_csv_occupancy(...), enable_hvac_off_via_schedules([...])
-	•	CO₂
-prepare_run_with_co2(...), co2_set_outdoor_ppm(...)
-	•	Probes & EKF
-probe_zone_air_and_supply(...), probe_zone_air_and_supply_with_kf(...)
+---
 
-⸻
+## 📚 API highlights (`EPlusUtil`)
 
-# 🛟 Troubleshooting
+* **Model/run**  
+  `set_model(...)`, `run_design_day()`, `run_annual()`, `dry_run_min(...)`, `set_simulation_params(...)`
 
-ModuleNotFoundError: No module named 'pyenergyplus'
-You imported EPlusUtil before the bootstrap (which adds EnergyPlus to sys.path). Run:
+* **Callbacks (runtime registry)**  
+  `register_begin_iteration([...])`, `register_after_hvac_reporting([...])`, plus `list_*` / `unregister_*`
 
+* **Dictionary & discovery**  
+  `list_variables_safely(...)`, `list_actuators_safely(...)`, `list_zone_names(...)`
+
+* **Outputs / SQL**  
+  `ensure_output_sqlite()`, `ensure_output_variables([...])`, `ensure_output_meters([...])`,  
+  `get_sql_series_dataframe([...])`, `plot_sql_series([...])`, `plot_sql_meters([...])`, `plot_sql_zone_variable(...)`
+
+* **Weather & stats**  
+  `export_weather_sql_to_csv(...)`, `plot_sql_cov_heatmap(control_sels, output_sels, ...)`
+
+* **Occupancy & HVAC**  
+  `enable_csv_occupancy(...)`, `enable_hvac_off_via_schedules([...])`
+
+* **CO₂**  
+  `prepare_run_with_co2(...)`, `co2_set_outdoor_ppm(...)`
+
+* **Probes & EKF**  
+  `probe_zone_air_and_supply(...)`, `probe_zone_air_and_supply_with_kf(...)`
+
+---
+
+## 🛟 Troubleshooting
+
+**`ModuleNotFoundError: No module named 'pyenergyplus'`**  
+You imported `EPlusUtil` **before** the bootstrap (which adds EnergyPlus to `sys.path`). Run:
+
+```python
 from eplus.colab_bootstrap import prepare_colab_eplus
 prepare_colab_eplus()
 from eplus.eplus_util import EPlusUtil
+```
 
-energyplus: error while loading shared libraries: libssl.so.1.1
-Use the bootstrap. If you bypassed it in Colab, install libssl1.1 manually.
+**`energyplus: error while loading shared libraries: libssl.so.1.1`**  
+Use the bootstrap. If you bypassed it in Colab, install `libssl1.1` manually.
 
-eplusout.sql not found
+**`eplusout.sql not found`**  
 Enable SQLite, then run a sim:
 
+```python
 util.ensure_output_sqlite()
 util.run_design_day()
+```
 
-Callbacks not firing?
-Make sure you register before the run, and that enable=True. If you want them to run during sizing/warmup, set run_during_warmup=True.
+**Callbacks not firing?**  
+Make sure you **register before the run**, and that `enable=True`. If you want them to run during sizing/warmup, set `run_during_warmup=True`.
 
-Write/permission errors in out_dir
-Use a writable path (e.g., out_dir="eplus_out"). The class tests writability and fails early.
+**Write/permission errors in `out_dir`**  
+Use a writable path (e.g., `out_dir="eplus_out"`). The class tests writability and fails early.
 
-⸻
+---
 
-# 📁 SQL Explorer: inspect & extract from eplusout.sql
+## 📁 SQL Explorer: inspect & extract from `eplusout.sql`
 
-This package includes EPlusSqlExplorer to browse/search/extract from EnergyPlus’s eplusout.sql without pyenergyplus.
+This package includes `EPlusSqlExplorer` to browse/search/extract from EnergyPlus’s `eplusout.sql` **without** `pyenergyplus`.
 
-Location: eplus/sql_explorer.py
-Import: from eplus import EPlusSqlExplorer
+> Location: `eplus/sql_explorer.py`  
+> Import: `from eplus import EPlusSqlExplorer`
 
-Quick start
+### Quick start
 
+```python
 xp = EPlusSqlExplorer("eplus_out/eplusout.sql")
 xp.list_tables()[:10]
 xp.peek("ReportData", 5)
 hits = xp.search_value("Electricity:Facility")
 df = xp.auto_extract_series("Electricity:Facility", to_kwh=True)
 df.head()
+```
 
 Save directly to CSV:
 
+```python
 xp.auto_extract_series("Electricity:Facility", to_kwh=True, csv_out="facility_kWh.csv")
+```
 
-Tips:
-	•	E+ hour is end-of-interval → extractor shifts to start for plotting sanity.
-	•	If you get no rows, broaden freq_whitelist or include design days.
+**Tips**
 
-⸻
+- **Timestamps:** EnergyPlus reports hour as **end-of-interval** (1–24). The extractor shifts to **interval start** for plotting sanity.
+- **Frequencies:** If you get no rows, broaden `freq_whitelist` or include design days.
 
-# 📄 License
+---
 
-MIT © Mugalan. See LICENSE.
+## 📄 License
 
-⸻
+MIT © Mugalan. See `LICENSE`.
 
-# ❤️ Acknowledgements
+---
 
-Built on the excellent EnergyPlus engine and its Python API (pyenergyplus).
+## ❤️ Acknowledgements
+
+Built on the excellent [EnergyPlus](https://energyplus.net/) simulation engine and its Python API (`pyenergyplus`).
