@@ -72,7 +72,7 @@ class EPlusUtil:
         self._runtime_log_enabled: bool = False
         self._runtime_log_func = None
 
-        self._callback_aliases = {
+        self.callback_aliases = {
             "begin":        "callback_begin_system_timestep_before_predictor",
             "before_hvac":  "callback_after_predictor_before_hvac_managers",
             "inside_iter":  "callback_inside_system_iteration_loop",
