@@ -557,12 +557,100 @@ class EPlusUtil:
         return list(reg["names"])
 
     def enable_hook(self, hook):
-        """Enable dispatch for the given hook (handlers remain unchanged)."""
+        """
+        Enable dispatch for a specific EnergyPlus runtime hook without altering the
+        registered handlers.
+
+        This flips the per-hook "enabled" flag to **True** so that, on the next
+        simulation step where EnergyPlus invokes that hook, the currently
+        registered handlers (if any) will be dispatched. It does **not** add,
+        remove, or re-order handlers, and it does **not** attach the underlying
+        EnergyPlus callback if it was never registered.
+
+        Parameters
+        ----------
+        hook : str | callable
+            Identifies the hook to enable. Accepts the same forms as `register_handlers`:
+            - Alias string: "begin", "before_hvac", "inside_iter", "after_hvac",
+            "after_zone", "after_warmup", "after_get_input"
+            - Full runtime attribute name (str), e.g.
+            "callback_begin_system_timestep_before_predictor"
+            - The registration callable itself, e.g.
+            `api.runtime.callback_begin_system_timestep_before_predictor`
+
+        Notes
+        -----
+        - If the hook’s EnergyPlus callback has **never** been attached to the
+        current `state`, enabling here won’t attach it. Use `register_handlers(...)`
+        at least once for that hook to ensure the callback is bound.
+        - This does not change the hook’s **warmup** policy. If the hook is set to
+        skip warmup (default), enabling it will still skip dispatch during warmup.
+
+        Returns
+        -------
+        None
+
+        Examples
+        --------
+        Enable the “before predictor” (begin system timestep) hook by alias:
+
+        >>> util.enable_hook("begin")
+
+        Enable by passing the runtime registration function:
+
+        >>> util.enable_hook(util.api.runtime.callback_begin_system_timestep_before_predictor)
+        """
         _, reg = self._get_or_init_hook_registry(hook)
         reg["enabled"] = True
 
     def disable_hook(self, hook):
-        """Disable dispatch for the given hook (handlers remain unchanged)."""
+        """
+        Disable dispatch for a specific EnergyPlus runtime hook without changing
+        which handlers are registered.
+
+        This flips the per-hook "enabled" flag to **False** so that, even if the
+        underlying EnergyPlus callback fires, the utility’s dispatcher will **skip**
+        invoking your handlers for that hook. It does **not** add, remove, or
+        re-order handlers, and it does **not** detach the underlying EnergyPlus
+        callback from the current state.
+
+        Parameters
+        ----------
+        hook : str | callable
+            Identifies the hook to disable. Accepts the same forms as `register_handlers`:
+            - Alias string: "begin", "before_hvac", "inside_iter", "after_hvac",
+            "after_zone", "after_warmup", "after_get_input"
+            - Full runtime attribute name (string), e.g.
+            "callback_begin_system_timestep_before_predictor"
+            - The registration callable itself, e.g.
+            `api.runtime.callback_inside_system_iteration_loop`
+
+        Notes
+        -----
+        - Disabling a hook keeps its handlers in the registry. Use
+        `unregister_handlers(hook, [...])` or `register_handlers(hook, [], clear=True)`
+        if you want to actually remove them.
+        - Disabling does not affect the hook’s **warmup** policy. If you need to change
+        whether handlers run during warmup, call `register_handlers(...)` with the
+        `run_during_warmup` argument.
+        - To re-enable dispatch, call `enable_hook(hook)`.
+
+        Returns
+        -------
+        None
+
+        Examples
+        --------
+        Temporarily pause “begin system timestep (before predictor)” dispatch:
+
+        >>> util.disable_hook("begin")
+        >>> util.run_design_day()  # handlers for "begin" will not run
+        >>> util.enable_hook("begin")  # resume dispatch later
+
+        Disable by passing the runtime registration function:
+
+        >>> util.disable_hook(util.api.runtime.callback_inside_system_iteration_loop)
+        """
         _, reg = self._get_or_init_hook_registry(hook)
         reg["enabled"] = False
 
