@@ -337,16 +337,6 @@ class EPlusUtil:
         if not hasattr(self, "_extra_callbacks"):
             self._extra_callbacks = []  # used by your class to rebind on reset
 
-    # Common aliases → api.runtime.callback_* names
-    self.CALLBACK_ALIASES = {
-        "begin": "callback_begin_system_timestep_before_predictor",
-        "before_hvac": "callback_after_predictor_before_hvac_managers",
-        "inside_iter": "callback_inside_system_iteration_loop",
-        "after_hvac": "callback_end_system_timestep_after_hvac_reporting",
-        "after_zone": "callback_end_zone_timestep_after_zone_reporting",
-        "after_warmup": "callback_after_new_environment_warmup_complete",
-        "after_get_input": "callback_after_component_get_input",
-    }
 
     def _resolve_runtime_register(self, hook) -> tuple[str, callable]:
         """
