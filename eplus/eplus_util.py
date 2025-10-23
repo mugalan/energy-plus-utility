@@ -155,7 +155,7 @@ class EPlusUtil:
         Register begin-iteration handlers.
 
         Accepts EITHER:
-        • Sequence[str]: ["occupancy_counter", "tick_hvac_kill"]
+        • Sequence[str]: ["occupancy_handler", "tick_hvac_kill"]
         • Sequence[dict]: [{"method_name": "...", "key_wargs": {...}}]
             (also accepts keys "kwargs", "key_kwargs", or "params" for the dict)
 
@@ -2892,7 +2892,7 @@ class EPlusUtil:
 
     # -------- HVAC ------------
 
-    def occupancy_counter(self, s, **overrides):
+    def occupancy_handler(self, s, **overrides):
         """
         Begin-iteration handler: randomized zone occupancy via People actuators.
 
@@ -2901,10 +2901,10 @@ class EPlusUtil:
         People objects.
 
         Register with either:
-            util.register_begin_iteration(["occupancy_counter"])
+            util.register_begin_iteration(["occupancy_handler"])
         or
             util.register_begin_iteration([
-                {"method_name": "occupancy_counter",
+                {"method_name": "occupancy_handler",
                 "key_wargs": {"lam": 33.0, "min": 20, "max": 45, "seed": 123}}
             ])
         """
