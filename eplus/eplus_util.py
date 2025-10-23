@@ -3163,22 +3163,6 @@ class EPlusUtil:
         show: bool = True,
         warn_rows_threshold: int = 50000,
     ):
-
-    def plot_sql_series(
-        self,
-        selections: list[dict],
-        *,
-        reporting_freq: tuple[str, ...] | None = ("TimeStep", "Hourly"),
-        include_design_days: bool = False,
-        start=None,
-        end=None,
-        resample: str | None = "1H",
-        meters_to_kwh: bool = True,
-        aggregate_vars: str = "mean",
-        title: str | None = None,
-        show: bool = True,
-        warn_rows_threshold: int = 50000,
-    ):
         """
         Plot one or more EnergyPlus variables/meters pulled directly from
         `<out_dir>/eplusout.sql`. This is a convenience wrapper around
