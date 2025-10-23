@@ -72,6 +72,16 @@ class EPlusUtil:
         self._runtime_log_enabled: bool = False
         self._runtime_log_func = None
 
+        self._callback_aliases = {
+            "begin":        "callback_begin_system_timestep_before_predictor",
+            "before_hvac":  "callback_after_predictor_before_hvac_managers",
+            "inside_iter":  "callback_inside_system_iteration_loop",
+            "after_hvac":   "callback_end_system_timestep_after_hvac_reporting",
+            "after_zone":   "callback_end_zone_timestep_after_zone_reporting",
+            "after_warmup": "callback_after_new_environment_warmup_complete",
+            "after_get_input": "callback_after_component_get_input",
+        }
+
     def _assert_out_dir_writable(self):
         import os, tempfile, pathlib
         assert self.out_dir, "set_model(...) first."
@@ -341,7 +351,7 @@ class EPlusUtil:
     def _resolve_runtime_register(self, hook) -> tuple[str, callable]:
         """
         Accepts:
-        - a string alias from CALLBACK_ALIASES
+        - a string alias from callback_aliases
         - a full api.runtime attribute name (string)
         - a direct callable (api.runtime.callback_*)
         Returns (hook_key, runtime_register_callable).
@@ -354,7 +364,7 @@ class EPlusUtil:
         if not isinstance(hook, str):
             raise TypeError(f"hook must be a string alias/name or a callable; got {type(hook)}")
 
-        attr = self.CALLBACK_ALIASES.get(hook, hook)  # allow direct attr names too
+        attr = self.callback_aliases.get(hook, hook)  # allow direct attr names too
         fn = getattr(rt, attr, None)
         if not callable(fn):
             raise AttributeError(f"EnergyPlus runtime has no callable '{attr}'")
