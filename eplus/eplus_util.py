@@ -2375,6 +2375,95 @@ class EPlusUtil:
         activate: bool = True,
         reset: bool = True
     ) -> str:
+        """
+        Patch the active IDF with common **simulation controls** (timestep, run period,
+        warmup days), write it to `<out_dir>/<stem>__patched.idf`, and optionally
+        activate it for subsequent runs.
+
+        What gets modified
+        ------------------
+        - **Timestep**: replaces all existing `Timestep` objects with one line:
+        `Timestep, <timestep_per_hour>;`
+        - **RunPeriod**: replaces all existing `RunPeriod` objects with a single
+        block named `runperiod_name`, spanning the requested `start` → `end`
+        (month, day). `start_day_of_week` may be left blank to **use the weather
+        file setting**.
+        - **Sizing:Parameters**: replaces the object to set **Minimum/Maximum
+        Number of Warmup Days** (other fields left blank -> defaults).
+
+        Parameters
+        ----------
+        timestep_per_hour : int, optional
+            Number of zone/system timesteps per hour (1–60). Example: `6` → 10-minute timestep.
+        start, end : (int, int), optional
+            Start/end as `(month, day)` (1-indexed). **Provide both** to set a RunPeriod,
+            e.g. `start=(1, 1)`, `end=(12, 31)`.
+        start_day_of_week : str, optional
+            Day-of-week token (e.g., `"Monday"`, `"Tuesday"`, …). If `None` or empty,
+            the field is left blank so EnergyPlus **uses the weather file**.
+        use_weather_holidays, use_weather_dst : bool
+            Whether to respect holidays and daylight saving from the EPW/holiday files.
+        weekend_holiday_rule : bool
+            Apply the weekend holiday rule (`Yes`/`No` in `RunPeriod`).
+        use_weather_rain, use_weather_snow : bool
+            Whether to use rain/snow indicators from the weather file.
+        min_warmup_days, max_warmup_days : int, optional
+            Positive integers controlling warmup bounds. Leave `None` to omit.
+        runperiod_name : str
+            Name for the generated `RunPeriod` object.
+        activate : bool, default True
+            If `True`, switch `self.idf` to the patched file and remember the original
+            in `self._orig_idf_path`.
+        reset : bool, default True
+            If `activate=True`, also call `reset_state()` so the next run uses a clean state.
+
+        Returns
+        -------
+        str
+            Absolute path to the patched IDF written in `out_dir`.
+
+        Raises
+        ------
+        AssertionError
+            If `set_model(idf, epw, out_dir)` was not called.
+        ValueError
+            - If `timestep_per_hour` is outside `[1, 60]`.
+            - If only one of `start`/`end` is provided.
+            - If `min_warmup_days` or `max_warmup_days` is provided and < 1.
+
+        Side effects
+        ------------
+        - Writes `<stem>__patched.idf` into `out_dir` and sets `self._patched_idf_path`.
+        - If `activate=True`, sets `self.idf` to the patched path (non-destructive),
+        and (when `reset=True`) resets the API state.
+        - Previous `Timestep`, `RunPeriod`, and `Sizing:Parameters` blocks are **removed**
+        from the patched file and replaced with your settings.
+
+        Notes
+        -----
+        - This is a **text-level** patcher (robust for common cases) rather than a full IDF parser.
+        - `RunPeriod` changes are irrelevant for `--design-day` runs; they apply to annual runs.
+        - To revert to the original IDF later, call `clear_patched_idf()`.
+
+        Examples
+        --------
+        Set a 10-minute timestep and run the full year:
+        >>> util.set_simulation_params(timestep_per_hour=6)
+
+        Simulate only Q1 using the weather file’s weekday alignment:
+        >>> util.set_simulation_params(start=(1, 1), end=(3, 31))
+
+        Tighten warmup bounds without changing run period:
+        >>> util.set_simulation_params(min_warmup_days=6, max_warmup_days=30)
+
+        Create a patched file **without** activating it (manual use later):
+        >>> path = util.set_simulation_params(start=(7, 1), end=(9, 30), activate=False)
+        >>> print(path)  # you can pass this path to EnergyPlus yourself
+
+        Use a fixed start day (ignoring weather file alignment):
+        >>> util.set_simulation_params(start=(1, 1), end=(12, 31), start_day_of_week="Monday")
+        """
+        ...
         assert self.idf and self.epw and self.out_dir, "Call set_model(idf, epw, out_dir) first."
         src_path = pathlib.Path(self.idf)
         text = src_path.read_text(errors="ignore")
@@ -2435,9 +2524,68 @@ class EPlusUtil:
     # --- SQL-only helpers ---
     def ensure_output_sqlite(self, *, activate: bool = True, reset: bool = True) -> str:
         """
-        Ensure Output:SQLite so eplusout.sql is produced.
-        Creates <out_dir>/<stem>__sqlite.idf with 'Output:SQLite, SimpleAndTabular;'
-        and optionally switches self.idf to it.
+        Guarantee that the active IDF will produce **eplusout.sql** by ensuring an
+        `Output:SQLite` object exists, then write a patched copy of the IDF to
+        `<out_dir>/<stem>__sqlite.idf`. Optionally make this patched file the active
+        `self.idf` and reset the runtime state so the next run uses it.
+
+        Behavior
+        --------
+        - If the source IDF already contains an `Output:SQLite` object, it is **kept as-is**.
+        - If not, a minimal block is appended:
+            `Output:SQLite,`
+            `  SimpleAndTabular;`
+        - The result is saved as `__sqlite.idf` alongside other outputs.
+        - When `activate=True`, the method:
+            - Remembers the original path in `self._orig_idf_path` (once),
+            - Points `self.idf` to the patched file,
+            - Calls `reset_state()` if `reset=True`.
+
+        Parameters
+        ----------
+        activate : bool, default True
+            Switch `self.idf` to the patched `__sqlite.idf` immediately.
+        reset : bool, default True
+            If `activate=True`, reset the EnergyPlus state so subsequent runs use
+            the newly patched IDF cleanly.
+
+        Returns
+        -------
+        str
+            Absolute path to the written `<stem>__sqlite.idf`.
+
+        Raises
+        ------
+        AssertionError
+            If `set_model(idf, epw, out_dir)` has not been called (requires `self.idf`
+            and `self.out_dir`).
+
+        Side Effects
+        ------------
+        - Writes a new IDF file in `out_dir`.
+        - May update `self.idf` and reset the API state (depending on `activate` / `reset`).
+
+        Notes
+        -----
+        - This method is **idempotent**: calling it again will just rewrite the same
+        patched file (and keep any existing `Output:SQLite` blocks).
+        - Producing `eplusout.sql` still requires running a simulation (e.g., via
+        `run_design_day()` or `run_annual()`).
+        - To add specific variables/meters to the SQL, pair with
+        `ensure_output_variables(...)` / `ensure_output_meters(...)` before running.
+
+        Examples
+        --------
+        Ensure SQL is enabled and run an annual simulation:
+        >>> util.ensure_output_sqlite()
+        >>> util.run_annual()
+        >>> import os
+        >>> os.path.exists(os.path.join(util.out_dir, "eplusout.sql"))
+        True
+
+        Prepare the patched file but keep the original IDF active:
+        >>> path = util.ensure_output_sqlite(activate=False)
+        >>> print(path)  # later you can switch util.idf to this path manually
         """
         assert self.idf and self.out_dir, "Call set_model(idf, epw, out_dir) first."
         src = pathlib.Path(self.idf)
@@ -2460,11 +2608,85 @@ class EPlusUtil:
 
     def ensure_output_variables(self, specs: list[dict], *, activate: bool = True, reset: bool = True) -> str:
         """
-        Ensure specific variables are written to SQL via Output:Variable objects.
+        Ensure the IDF contains `Output:Variable` objects for the requested variables,
+        writing a patched copy to `<out_dir>/<stem>__vars.idf`. Missing entries are
+        appended; existing ones (by exact triplet **Key Value / Variable Name / Frequency**)
+        are left untouched. Optionally switch `self.idf` to the patched file and reset
+        the runtime state so the next run uses it.
 
-        specs: list of dicts like:
-        {"name":"Zone Air Temperature", "key":"*", "freq":"TimeStep"}
-        {"name":"Zone Mean Air Temperature", "key":"SPACE1", "freq":"Hourly"}
+        Parameters
+        ----------
+        specs : list of dict
+            A list of variable specifications. Each dict supports:
+            - **name** (str, required): EnergyPlus variable name
+                (e.g., "Zone Air Temperature").
+            - **key** (str, optional, default `"*"`): The Key Value (object name) to report.
+                Use `"*"` to report for all keys that exist for that variable; use a specific
+                zone/object name to target one key.
+            - **freq** (str, optional, default `"TimeStep"`): Reporting frequency
+                (e.g., "TimeStep", "Hourly", "Daily", "Monthly", "RunPeriod").
+            Example item:
+                `{"name": "Zone Air Temperature", "key": "*", "freq": "TimeStep"}`
+
+        activate : bool, default True
+            If True, switch `self.idf` to the newly written `__vars.idf`.
+        reset : bool, default True
+            If `activate=True`, call `reset_state()` so subsequent runs use the patched IDF.
+
+        Returns
+        -------
+        str
+            Absolute path to the written `<stem>__vars.idf`. If no new `Output:Variable`
+            blocks were needed (all were already present), returns the original `self.idf`
+            path without writing a new file.
+
+        Raises
+        ------
+        AssertionError
+            If `set_model(idf, epw, out_dir)` has not been called.
+        KeyError / ValueError
+            If a spec is missing the required `"name"` field or contains invalid values.
+
+        Behavior
+        --------
+        - Detects already-present `Output:Variable` entries via a strict triplet match:
+        **(key, name, freq)** — comparisons are whitespace-trimmed.
+        - Appends only the missing blocks and writes a patched copy to `out_dir`.
+        - When activated for the first time, remembers the original path in
+        `self._orig_idf_path` and updates `self.idf` to point at the patched file.
+
+        Side Effects
+        ------------
+        - May write a new IDF (`__vars.idf`) to `out_dir`.
+        - May update `self.idf` and reset the EnergyPlus state (depending on flags).
+
+        Notes
+        -----
+        - This method only ensures variable **report requests** exist. To ensure the
+        database file is produced, pair with `ensure_output_sqlite()` and then run
+        a simulation (`run_design_day()` / `run_annual()`).
+        - Use `ensure_output_meters(...)` to request meters instead of variables.
+
+        Examples
+        --------
+        Request common zone temperatures for all zones at timesteps, and a few
+        key-specific series hourly:
+
+        >>> util.ensure_output_sqlite()  # ensure eplusout.sql will be produced
+        >>> util.ensure_output_variables([
+        ...     {"name": "Zone Air Temperature", "key": "*", "freq": "TimeStep"},
+        ...     {"name": "Zone Mean Air Temperature", "key": "LIVING ZONE", "freq": "Hourly"},
+        ...     {"name": "Zone Mean Air Temperature", "key": "KITCHEN", "freq": "Hourly"},
+        ... ])
+        '/abs/path/to/eplus_out/YourModel__vars.idf'
+
+        Run a quick design-day simulation and then query data from SQL:
+
+        >>> util.run_design_day()
+        >>> df = util.get_sql_series_dataframe([
+        ...     {"kind": "var", "name": "Zone Air Temperature", "key": "*", "label": "ZAT"}
+        ... ])
+        >>> df.head()
         """
         assert self.idf and self.out_dir, "Call set_model(idf, epw, out_dir) first."
         src = pathlib.Path(self.idf)
@@ -2502,10 +2724,72 @@ class EPlusUtil:
     def ensure_output_meters(self, names: list[str], *, freq: str = "TimeStep",
                             activate: bool = True, reset: bool = True) -> str:
         """
-        Ensure specific meters are reported (to SQL) via Output:Meter objects.
+        Ensure the IDF contains `Output:Meter` objects for the requested meter names,
+        writing a patched copy to `<out_dir>/<stem>__meters.idf`. Missing entries are
+        appended; existing pairs **(Meter Name, Reporting Frequency)** are left as-is.
+        Optionally switch `self.idf` to the patched file and reset the runtime state.
 
-        names: e.g., ["Electricity:Facility", "ElectricityPurchased:Facility"]
-        freq:  "TimeStep" or "Hourly"
+        Parameters
+        ----------
+        names : list[str]
+            EnergyPlus meter names to request (e.g., `"Electricity:Facility"`,
+            `"ElectricityPurchased:Facility"`, `"Gas:Facility"`, `"DistrictCooling:Facility"`).
+        freq : str, default "TimeStep"
+            Reporting frequency for all provided meters, commonly `"TimeStep"` or `"Hourly"`.
+            (Other valid E+ frequencies like `"Daily"`, `"Monthly"`, `"RunPeriod"` will also work
+            if you pass them explicitly.)
+        activate : bool, default True
+            If True, switch `self.idf` to the newly written `__meters.idf`.
+        reset : bool, default True
+            If `activate=True`, call `reset_state()` so subsequent runs use the patched IDF.
+
+        Returns
+        -------
+        str
+            Absolute path to the written `<stem>__meters.idf`. If all requested
+            `(name, freq)` pairs already exist in the current IDF, returns the original
+            `self.idf` path and does not write a new file.
+
+        Raises
+        ------
+        AssertionError
+            If `set_model(idf, epw, out_dir)` has not been called.
+
+        Behavior
+        --------
+        - Scans the active IDF for existing `Output:Meter` entries (normalized by
+        `(name, freq)`), appends only missing ones, and writes a patched copy to `out_dir`.
+        - When activated the first time, stores the original IDF path in `self._orig_idf_path`,
+        updates `self.idf` to the patched file, and (optionally) resets the state.
+
+        Notes
+        -----
+        - `Output:Meter` requests only control **what** is reported. To actually produce
+        the SQLite database (`eplusout.sql`) that contains meter time series, ensure
+        `Output:SQLite` is enabled (e.g., call `ensure_output_sqlite()`) and then run a
+        simulation (`run_design_day()` / `run_annual()`).
+        - For quick visualization, use `plot_sql_meters([...])`, which converts Joules to
+        kWh by default when plotting.
+
+        Examples
+        --------
+        Request whole-facility electricity and purchased electricity hourly, then run
+        a design-day and plot:
+
+        >>> util.ensure_output_sqlite()  # ensure eplusout.sql will be produced
+        >>> util.ensure_output_meters(
+        ...     ["Electricity:Facility", "ElectricityPurchased:Facility"],
+        ...     freq="Hourly"
+        ... )
+        '/abs/path/to/eplus_out/YourModel__meters.idf'
+
+        >>> util.run_design_day()
+        >>> util.plot_sql_meters(
+        ...     ["Electricity:Facility", "ElectricityPurchased:Facility"],
+        ...     reporting_freq=("Hourly",),  # filter to hourly series
+        ...     resample=None,               # no additional resampling
+        ...     title="Facility Electricity (Hourly)"
+        ... )
         """
         assert self.idf and self.out_dir, "Call set_model(idf, epw, out_dir) first."
         src = pathlib.Path(self.idf)
@@ -2537,7 +2821,68 @@ class EPlusUtil:
         return str(out_path)
 
     def inspect_sql_meter(self, name: str, *, include_design_days: bool = False):
-        """Return available frequencies/units/counts for a given meter name in SQL."""
+        """
+        Inspect a meter already written to `eplusout.sql` and summarize what’s available
+        for it (reporting frequencies, units, and row counts).
+
+        This helper queries the EnergyPlus SQLite output (`<out_dir>/eplusout.sql`)
+        and returns a tidy `pandas.DataFrame` with one row per
+        `(Name, ReportingFrequency, Units)` combination that exists in the database.
+        By default it excludes sizing-period (design-day) environments so you see only
+        regular simulation results.
+
+        Parameters
+        ----------
+        name : str
+            The meter name to inspect (e.g., `"Electricity:Facility"`,
+            `"Gas:Facility"`, `"DistrictCooling:Facility"`).
+        include_design_days : bool, default False
+            If True, include rows from sizing/design-day environments
+            (`EnvironmentName` like `'SizingPeriod:%'`). When False (default), those
+            rows are filtered out.
+
+        Returns
+        -------
+        pandas.DataFrame
+            Columns:
+            - **Name** (str) — meter name you requested.
+            - **ReportingFrequency** (str) — e.g., `"TimeStep"`, `"Hourly"`,
+            `"Daily"`, `"Monthly"`, `"RunPeriod"`.
+            - **Units** (str) — units as recorded by EnergyPlus (often `"J"`).
+            - **n_rows** (int) — number of time-series rows present for that
+            `(Name, ReportingFrequency, Units)` combination.
+            Sorted by `n_rows` descending.
+
+        Raises
+        ------
+        AssertionError
+            If `set_model(idf, epw, out_dir)` has not been called.
+        FileNotFoundError
+            If `<out_dir>/eplusout.sql` does not exist. (Enable SQLite output with
+            `ensure_output_sqlite()` and run a simulation first.)
+
+        Notes
+        -----
+        - This method does **not** modify your IDF or simulation settings; it only
+        reads the SQLite database.
+        - If you expect a frequency but don’t see it here, ensure the meter was
+        requested at that frequency (e.g., via `ensure_output_meters(...)`) and
+        re-run the simulation.
+
+        Examples
+        --------
+        >>> util.ensure_output_sqlite()                     # make sure SQL will be produced
+        >>> util.ensure_output_meters(["Electricity:Facility"], freq="Hourly")
+        >>> util.run_design_day()                           # or util.run_annual()
+        >>> util.inspect_sql_meter("Electricity:Facility")
+            Name                   ReportingFrequency Units  n_rows
+        0  Electricity:Facility               Hourly        J    8760
+        1  Electricity:Facility               TimeStep      J   52560
+
+        # Include sizing periods if you specifically want to see them:
+        >>> util.inspect_sql_meter("Electricity:Facility", include_design_days=True)
+        """
+
         assert self.out_dir, "Call set_model(...) first."
         sql_path = os.path.join(self.out_dir, "eplusout.sql")
         if not os.path.exists(sql_path):
@@ -2569,13 +2914,87 @@ class EPlusUtil:
         include_design_days: bool = False,
     ) -> pd.DataFrame:
         """
-        Query eplusout.sql and return a tidy DataFrame with columns:
-        ['timestamp','trace','value','kind','name','key','units','freq']
+        Query `<out_dir>/eplusout.sql` and return a tidy time-series DataFrame for the
+        requested variables/meters.
 
-        Notes:
-        - Does NOT resample, window, or convert units. Plotter handles that.
-        - 'trace' is prebuilt from selection label/name (+ key and units where applicable).
+        The result is **not** resampled or unit-converted; it is a clean, long-form
+        table ready for plotting/aggregation elsewhere (e.g., `plot_sql_series`).
+
+        Parameters
+        ----------
+        selections : list of dict
+            One or more selection specs. Each spec supports:
+            - **kind** : {"var","meter"} (default "var")
+            - **name** : str — variable or meter name as recorded in SQL
+            - **key**  : str | {"*", "ALL", ""} — for variables only
+                * `""` or omitted → match blank/NULL key (and "Environment" for site vars)
+                * `"*"` / `"ALL"` → expand to all keys that exist in SQL for `name`
+                * specific key (e.g., `"SPACE1-1"`) → exact match (case-insensitive, trimmed)
+            - **label** : str (optional) — human label for the series; if omitted the
+            label defaults to `name` (and key/units may be appended for clarity).
+        reporting_freq : tuple[str, ...] | None, default ("TimeStep", "Hourly")
+            Reporting frequency filter applied in SQL. Use `None` to disable the
+            frequency filter and return whatever exists (e.g., Hourly, Daily, etc).
+            Matching is tolerant (e.g., "TIMESTEP" also matches "DETAILED").
+        include_design_days : bool, default False
+            If `True`, include rows from sizing/design-day environments. When `False`,
+            they are filtered out (`EnvironmentName NOT LIKE 'SizingPeriod:%'`).
+
+        Returns
+        -------
+        pandas.DataFrame
+            Long-form dataframe with columns:
+            - **timestamp** : pandas.Timestamp — interval **start** (E+ hours are
+            end-of-interval; this shifts to the start). `Year==0` is mapped to 2002.
+            - **trace** : str — display label assembled from `label`/`name` (+ key/units).
+            - **value** : float — raw value from SQL (no resampling/unit conversion).
+            - **kind** : {"var","meter"}
+            - **name** : str — original variable/meter name
+            - **key** : str — variable key (empty for meters)
+            - **units** : str — units reported by EnergyPlus (e.g., `"J"`, `"C"`)
+            - **freq** : str — reporting frequency recorded in SQL
+
+        Raises
+        ------
+        AssertionError
+            If `set_model(idf, epw, out_dir)` has not been called.
+        FileNotFoundError
+            If `<out_dir>/eplusout.sql` does not exist (enable via
+            `ensure_output_sqlite()` and rerun a simulation).
+        ValueError
+            If no rows match the request. The error message includes hints about
+            available frequencies and a sample of existing keys.
+
+        Notes
+        -----
+        - This function **does not** resample, window, or convert units. For example,
+        meters remain in joules unless you convert later (e.g., to kWh).
+        - When `key="*"`/`"ALL"`, the method fans out to **all** available keys for
+        that variable name, returning a concatenated long table.
+        - The `trace` column is constructed for direct plotting (unique legend labels).
+
+        Examples
+        --------
+        Pull a single meter and a single zone variable (auto label and Hourly only):
+
+        >>> df = util.get_sql_series_dataframe([
+        ...     {"kind": "meter", "name": "Electricity:Facility"},
+        ...     {"kind": "var", "name": "Zone Air Temperature", "key": "SPACE1-1", "label": "Space 1 Temp"},
+        ... ], reporting_freq=("Hourly",))
+        >>> df.head()
+                timestamp             trace  value  kind  name                   key units   freq
+        0  2002-01-01 00:00:00  Electricity...   ...  meter Electricity:Facility         J     Hourly
+        1  2002-01-01 00:00:00      Space 1...   ...    var Zone Air Temperature  SPACE1-1  C  Hourly
+        ...
+
+        Expand a variable over **all** keys and disable frequency filtering:
+
+        >>> df = util.get_sql_series_dataframe(
+        ...     [{"kind":"var", "name":"Zone People Occupant Count", "key":"*"}],
+        ...     reporting_freq=None
+        ... )
         """
+
         assert self.out_dir, "Call set_model(idf, epw, out_dir) first."
         sql_path = os.path.join(self.out_dir, "eplusout.sql")
         if not os.path.exists(sql_path):
@@ -2744,10 +3163,134 @@ class EPlusUtil:
         show: bool = True,
         warn_rows_threshold: int = 50000,
     ):
+
+    def plot_sql_series(
+        self,
+        selections: list[dict],
+        *,
+        reporting_freq: tuple[str, ...] | None = ("TimeStep", "Hourly"),
+        include_design_days: bool = False,
+        start=None,
+        end=None,
+        resample: str | None = "1H",
+        meters_to_kwh: bool = True,
+        aggregate_vars: str = "mean",
+        title: str | None = None,
+        show: bool = True,
+        warn_rows_threshold: int = 50000,
+    ):
         """
-        Plot variables/meters directly from eplusout.sql.
-        Refactored to use get_sql_series_dataframe(...) for data retrieval.
+        Plot one or more EnergyPlus variables/meters pulled directly from
+        `<out_dir>/eplusout.sql`. This is a convenience wrapper around
+        `get_sql_series_dataframe(...)` that optionally windows the data,
+        converts meter energy from joules → kWh, resamples/aggregates, and
+        renders an interactive Plotly line chart.
+
+        Parameters
+        ----------
+        selections : list of dict
+            Selection specs passed through to `get_sql_series_dataframe`. Each item:
+            - **kind** : {"var","meter"} (default "var")
+            - **name** : str — SQL variable/meter name
+            - **key**  : str | {"*", "ALL", ""} — variables only
+                * `""` / omitted → blank/NULL key (and "Environment" for site vars)
+                * `"*"` / `"ALL"` → expand to all keys found in SQL
+                * specific key (e.g., `"SPACE1-1"`) → exact, case-insensitive
+            - **label** : str (optional) — friendly label used for the legend/trace
+        reporting_freq : tuple[str, ...] | None, default ("TimeStep","Hourly")
+            Frequency filter applied in SQL. Use `None` to disable filtering and
+            accept any frequency present (Daily/Monthly/RunPeriod/etc).
+            Matching is tolerant (e.g., "TIMESTEP" also matches "DETAILED").
+        include_design_days : bool, default False
+            Include sizing period rows (by default they are excluded).
+        start, end : datetime-like or str, optional
+            Inclusive window applied **after** SQL retrieval. Anything accepted by
+            `pandas.to_datetime` (e.g., `"2002-01-03"`, `"2002-01-03 06:00"`).
+        resample : str | None, default "1H"
+            Pandas offset alias for time aggregation (e.g., `"15min"`, `"1H"`, `"1D"`).
+            - If provided, data are resampled:
+            * **meters** are **summed** over each bin
+            * **variables** use `aggregate_vars` (e.g., `"mean"`, `"median"`, `"max"`)
+            - If `None`, the original timestep data are plotted (can be very large).
+        meters_to_kwh : bool, default True
+            For meter series only, convert J → kWh (divide by 3.6e6), update the
+            `units` to `"kWh"`, and adjust trace labels to end with `[kWh]`.
+        aggregate_vars : str, default "mean"
+            Aggregator name used for **variables** during resampling
+            (anything supported by `Series.resample(...).agg(aggregate_vars)`).
+            Ignored for meters (meters always sum).
+        title : str | None, default None
+            Figure title. If plotting a single series and `title` is `None`, the
+            lone trace label is used as the title.
+        show : bool, default True
+            If `True`, calls `fig.show()`; otherwise only returns the figure.
+        warn_rows_threshold : int, default 50000
+            When `resample=None` and the plotted row count exceeds this value, a
+            one-line warning is logged to help avoid sluggish rendering.
+
+        Returns
+        -------
+        plotly.graph_objects.Figure
+            Interactive line chart with:
+            - x-axis: **Time**
+            - y-axis: **kWh** if `meters_to_kwh=True` and any meters are present,
+            otherwise **Value**
+            - multiple traces colored by the `trace` label when >1 series exist
+
+        Raises
+        ------
+        AssertionError
+            If `set_model(idf, epw, out_dir)` has not been called.
+        FileNotFoundError
+            If `<out_dir>/eplusout.sql` is missing (enable via `ensure_output_sqlite()`
+            and rerun a simulation).
+        ValueError
+            - If all rows were filtered out by `start`/`end`
+            - If no data remain after resampling/aggregation
+            - If the underlying `get_sql_series_dataframe` found no matches; the
+            propagated error includes hints for available keys/frequencies.
+
+        Notes
+        -----
+        - Time stamps are interval **starts** (EnergyPlus hours are end-of-interval).
+        - For mixed inputs (meters + variables), meters are summed while variables
+        use `aggregate_vars` during resampling.
+        - If you need the underlying tidy dataframe without plotting, use
+        `get_sql_series_dataframe(...)` directly.
+
+        Examples
+        --------
+        Plot hourly facility electricity (kWh) and a single zone temperature:
+
+        >>> util.ensure_output_sqlite()
+        >>> fig = util.plot_sql_series(
+        ...     selections=[
+        ...         {"kind":"meter", "name":"Electricity:Facility"},
+        ...         {"kind":"var",   "name":"Zone Air Temperature", "key":"SPACE1-1", "label":"Space 1 Tdb"}
+        ...     ],
+        ...     reporting_freq=("Hourly",),
+        ...     start="2002-01-05", end="2002-01-12",
+        ... )
+        >>> fig  # interactive figure
+
+        Plot all zone occupant counts at 15-minute resolution without converting meters:
+
+        >>> fig = util.plot_sql_series(
+        ...     selections=[{"kind":"var", "name":"Zone People Occupant Count", "key":"*"}],
+        ...     reporting_freq=None,
+        ...     resample="15min",
+        ...     meters_to_kwh=False,
+        ...     title="Occupants per Zone"
+        ... )
+
+        Render raw timestep data (no resample). A warning logs if very large:
+
+        >>> fig = util.plot_sql_series(
+        ...     selections=[{"kind":"meter","name":"Gas:Facility"}],
+        ...     resample=None
+        ... )
         """
+
         # ---- 1) fetch tidy data (no resample/window/convert) ----
         df = self.get_sql_series_dataframe(
             selections,
@@ -2816,8 +3359,74 @@ class EPlusUtil:
         include_design_days: bool = False,
     ):
         """
-        Return a DataFrame of zone-style variables that actually have data in eplusout.sql.
-        Columns: [Name, KeyValue, Units, ReportingFrequency, n_rows]
+        List zone-scoped variables that actually have rows in `<out_dir>/eplusout.sql`.
+
+        This queries EnergyPlus's SQLite output (tables `ReportData*`, `Time`,
+        and `EnvironmentPeriods`) and returns a summary table grouped by
+        variable name, key (zone), units, and reporting frequency—along with a
+        row count for each group.
+
+        Parameters
+        ----------
+        name : str | None, default None
+            Exact ReportDataDictionary `Name` to match (e.g., "Zone Air Temperature").
+            When provided, `like` is ignored. Match is case-sensitive because it
+            uses SQL equality against EnergyPlus's canonical casing.
+        like : str, default "Zone %"
+            SQL `LIKE` pattern used when `name` is None. Useful for discovery
+            (e.g., `"Zone %Temperature%"`, `"Zone %CO2%"`).
+        reporting_freq : tuple[str, ...] | None, default ("TimeStep","Hourly")
+            Frequency filter applied in SQL. Use `None` to disable frequency
+            filtering and include Daily/Monthly/RunPeriod rows if present.
+            Matching is tolerant (e.g., "TIMESTEP" also matches "DETAILED").
+        include_design_days : bool, default False
+            If `True`, sizing period rows (`EnvironmentName` like "SizingPeriod:%")
+            are included; otherwise they are excluded.
+
+        Returns
+        -------
+        pandas.DataFrame
+            Columns:
+            - **Name** (str) — variable name
+            - **KeyValue** (str) — zone (or blank for keyless variables)
+            - **Units** (str)
+            - **ReportingFrequency** (str)
+            - **n_rows** (int) — number of rows matched in SQL
+
+            Sorted by Name, KeyValue.
+
+        Raises
+        ------
+        AssertionError
+            If `set_model(idf, epw, out_dir)` has not been called.
+        FileNotFoundError
+            If `<out_dir>/eplusout.sql` does not exist. (Call
+            `ensure_output_sqlite()` and re-run a simulation.)
+
+        Notes
+        -----
+        - This only reports variables that **actually appear in SQL** (i.e., you
+        requested them via `Output:Variable` and ran the simulation).
+        - Zone keys are returned exactly as stored in SQL (case preserved).
+        - For quick plotting of a single zone variable across a few keys, see
+        `plot_sql_zone_variable(...)`.
+
+        Examples
+        --------
+        Discover all zone variables that contain "Temperature" (any frequency):
+
+        >>> df = util.list_sql_zone_variables(like="Zone %Temperature%", reporting_freq=None)
+        >>> df.head()
+
+        Inspect which zones have data for Zone Air Temperature at TimeStep/Hourly:
+
+        >>> df = util.list_sql_zone_variables(name="Zone Air Temperature",
+        ...                                   reporting_freq=("TimeStep","Hourly"))
+        >>> df.sort_values("n_rows", ascending=False).head()
+
+        Include sizing periods for CO₂ variables:
+
+        >>> util.list_sql_zone_variables(like="Zone %CO2%", include_design_days=True)
         """
         assert self.out_dir, "Call set_model(...) first."
         sql_path = os.path.join(self.out_dir, "eplusout.sql")
@@ -2879,8 +3488,86 @@ class EPlusUtil:
         show: bool = True,
     ):
         """
-        Quick plot for a single zone variable across one or more zone keys.
-        Uses the class's SQL plotter under the hood.
+        Plot a single zone variable for one or more zones (keys) from `eplusout.sql`.
+
+        This is a convenience wrapper around `plot_sql_series(...)`. When `keys` is
+        omitted, the method will discover zone keys that actually have rows for the
+        requested variable (via `list_sql_zone_variables(...)`) and auto-select up to
+        `max_auto_keys` with the most data.
+
+        Parameters
+        ----------
+        var_name : str
+            Exact variable name as stored in ReportDataDictionary (e.g., "Zone Air Temperature",
+            "Zone Mean Air Temperature", "Zone Air CO2 Concentration").
+        keys : list[str] | None, default None
+            Zone names to plot. If `None`, the method inspects SQL and auto-picks up to
+            `max_auto_keys` keys with the highest row counts for `var_name`.
+        reporting_freq : tuple[str, ...] | None, default ("TimeStep","Hourly")
+            Frequency filter. Use `None` to include any frequency present (Daily, Monthly, etc.).
+        include_design_days : bool, default False
+            Include sizing periods (`EnvironmentName` LIKE "SizingPeriod:%") when querying SQL.
+        start, end : any, optional
+            Optional time window. Parsed by `pandas.to_datetime`. Rows outside the window
+            are filtered out before plotting.
+        resample : str | None, default "1H"
+            Pandas offset string to resample each trace before plotting (e.g., "30min",
+            "2H"). Variables are aggregated using `aggregate_vars`. Use `None` to plot
+            the native SQL time resolution.
+        aggregate_vars : str, default "mean"
+            Aggregation to apply when resampling variable traces (e.g., "mean", "median", "max").
+        max_auto_keys : int, default 4
+            Maximum number of keys to auto-select when `keys=None`.
+        title : str | None, default None
+            Plot title. If omitted, a title is synthesized as:
+            `"{var_name} — key1, key2, key3…"`.
+        show : bool, default True
+            If True, calls `fig.show()`; the figure is always returned.
+
+        Returns
+        -------
+        plotly.graph_objs.Figure
+            A line chart with one trace per selected key.
+
+        Raises
+        ------
+        ValueError
+            - If no rows exist for `var_name` in SQL (when auto-picking keys).
+            - If all rows are filtered out by the time window / frequency choices downstream.
+        FileNotFoundError
+            If `<out_dir>/eplusout.sql` is missing. (Call `ensure_output_sqlite()` and rerun a simulation.)
+
+        Notes
+        -----
+        - Units come from SQL and are appended to each trace label.
+        - Variables are **not** converted (unlike meters which may be converted to kWh elsewhere).
+        - This method delegates data retrieval + plotting to `get_sql_series_dataframe(...)`
+        and `plot_sql_series(...)`.
+
+        Examples
+        --------
+        Plot the top 4 zones for Zone Air Temperature, hourly-averaged:
+
+        >>> util.plot_sql_zone_variable("Zone Air Temperature")
+
+        Plot specific zones at 30-minute resolution:
+
+        >>> util.plot_sql_zone_variable(
+        ...     "Zone Air Temperature",
+        ...     keys=["LIVING ZONE", "KITCHEN"],
+        ...     reporting_freq=("TimeStep",),
+        ...     resample="30min",
+        ...     title="Living vs Kitchen — 30-min"
+        ... )
+
+        Focus on a summer window and include design-day outputs:
+
+        >>> util.plot_sql_zone_variable(
+        ...     "Zone Mean Air Temperature",
+        ...     start="2002-06-01",
+        ...     end="2002-08-31",
+        ...     include_design_days=True
+        ... )
         """
         if keys is None:
             df = self.list_sql_zone_variables(
@@ -2908,7 +3595,78 @@ class EPlusUtil:
         )
 
     def plot_sql_meters(self, meter_names: list[str], **kwargs):
-        """Convenience wrapper to plot one or more meters from SQL."""
+        """
+        Plot one or more EnergyPlus meters from `eplusout.sql`.
+
+        This is a thin convenience wrapper around `plot_sql_series(...)` that builds
+        the required selections for meters and forwards all keyword arguments.
+
+        Parameters
+        ----------
+        meter_names : list[str]
+            Exact meter names as stored in ReportDataDictionary (e.g.,
+            "Electricity:Facility", "ElectricityPurchased:Facility",
+            "NaturalGas:Facility"). Names must already exist in the SQL output.
+        **kwargs :
+            Any keyword arguments accepted by `plot_sql_series(...)`, including:
+            - reporting_freq: tuple[str, ...] | None, default ("TimeStep","Hourly")
+            - include_design_days: bool, default False
+            - start, end: optional time window (parsed by pandas)
+            - resample: str | None, default "1H"
+            - meters_to_kwh: bool, default True (converts Joules → kWh for meters)
+            - title: str | None
+            - show: bool, default True
+
+        Returns
+        -------
+        plotly.graph_objs.Figure
+            A line chart with one trace per requested meter. If `meters_to_kwh=True`,
+            the y-axis is in kWh; otherwise native meter units (typically Joules).
+
+        Raises
+        ------
+        FileNotFoundError
+            If `<out_dir>/eplusout.sql` does not exist (call `ensure_output_sqlite()`
+            and rerun a simulation).
+        ValueError
+            If no rows are found after applying frequency / time filters.
+
+        Notes
+        -----
+        - By default meters are converted from Joules to kWh for readability.
+        Disable with `meters_to_kwh=False` to keep native units.
+        - Use `inspect_sql_meter(name)` beforehand to discover available
+        frequencies and units for a given meter.
+
+        Examples
+        --------
+        Plot facility electricity (and purchased electricity if present), hourly:
+
+        >>> util.plot_sql_meters(
+        ...     ["Electricity:Facility", "ElectricityPurchased:Facility"],
+        ...     reporting_freq=("TimeStep","Hourly"),
+        ...     resample="1H",
+        ...     title="Site Electricity — Hourly"
+        ... )
+
+        Plot natural gas without unit conversion, aggregated daily:
+
+        >>> util.plot_sql_meters(
+        ...     ["NaturalGas:Facility"],
+        ...     meters_to_kwh=False,
+        ...     resample="1D",
+        ...     title="Daily Natural Gas (J)"
+        ... )
+
+        Focus on a specific window and include sizing periods:
+
+        >>> util.plot_sql_meters(
+        ...     ["Electricity:Facility"],
+        ...     start="2002-07-01", end="2002-07-31",
+        ...     include_design_days=True,
+        ...     title="July Electricity — Including Sizing"
+        ... )
+        """
         sels = [{"kind":"meter", "name": m} for m in meter_names]
         return self.plot_sql_series(sels, **kwargs)
 
