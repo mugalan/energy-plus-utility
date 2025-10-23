@@ -142,8 +142,9 @@ util.run_annual()
 ### 3) Explore what’s available
 
 ```python
-vars_and_meters = util.list_variables_safely()  # robust, with dictionary/API fallbacks
-acts = util.list_actuators_safely()
+vars_and_meters = util.list_available_variables()  # robust, with dictionary/API fallbacks
+acts = util.list_available_actuators_safely()
+mtrs = util.list_available_meters()
 zones = util.list_zone_names(save_csv=True)     # writes zones.csv into out_dir
 ```
 
