@@ -4536,19 +4536,99 @@ class EPlusUtil:
 
     def probe_zone_air_and_supply(self, s, **opts):
         """
-        Callback (fast): per zone snapshot of air state + supply aggregate.
-        Prints at a configurable interval and returns a dict snapshot.
+        Fast per-timestep callback that snapshots **zone air state** and **supply (inlet) aggregates**,
+        with robust fallbacks and optional logging. Designed to be registered via
+        `register_begin_iteration(...)` or `register_after_hvac_reporting(...)`, but it can also
+        be called directly.
 
-        Fallbacks:
-        • Zone w: try Zone Air Humidity Ratio → Zone Mean Air Humidity Ratio →
-                    compute from (zone T, zone RH, site P).
-        • Site w: try Site Outdoor Air Humidity Ratio → compute from (To, RHo, Po).
-        • Supply node w: try node Humidity Ratio → compute from (node T, node RH, site P).
+        What it does
+        ------------
+        • Discovers each zone’s inlet node(s) (prefers SQL; falls back to common name patterns).  
+        • Requests the minimal set of E+ variables once per state and then resolves handles when
+        `api_data_fully_ready(...)` becomes True.  
+        • At each call (post-warmup), builds a snapshot containing:
+            - **Outdoor**: dry-bulb (°C), humidity ratio (kg/kg), CO₂ (ppm).
+            - **Per zone**:
+                - **air**: dry-bulb (°C), humidity ratio (kg/kg), CO₂ (ppm).
+                - **supply** (inlet aggregate): mass flow (kg/s), dry-bulb (°C),
+                humidity ratio (kg/kg), CO₂ (ppm) — mass-flow-weighted when multiple nodes exist.
+            - **inlet_nodes**: the node names used for that zone.
 
-        Kwargs:
-        log_every_minutes: int | None = 1   # 1 => every timestep; None => no prints
-        precision: int = 3
+        Humidity-ratio fallbacks (w)
+        ----------------------------
+        If a direct humidity-ratio variable is unavailable, the function computes **w** via a
+        Tetens-based relation using (T[°C], RH[%], P[Pa]):
+
+        • **Zone w**: try *Zone Air Humidity Ratio* → *Zone Mean Air Humidity Ratio* → compute from zone T, zone RH, site P.  
+        • **Site w**: try *Site Outdoor Air Humidity Ratio* → compute from site T, site RH, site P.  
+        • **Supply node w**: try *System Node Humidity Ratio* → compute from node T, node RH, site P.
+
+        CO₂ fallback
+        ------------
+        If *Site Outdoor Air CO2 Concentration* is absent and a CO₂ outdoor schedule actuator
+        handle (`self._co2_outdoor_sched_handle`) is available, that value is used instead.
+
+        Parameters
+        ----------
+        s : EnergyPlusState
+            The active EnergyPlus runtime state passed by the callback system.
+        **opts :
+            Optional keyword arguments:
+            • `log_every_minutes: int | None = 1`
+                - `1` → print once each model minute (i.e., every timestep if 60/N = 1).
+                - `None` → disable prints.
+                Printing is gated so each timestamp is logged at most once.
+            • `precision: int = 3`
+                Decimal precision for printed values.
+
+        Returns
+        -------
+        dict | None
+            A snapshot dict (also stored on `self._probe_last_snapshot`) of the form:
+
+            {
+            "timestamp": pandas.Timestamp | str,
+            "outdoor": {"Tdb_C": float, "w_kgperkg": float, "co2_ppm": float},
+            "zones": {
+                "<ZONE>": {
+                "air":    {"Tdb_C": float, "w_kgperkg": float, "co2_ppm": float},
+                "supply": {"m_dot_kgs": float, "Tdb_C": float, "w_kgperkg": float, "co2_ppm": float},
+                "inlet_nodes": [str, ...]
+                },
+                ...
+            }
+            }
+
+            Returns `None` during warmup or before variable handles are ready.
+
+        Side effects
+        ------------
+        • Issues `request_variable(...)` calls once, resolves and caches handles once per state,
+        and writes concise log lines via `self._log(...)` when `log_every_minutes` is not None.  
+        • Saves the latest payload to `self._probe_last_snapshot`.
+
+        Notes
+        -----
+        • Missing/unknown readings are `numpy.nan`.  
+        • Supply aggregates use **mass-flow weighting** over all discovered inlet nodes.  
+        • Handles used here are valid only for the current temporary state; do not reuse them elsewhere.
+
+        Example
+        -------
+        Register to print once every 15 minutes (model time) with 2-decimal precision:
+
+        >>> util.register_begin_iteration([
+        ...   {"method_name": "probe_zone_air_and_supply",
+        ...    "kwargs": {"log_every_minutes": 15, "precision": 2}}
+        ... ])
+        >>> util.run_design_day()  # or util.run_annual()
+
+        Or call directly inside a custom callback:
+
+        >>> snap = util.probe_zone_air_and_supply(util.state, log_every_minutes=None)
+        >>> snap["zones"]["LIVING"]["air"]["Tdb_C"]
         """
+
         ex = self.api.exchange
         if ex.warmup_flag(s):
             return
@@ -5097,21 +5177,210 @@ class EPlusUtil:
 
     def probe_zone_air_and_supply_with_kf(self, s, **opts):
         """
-        Probe + KF/EKF persistence using a pluggable preparer.
+        Probe + persistent Kalman/Extended Kalman filtering over zones, with a **pluggable
+        preparer** for the state/measurement model. This augments the raw snapshot from
+        `probe_zone_air_and_supply(...)` with a per-zone EKF update and **persists** both
+        measurements and estimates to SQLite.
 
-        Measurement policy (generic):
-        - Forward-fill outdoor and zone measurements; default 0.0 at start.
-        - Zone w fallback: payload w → Zone Mean Air Humidity Ratio → w(T,RH,P_site)
+        High-level flow
+        ---------------
+        1) Calls `probe_zone_air_and_supply(s, **probe_kwargs)` to get a fast snapshot:
+        outdoor (T, w, CO₂) and, per zone, air + supply aggregates.
+        2) Applies a **measurement policy** (forward-fill and fallbacks) to produce a clean
+        3-vector `y = [T, w, CO2]` for each zone, together with simple regressors
+        describing supply/outdoor deltas.
+        3) Delegates to a **preparer** (configurable) that maps `(y, mu_prev, P_prev, …)`
+        into EKF inputs: `{x_prev, P_prev, f_x, F, H, Q, R, y}`.
+        4) Runs a single EKF update via `self._ekf_update(...)`, stores the posterior per
+        zone, and **writes** a row to SQLite (batched) with y, ŷ, and μ.
 
-        Choose the preparer with:
-        kf_prepare_fn(self?, *, zone, meas, mu_prev, P_prev, Sigma_P, Sigma_R) -> dict for _ekf_update
-        (defaults to self._kf_prepare_inputs_random_walk)
+        Measurement policy & fallbacks
+        ------------------------------
+        • Outdoor & zone readings are **forward-filled**; when first seen, default to 0.  
+        • Zone humidity ratio **w** fallback chain:
+            1) use probe payload's `w` if finite;
+            2) else try *Zone Mean Air Humidity Ratio*;
+            3) else compute from `(T, RH, site P)` using a Tetens-based relation.
+        • Supply aggregates (mass-flow weighted) and outdoor/supply CO₂ are forward-filled.
+        • A single model time step is interpreted as `dt_h = 1/num_time_steps_in_hour`.
 
-        Other opts:
-        kf_sigma_P_diag, kf_sigma_R_diag, kf_init_mu, kf_init_cov_diag,
-        kf_sql_table, kf_zones, kf_exclude_patterns, kf_log,
-        kf_db_filename, kf_batch_size, kf_commit_every_batches,
-        kf_checkpoint_every_commits, kf_journal_mode, kf_synchronous
+        Preparer contract (pluggable model)
+        -----------------------------------
+        Choose the preparer with `opts["kf_prepare_fn"]` (callable). If omitted, defaults to
+        `self._kf_prepare_inputs_zone_energy_model`.
+
+        The preparer is called as either:
+            fn(self, *, zone, meas, mu_prev, P_prev, Sigma_P, Sigma_R) -> dict
+        or (if bound method):
+            fn(*, zone, meas, mu_prev, P_prev, Sigma_P, Sigma_R) -> dict
+
+        It must return a dict for `_ekf_update(...)` with keys:
+            {
+            "x_prev": (n,),               # prior mean (may equal mu_prev)
+            "P_prev": (n,n),              # prior covariance (may equal P_prev)
+            "f_x":   callable or array,   # nonlinear transition f(x) or predicted x_k|k-1
+            "F":     (n,n),               # d f / d x  (Jacobian)
+            "H":     (m,n),               # observation matrix
+            "Q":     (n,n),               # process noise
+            "R":     (m,m),               # measurement noise
+            "y":     (m,)                 # measurement vector (usually [T,w,CO2])
+            }
+
+        Notes on the built-in measurement features
+        ------------------------------------------
+        • The function constructs a simple regressor matrix `phi` based on supply/outdoor deltas
+        and bundles a rich `meas` dict for the preparer:
+            `meas = {"phi", "y", "names": ["T","w","CO2"], "ts", "dt", "msa", "To","wo","co","Tsa","wsa","csa"}`
+        (`msa` = supply mass flow, kg/s)
+        • State dimensionality **n** is determined by your preparer (in practice inferred from
+        `mu_prev` / `mu0` length; defaults below imply n=5).
+
+        Persistence (SQLite)
+        --------------------
+        • Database file: `<out_dir>/<kf_db_filename>` (default: `"eplusout.sql"`).  
+        This function adds a table alongside EnergyPlus tables (safe to co-exist).
+        • Table name: `opts["kf_sql_table"]` (default: `"KalmanEstimates"`).
+        • Base schema (created if absent):
+
+            Timestamp TEXT, Zone TEXT,
+            y_T REAL, y_w REAL, y_c REAL,
+            yhat_T REAL, yhat_w REAL, yhat_c REAL
+
+        On first insert, **state columns** are added dynamically as `mu_0, mu_1, …`.
+        (Optionally set `self._kf_state_col_names = ["Qint","Cth","..."]` beforehand to
+        override column names.)
+        • Batched writes with WAL by default; commits/checkpoints are tunable (see options).
+
+        Parameters
+        ----------
+        s : EnergyPlusState
+            Active runtime state (provided by the callback hook).
+        **opts :
+            The following keys are recognized (others are forwarded to `probe_zone_air_and_supply`):
+
+            Kalman model / noise / priors
+            • `kf_sigma_P_diag`: sequence[float]  
+            Process noise diagonal (default: `[1e-6, 1e-3, 1e-6, 1e-6, 1e-4]`).
+            • `kf_sigma_R_diag`: sequence[float]  
+            Measurement noise diagonal for `[T, w, CO2]` (default: `[0.2**2, (2e-4)**2, 30.0**2]`).
+            • `kf_init_mu`: sequence[float]  
+            Initial mean μ₀ (default: `[0.0, 20.0, 0.0, 0.008, 400.0]`).
+            • `kf_init_cov_diag`: sequence[float]  
+            Initial covariance diag (default: `[1.0, 25.0, 1.0, 1e-3, 1e3]`).
+            • `kf_prepare_fn`: callable  
+            Preparer function/method as described above (default: `_kf_prepare_inputs_zone_energy_model`).
+
+            Zone selection & logging
+            • `kf_zones`: list[str] | None  
+            If provided, restricts filtering/updates to these zones (others ignored).
+            • `kf_exclude_patterns`: tuple[str,...]  
+            Exclude zones containing any of these substrings (default: `("PLENUM",)`).
+            • `kf_log`: bool  
+            Log a concise per-update line (default: True).
+
+            Persistence & performance
+            • `kf_db_filename`: str  
+            SQLite file name (default: `"eplusout.sql"`).
+            • `kf_sql_table`: str  
+            Table name (default: `"KalmanEstimates"`).
+            • `kf_batch_size`: int  
+            Insert batch size for `executemany` (default: 50).
+            • `kf_commit_every_batches`: int  
+            Commit after this many batches (default: 10).
+            • `kf_checkpoint_every_commits`: int  
+            For WAL, checkpoint after this many commits (default: 5).
+            • `kf_journal_mode`: {"WAL","DELETE","TRUNCATE","MEMORY","OFF"} (default: "WAL")
+            • `kf_synchronous`: {"OFF","NORMAL","FULL","EXTRA"} (default: "NORMAL")
+
+            Forwarded to `probe_zone_air_and_supply(...)`
+            • Any keys not listed above (e.g., `log_every_minutes`, `precision`, …) go directly to
+            the underlying probe.
+
+        Returns
+        -------
+        dict | None
+            The **probe payload** (same structure as `probe_zone_air_and_supply`), or `None` during
+            warmup / before handles are ready / if the probe yields nothing. EKF posteriors are stored
+            internally on:
+                • `self.__dict__["_kf_mu"][zone]    → numpy.ndarray (n,)`
+                • `self.__dict__["_kf_Sigma"][zone] → numpy.ndarray (n,n)`
+            and rows are persisted to SQLite as described above.
+
+        Side effects
+        ------------
+        • Maintains per-run caches for forward-fill:
+            `_kf_last_out`, `_kf_last_air[zone]`, `_kf_last_sup[zone]`.  
+        • Opens/creates `<out_dir>/<kf_db_filename>`, creates/extends `kf_sql_table`, and writes
+        batched inserts (with WAL/synchronous pragmas if supported).
+        • Logs a compact line per zone when `kf_log=True`, e.g.:
+            `[kf] 2002-01-01 01:00:00 LIVING | update | yhat_T=21.8 yhat_w=0.00791 yhat_c=420.5 | mu[:5]=[...]`
+
+        Error handling & edge cases
+        ---------------------------
+        • Returns early during EnergyPlus warmup.  
+        • If SQLite fails to open/insert, persistence is disabled for the remainder of the run
+        (probe payload is still returned).  
+        • If no zones pass the selection/filtering, nothing is updated/persisted.  
+        • The default `kf_db_filename="eplusout.sql"` appends a custom table to the EnergyPlus
+        database; to keep KF data separate, set a different filename (e.g., `"kalman.sqlite"`).
+
+        Examples
+        --------
+        1) **Register with defaults** (hourly logging from the probe suppressed, KF logging on):
+            >>> util.register_begin_iteration([
+            ...   {"method_name": "probe_zone_air_and_supply_with_kf",
+            ...    "kwargs": {"log_every_minutes": None, "kf_log": True}}
+            ... ])
+            >>> util.run_annual()
+
+        2) **Restrict to a few zones** and write KF outputs to a separate DB:
+            >>> util.register_begin_iteration([
+            ...   {"method_name": "probe_zone_air_and_supply_with_kf",
+            ...    "kwargs": {
+            ...       "kf_zones": ["LIVING", "KITCHEN"],
+            ...       "kf_db_filename": "kalman.sqlite",
+            ...       "kf_sql_table": "ZoneEKF",
+            ...       "kf_sigma_R_diag": [0.25**2, (3e-4)**2, 20.0**2]
+            ...    }}
+            ... ])
+            >>> util.run_design_day()
+
+        3) **Custom preparer** (e.g., random-walk state with direct mapping):
+            >>> def my_prepare(self, *, zone, meas, mu_prev, P_prev, Sigma_P, Sigma_R):
+            ...     import numpy as np
+            ...     # n = len(mu_prev); m = 3 for [T,w,CO2]
+            ...     n = len(mu_prev)
+            ...     F = np.eye(n)                      # x_k = x_{k-1} + noise
+            ...     H = np.zeros((3, n)); H[:,:3] = np.eye(3)  # observe first 3 states directly
+            ...     Q = Sigma_P
+            ...     R = Sigma_R
+            ...     def f_x(x): return x               # identity transition
+            ...     return dict(
+            ...         x_prev=mu_prev, P_prev=P_prev,
+            ...         f_x=f_x, F=F, H=H, Q=Q, R=R, y=meas["y"]
+            ...     )
+            ...
+            >>> util.register_begin_iteration([
+            ...   {"method_name": "probe_zone_air_and_supply_with_kf",
+            ...    "kwargs": {"kf_prepare_fn": my_prepare, "kf_log": True}}
+            ... ])
+            >>> util.run_annual()
+
+        4) **Query the persisted estimates** (after a run):
+            >>> import sqlite3, pandas as pd, os
+            >>> db = os.path.join(util.out_dir, "kalman.sqlite")  # or "eplusout.sql" if you used the default
+            >>> conn = sqlite3.connect(db)
+            >>> df = pd.read_sql_query("SELECT * FROM ZoneEKF WHERE Zone='LIVING' ORDER BY Timestamp", conn)
+            >>> conn.close()
+            >>> df.head()
+
+        Implementation notes
+        --------------------
+        • Default process/measurement covariances and priors are **reasonable starting points**
+        but should be tuned for your building and sensor quality.  
+        • The EKF step relies on `self._ekf_update(...)`. Your preparer determines the model; the
+        helper defaults here imply a 5-state example (because default μ₀/Σ₀ diagonals are length 5),
+        but nothing in the code constrains you to that size.
         """
         ex = self.api.exchange
         if ex.warmup_flag(s):
