@@ -72,6 +72,16 @@ class EPlusUtil:
         self._runtime_log_enabled: bool = False
         self._runtime_log_func = None
 
+        self.callback_aliases = {
+            "begin":        "callback_begin_system_timestep_before_predictor",
+            "before_hvac":  "callback_after_predictor_before_hvac_managers",
+            "inside_iter":  "callback_inside_system_iteration_loop",
+            "after_hvac":   "callback_end_system_timestep_after_hvac_reporting",
+            "after_zone":   "callback_end_zone_timestep_after_zone_reporting",
+            "after_warmup": "callback_after_new_environment_warmup_complete",
+            "after_get_input": "callback_after_component_get_input",
+        }
+
     def _assert_out_dir_writable(self):
         import os, tempfile, pathlib
         assert self.out_dir, "set_model(...) first."
@@ -113,364 +123,324 @@ class EPlusUtil:
         if self.verbose >= level:
             print(msg)
 
-    # --- register callbacks ----
+    # --- Generi Callback registering hub ---
 
-    # --- unified "begin-iteration" callback registry (with kwargs) ---
-
-    def _init_begin_tick_registry(self):
-        if not hasattr(self, "_begin_tick_enabled"):
-            self._begin_tick_enabled: bool = True
-            self._begin_tick_run_during_warmup: bool = False
-            # names kept for simple listing
-            self._begin_tick_names: list[str] = []
-            # callable + kwargs specs (ordered)
-            self._begin_tick_specs: list[tuple[callable, dict]] = []
-
-    def _begin_tick_dispatcher(self, s):
-        """Master dispatcher at the beginning of each system timestep."""
-        if not getattr(self, "_begin_tick_run_during_warmup", False) and self.api.exchange.warmup_flag(s):
-            return
-        if not getattr(self, "_begin_tick_enabled", True):
-            return
-        # snapshot to avoid mutation issues mid-iteration
-        specs = list(getattr(self, "_begin_tick_specs", []))
-        for func, kw in specs:
-            try:
-                func(s, **kw)
-            except Exception as e:
-                try:
-                    nm = getattr(func, "__name__", "handler")
-                    self._log(1, f"[begin-tick] {nm} failed: {e}")
-                except Exception:
-                    pass
-
-    def _ensure_begin_tick_registered(self):
-        self._init_begin_tick_registry()
-        pair = (self.api.runtime.callback_begin_system_timestep_before_predictor, self._begin_tick_dispatcher)
-        if pair not in self._extra_callbacks:
-            self._extra_callbacks.append(pair)
-        if getattr(self, "state", None):
-            try:
-                self.api.runtime.callback_begin_system_timestep_before_predictor(self.state, self._begin_tick_dispatcher)
-            except Exception:
-                pass
-
-    def register_begin_iteration(self, methods, *, clear: bool = False,
-                                enable: bool = True,
-                                run_during_warmup: bool | None = None):
+    def _init_callback_hub(self):
         """
-        Register handlers to run at the **beginning of each EnergyPlus system timestep**
-        (the “before predictor” phase). Handlers are methods on this class and are
-        invoked as **bound** callables with the signature:
-        `handler(self, state, **kwargs)`.
-
-        Accepted `methods` formats (order matters):
-        • `Sequence[str]` — method names on this instance, e.g.
-            `["occupancy_handler", "co2_set_outdoor_ppm"]`
-        • `Sequence[dict]` — objects with a method name and optional kwargs, e.g.
-            `[{"method_name": "occupancy_handler", "kwargs": {"lam": 25}},
-            {"name": "co2_set_outdoor_ppm", "params": {"value_ppm": 450}}]`
-
-        For convenience, the kwargs key may also be given as `"key_wargs"` (typo accepted)
-        or `"key_kwargs"`; all are treated identically to `"kwargs"`/`"params"`.
-
-        Behavior & ordering rules
-        -------------------------
-        - If `clear=True`, any previously registered handlers are removed before adding new ones.
-        - Handlers are **de-duplicated by method name**; when a name appears multiple times,
-        the **last occurrence wins** (its kwargs are kept).
-        - The resulting order preserves any existing kept handlers, then appends new names
-        in the order provided.
-        - If `enable` is `False`, the registry is kept but **dispatch is disabled** until
-        re-enabled (see `enable_begin_iteration()` / `disable_begin_iteration()`).
-        - By default, handlers **do not run during warmup**. Set `run_during_warmup=True`
-        to allow warmup execution, or `False` to force skip. `None` leaves the current
-        registry setting unchanged.
-
-        Side effects
-        ------------
-        Ensures the underlying EnergyPlus callback
-        (`callback_begin_system_timestep_before_predictor`) is registered on the current
-        state so handlers will be dispatched on the next run.
-
-        Returns
-        -------
-        list[str]
-            The **ordered list of registered method names** after this call.
-
-        Raises
-        ------
-        TypeError
-            If a method spec is not `str` or `dict`, or if provided kwargs are not a `dict`.
-        ValueError
-            If a dict spec is missing a method name or it is empty after stripping.
-        AttributeError
-            If a named method does not exist on this instance or is not callable.
-
-        Examples
-        --------
-        Basic registration with defaults:
-
-        >>> util.register_begin_iteration([
-        ...     "occupancy_handler",
-        ...     {"method_name": "co2_set_outdoor_ppm", "kwargs": {"value_ppm": 450.0, "log_every_minutes": None}},
-        ... ])
-
-        Replace any existing handlers and **do not** run during warmup:
-
-        >>> util.register_begin_iteration(
-        ...     [{"name": "occupancy_handler", "params": {"lam": 30, "min": 10, "max": 40}}],
-        ...     clear=True, run_during_warmup=False
-        ... )
-
-        Keep the current set but temporarily disable dispatch:
-
-        >>> util.register_begin_iteration([], enable=False)   # methods unchanged; dispatcher paused
+        One-time init for the generic callback hub.
+        self._cb_registries: dict keyed by 'hook_key' (str), each value:
+            {
+            'enabled': bool,
+            'run_during_warmup': bool,
+            'names': [str],                # ordered names
+            'specs': [(callable, dict)],   # ordered callables + kwargs
+            'dispatcher': callable,        # closure(state) -> dispatch
+            'runtime_register': callable,  # api.runtime.callback_*
+            'registered_once': bool,       # whether we bound dispatcher already
+            }
         """
-
-        self._init_begin_tick_registry()
-        if clear:
-            self._begin_tick_names = []
-            self._begin_tick_specs = []
-
-        def _extract(method_item):
-            # returns (name: str, func: callable, kwargs: dict)
-            if isinstance(method_item, str):
-                name, kwargs = method_item.strip(), {}
-            elif isinstance(method_item, dict):
-                name = str(method_item.get("method_name") or method_item.get("name") or "").strip()
-                # tolerate 'key_wargs' typo and a few aliases
-                kwargs = (method_item.get("key_wargs")
-                        or method_item.get("kwargs")
-                        or method_item.get("key_kwargs")
-                        or method_item.get("params")
-                        or {})
-                if not isinstance(kwargs, dict):
-                    raise TypeError(f"kwargs for '{name}' must be a dict")
-            else:
-                raise TypeError(f"Unsupported method spec: {method_item!r}")
-
-            if not name:
-                raise ValueError(f"Invalid method name in spec: {method_item!r}")
-
-            func = getattr(self, name, None)
-            if func is None or not callable(func):
-                raise AttributeError(f"No callable '{name}' found on {self.__class__.__name__}")
-            return name, func, dict(kwargs)
-
-        # dedupe by method name (last one wins for kwargs)
-        seen = {nm: (fn, kw) for nm, (fn, kw) in zip(self._begin_tick_names, self._begin_tick_specs)}
-        for item in methods:
-            nm, fn, kw = _extract(item)
-            seen[nm] = (fn, kw)
-
-        # re-materialize ordered lists (preserve prior order, append new names at end)
-        ordered = []
-        for nm in self._begin_tick_names:
-            if nm in seen and nm not in ordered:
-                ordered.append(nm)
-        for item in methods:
-            nm = item if isinstance(item, str) else (item.get("method_name") or item.get("name"))
-            nm = str(nm).strip()
-            if nm and nm not in ordered:
-                ordered.append(nm)
-
-        self._begin_tick_names = ordered
-        self._begin_tick_specs = [seen[nm] for nm in ordered]
-
-        self._begin_tick_enabled = bool(enable)
-        if run_during_warmup is not None:
-            self._begin_tick_run_during_warmup = bool(run_during_warmup)
-
-        self._ensure_begin_tick_registered()
-        return list(self._begin_tick_names)
-
-    def unregister_begin_iteration(self, method_names: Sequence[str] | None = None) -> list[str]:
-        """Remove one/more handlers by name. If None, remove all."""
-        self._init_begin_tick_registry()
-        if method_names is None:
-            self._begin_tick_names, self._begin_tick_specs = [], []
-            return []
-        remove = {str(n).strip() for n in method_names}
-        new_names = [nm for nm in self._begin_tick_names if nm not in remove]
-        self._begin_tick_names = new_names
-        self._begin_tick_specs = [getattr(self, nm) for nm in new_names]  # will be fixed below
-        # rebuild specs from names keeping stored kwargs if available
-        name_to_spec = {nm: spec for nm, spec in zip(self._begin_tick_names, getattr(self, "_begin_tick_specs", []))}
-        specs = []
-        for nm in new_names:
-            fn = getattr(self, nm)
-            kw = name_to_spec.get(nm, (None, {}))[1]
-            specs.append((fn, kw))
-        self._begin_tick_specs = specs
-        return list(self._begin_tick_names)
-
-    def enable_begin_iteration(self):  self._init_begin_tick_registry(); self._begin_tick_enabled = True
-    def disable_begin_iteration(self): self._init_begin_tick_registry(); self._begin_tick_enabled = False
-
-    def list_begin_iteration(self) -> list[dict]:
-        """Return the ordered list of registered handlers at begin iterationwith kwargs."""
-        self._init_begin_tick_registry()
-        out = []
-        for nm, (fn, kw) in zip(self._begin_tick_names, self._begin_tick_specs):
-            out.append({"method_name": nm, "kwargs": dict(kw)})
-        return out
-
-
-    # --- unified "after-HVAC-reporting" callback registry (with kwargs) ---
-
-    def _init_after_hvac_registry(self):
-        if not hasattr(self, "_after_hvac_enabled"):
-            self._after_hvac_enabled: bool = True
-            self._after_hvac_run_during_warmup: bool = False
-            self._after_hvac_names: list[str] = []
-            self._after_hvac_specs: list[tuple[callable, dict]] = []
-
-    def _after_hvac_dispatcher(self, s):
-        """Master dispatcher right AFTER HVAC reporting each system timestep (node data finalized)."""
-        ex = self.api.exchange
-        if not getattr(self, "_after_hvac_run_during_warmup", False) and ex.warmup_flag(s):
-            return
-        if not getattr(self, "_after_hvac_enabled", True):
-            return
-        # snapshot to avoid mutation during iteration
-        specs = list(getattr(self, "_after_hvac_specs", []))
-        for func, kw in specs:
-            try:
-                func(s, **kw)   # NOTE: bound method; signature def method(self, state, **kwargs)
-            except Exception as e:
-                try:
-                    nm = getattr(func, "__name__", "handler")
-                    self._log(1, f"[after-hvac] {nm} failed: {e}")
-                except Exception:
-                    pass
-
-    def _ensure_after_hvac_registered(self):
-        self._init_after_hvac_registry()
+        if not hasattr(self, "_cb_registries"):
+            self._cb_registries = {}
         if not hasattr(self, "_extra_callbacks"):
-            self._extra_callbacks = []
-        pair = (self.api.runtime.callback_end_system_timestep_after_hvac_reporting, self._after_hvac_dispatcher)
+            self._extra_callbacks = []  # used by your class to rebind on reset
+
+    def _resolve_runtime_register(self, hook) -> tuple[str, callable]:
+        """
+        Accepts:
+        - a string alias from callback_aliases
+        - a full api.runtime attribute name (string)
+        - a direct callable (api.runtime.callback_*)
+        Returns (hook_key, runtime_register_callable).
+        """
+        rt = self.api.runtime
+        if callable(hook):
+            # Try to derive a stable key name from the func name
+            key = getattr(hook, "__name__", "custom_callback")
+            return key, hook
+        if not isinstance(hook, str):
+            raise TypeError(f"hook must be a string alias/name or a callable; got {type(hook)}")
+
+        attr = self.callback_aliases.get(hook, hook)  # allow direct attr names too
+        fn = getattr(rt, attr, None)
+        if not callable(fn):
+            raise AttributeError(f"EnergyPlus runtime has no callable '{attr}'")
+        return hook, fn
+
+    def _get_or_init_hook_registry(self, hook) -> tuple[str, dict]:
+        """
+        Ensure a registry for the given hook exists. Create dispatcher lazily.
+        Returns (hook_key, registry_dict).
+        """
+        self._init_callback_hub()
+        hook_key, runtime_register = self._resolve_runtime_register(hook)
+
+        reg = self._cb_registries.get(hook_key)
+        if reg is None:
+            # Create a per-hook dispatcher closure
+            def make_dispatcher(hkey):
+                def _dispatcher(state):
+                    ex = self.api.exchange
+                    cfg = self._cb_registries.get(hkey, {})
+                    if not cfg.get("enabled", True):
+                        return
+                    if (not cfg.get("run_during_warmup", False)) and ex.warmup_flag(state):
+                        return
+                    # snapshot to avoid mutation during iteration
+                    for func, kw in list(cfg.get("specs", [])):
+                        try:
+                            func(state, **kw)
+                        except Exception as e:
+                            try:
+                                nm = getattr(func, "__name__", "handler")
+                                self._log(1, f"[{hkey}] {nm} failed: {e}")
+                            except Exception:
+                                pass
+                return _dispatcher
+
+            disp = make_dispatcher(hook_key)
+            reg = {
+                "enabled": True,
+                "run_during_warmup": False,
+                "names": [],
+                "specs": [],
+                "dispatcher": disp,
+                "runtime_register": runtime_register,
+                "registered_once": False,
+            }
+            self._cb_registries[hook_key] = reg
+        else:
+            # if the caller passed a different runtime_register callable, update it
+            reg["runtime_register"] = runtime_register
+
+        return hook_key, reg
+
+    def _ensure_hook_registered(self, hook):
+        """
+        Bind the dispatcher to the EnergyPlus state for this hook, only once.
+        Also track in _extra_callbacks so a future reset can re-bind automatically.
+        """
+        hook_key, reg = self._get_or_init_hook_registry(hook)
+        # remember the pair so your reset routine can re-register later
+        pair = (reg["runtime_register"], reg["dispatcher"])
         if pair not in self._extra_callbacks:
             self._extra_callbacks.append(pair)
-        if getattr(self, "state", None):
+
+        if getattr(self, "state", None) and not reg.get("registered_once", False):
             try:
-                self.api.runtime.callback_end_system_timestep_after_hvac_reporting(self.state, self._after_hvac_dispatcher)
+                reg["runtime_register"](self.state, reg["dispatcher"])
+                reg["registered_once"] = True
             except Exception:
                 pass
 
-    def register_after_hvac_reporting(self, methods, *, clear: bool = False,
-                                    enable: bool = True,
-                                    run_during_warmup: bool | None = None) -> list[str]:
+    # --- public generic API ---
+    def register_handlers(self, hook, methods, *, clear: bool = False,
+                        enable: bool = True, run_during_warmup: bool | None = None) -> list[str]:
         """
-        Register handlers to run **after HVAC reporting** at each system timestep
-        (i.e., right after node data are finalized). Handlers must be methods on
-        this class and are invoked as **bound** callables with the signature:
-        `handler(self, state, **kwargs)`.
+        Register one or more **bound instance methods** to run at a specific
+        EnergyPlus runtime **callback hook** (e.g., *begin system timestep*,
+        *before HVAC managers*, *after HVAC reporting*, etc.).
 
-        Accepted `methods` formats (order matters):
-        • `Sequence[str]` — method names on this instance, e.g.
-            `["probe_zone_air_and_supply", "my_logger"]`
-        • `Sequence[dict]` — objects with a method name and optional kwargs, e.g.
-            `[{"method_name": "probe_zone_air_and_supply", "kwargs": {"log_every_minutes": 5}},
-            {"name": "my_logger", "params": {"level": "debug"}}]`
+        This API lets you compose a **runtime control loop** in pure Python:
+        you choose *when* your code runs (the hook) and *what* runs (a list of
+        instance methods, each with optional kwargs). Under the hood, a single
+        dispatcher is attached to the EnergyPlus callback and invokes your
+        methods in-order every time that hook fires.
 
-        Notes on kwargs keys:
-        You may use `"kwargs"`, `"params"`, `"key_kwargs"`, or even the tolerated typo
-        `"key_wargs"`—they are all treated equivalently.
+        Parameters
+        ----------
+        hook : str | callable
+            Where to attach the dispatcher. Accepts:
+            - **Alias string** (recommended):
 
-        Behavior & ordering rules
-        -------------------------
-        - If `clear=True`, previously registered handlers are removed before adding new ones.
-        - Handlers are **de-duplicated by method name**; the **last occurrence wins** (its
-        kwargs override prior ones).
-        - Final order preserves surviving existing handlers, then appends any new names in
-        the order provided.
-        - If `enable` is `False`, the registry is kept but **dispatch is disabled** until
-        re-enabled (see `enable_after_hvac_reporting()` / `disable_after_hvac_reporting()`).
-        - Warmup behavior: by default, handlers **do not run during warmup**. Pass
-        `run_during_warmup=True` to enable, `False` to force-disable, or `None` to leave
-        the existing setting unchanged.
+            ========  ==============================================
+            alias     EnergyPlus runtime callback attribute
+            --------  ----------------------------------------------
+            "begin"   callback_begin_system_timestep_before_predictor
+            "before_hvac"
+                        callback_after_predictor_before_hvac_managers
+            "inside_iter"
+                        callback_inside_system_iteration_loop
+            "after_hvac"
+                        callback_end_system_timestep_after_hvac_reporting
+            "after_zone"
+                        callback_end_zone_timestep_after_zone_reporting
+            "after_warmup"
+                        callback_after_new_environment_warmup_complete
+            "after_get_input"
+                        callback_after_component_get_input
+            ========  ==============================================
 
-        Side effects
-        ------------
-        Ensures the underlying EnergyPlus callback
-        (`callback_end_system_timestep_after_hvac_reporting`) is registered on the current
-        state so handlers will be dispatched on the next run.
+            - **Full attribute name** as a string, e.g.
+            ``"callback_after_predictor_before_hvac_managers"``.
+            - **The registration callable itself**, e.g.
+            ``api.runtime.callback_inside_system_iteration_loop``.
+        methods : Sequence[str | dict]
+            Handler specs. Each handler must be a **method on this instance**
+            and is invoked as: ``method(self, state, **kwargs)``.
+
+            Acceptable forms (order matters):
+            - ``"method_name"``                       → no kwargs
+            - ``{"method_name": "...", "kwargs": {...}}``
+
+            For convenience, the kwargs key also accepts:
+            ``"params"``, ``"key_kwargs"``, or even the misspelling
+            ``"key_wargs"`` (all treated the same).
+        clear : bool, default False
+            If True, **drop any previously registered handlers for this hook**
+            before adding the new set.
+        enable : bool, default True
+            If False, keep the registry but **pause dispatch** for this hook
+            (handlers remain registered and can be re-enabled later).
+        run_during_warmup : bool | None, default None
+            Warmup dispatch policy for this hook:
+            - True  → run handlers **during warmup**;
+            - False → **skip during warmup**;
+            - None  → leave the current setting unchanged.
 
         Returns
         -------
         list[str]
-            The **ordered list of registered method names** after this call.
+            The **ordered list of registered method names** for this hook
+            *after* the update.
+
+        Behavior & Ordering
+        -------------------
+        - Handlers are **de-duplicated by method name**; if the same method
+        appears multiple times, the **last occurrence wins** (its kwargs
+        are kept).
+        - Final order preserves any **existing kept** handlers, then appends
+        **new names in the order provided**.
+        - A single dispatcher is attached to the chosen runtime hook; later
+        calls only update the internal registry and flags.
+        - The dispatcher checks the EnergyPlus warmup flag each tick and
+        abides by ``run_during_warmup`` for this hook.
+
+        Side Effects
+        ------------
+        - Ensures the underlying EnergyPlus callback is **registered on the
+        current state** so the dispatcher will fire in the next run.
+        - If your workflow replaces the E+ state (e.g., via ``reset_state``),
+        this class re-applies all previously attached dispatchers.
 
         Raises
         ------
         TypeError
-            If a method spec is not `str` or `dict`, or if provided kwargs are not a `dict`.
+            If a handler spec is not ``str`` or ``dict``, if kwargs is not a
+            ``dict``, or if ``hook`` is neither a string nor a callable.
         ValueError
-            If a dict spec lacks a method name or it is empty after stripping.
+            If a dict spec is missing a method name or it is empty/blank.
         AttributeError
-            If a named method does not exist on this instance or is not callable.
+            - If a named method does not exist on this instance or is not callable.
+            - If a string hook cannot be resolved to a valid runtime callback.
 
         Examples
         --------
-        Register a probe and a logger with custom parameters:
+        Basic: run two methods at the **beginning of each system timestep**:
 
-        >>> util.register_after_hvac_reporting([
-        ...     {"method_name": "probe_zone_air_and_supply", "kwargs": {"log_every_minutes": 1, "precision": 2}},
-        ...     {"name": "my_logger", "params": {"tag": "after-hvac"}}
-        ... ])
-
-        Replace any existing handlers and keep them from running during warmup:
-
-        >>> util.register_after_hvac_reporting(
-        ...     ["probe_zone_air_and_supply"],
-        ...     clear=True, run_during_warmup=False
+        >>> util.register_handlers(
+        ...     "begin",
+        ...     [
+        ...         "occupancy_handler",
+        ...         {"method_name": "co2_set_outdoor_ppm",
+        ...          "kwargs": {"value_ppm": 450.0, "log_every_minutes": None}}
+        ...     ],
+        ...     run_during_warmup=False
         ... )
 
-        Keep the current set but pause dispatch:
+        Use a **full attribute name** for the hook:
 
-        >>> util.register_after_hvac_reporting([], enable=False)  # handlers unchanged; dispatcher paused
+        >>> util.register_handlers(
+        ...     "callback_end_system_timestep_after_hvac_reporting",
+        ...     ["probe_zone_air_and_supply"]
+        ... )
+
+        Pass the **registration callable** directly (no strings involved):
+
+        >>> util.register_handlers(
+        ...     util.api.runtime.callback_inside_system_iteration_loop,
+        ...     [{"method_name": "my_iterative_controller", "params": {"gain": 0.2}}]
+        ... )
+
+        Temporarily **pause** a hook without changing its handlers:
+
+        >>> util.register_handlers("begin", [], enable=False)
+
+        Replace existing handlers and **update kwargs** (de-dup by name, last wins):
+
+        >>> util.register_handlers(
+        ...     "after_hvac",
+        ...     [
+        ...         {"method_name": "probe_zone_air_and_supply_with_kf",
+        ...          "kwargs": {"kf_db_filename": "kf.sqlite", "kf_batch_size": 100}},
+        ...         {"method_name": "probe_zone_air_and_supply_with_kf",
+        ...          "kwargs": {"kf_db_filename": "kf_big.sqlite", "kf_batch_size": 250}}
+        ...     ],
+        ...     clear=True
+        ... )
+        # → only one entry remains for 'probe_zone_air_and_supply_with_kf' with batch_size=250
+
+        Practical pattern: **controls early, analytics late**:
+
+        >>> util.register_handlers(
+        ...     "begin",
+        ...     [{"method_name": "zone_pid_controller",
+        ...       "kwargs": {"setpoint_C": 22.0, "humidity_w": 0.008}}],
+        ...     clear=True
+        ... )
+        >>> util.register_handlers(
+        ...     "after_hvac",
+        ...     [{"method_name": "probe_zone_air_and_supply_with_kf",
+        ...       "kwargs": {"kf_db_filename": "eplusout_kf.sqlite"}}],
+        ...     clear=True
+        ... )
+
+        Notes
+        -----
+        - Handler signature is **``handler(self, state, **kwargs)``**. If your
+        logic requires resolved API handles, consider waiting for
+        ``exchange.api_data_fully_ready(state)`` or registering at
+        ``"after_get_input"`` / ``"after_warmup"`` to initialize and cache them.
+        - Keep handlers **fast and non-blocking**—they execute in the simulation
+        loop at every hook invocation.
         """
+        hook_key, reg = self._get_or_init_hook_registry(hook)
 
-
-        self._init_after_hvac_registry()
         if clear:
-            self._after_hvac_names = []
-            self._after_hvac_specs = []
+            reg["names"].clear()
+            reg["specs"].clear()
 
-        def _extract(method_item):
-            # returns (name: str, func: callable, kwargs: dict)
-            if isinstance(method_item, str):
-                name, kwargs = method_item.strip(), {}
-            elif isinstance(method_item, dict):
-                name = str(method_item.get("method_name") or method_item.get("name") or "").strip()
-                kwargs = (method_item.get("key_wargs")
-                        or method_item.get("kwargs")
-                        or method_item.get("key_kwargs")
-                        or method_item.get("params")
+        def _extract(item):
+            if isinstance(item, str):
+                name, kwargs = item.strip(), {}
+            elif isinstance(item, dict):
+                name = str(item.get("method_name") or item.get("name") or "").strip()
+                kwargs = (item.get("key_wargs")
+                        or item.get("kwargs")
+                        or item.get("key_kwargs")
+                        or item.get("params")
                         or {})
                 if not isinstance(kwargs, dict):
                     raise TypeError(f"kwargs for '{name}' must be a dict")
             else:
-                raise TypeError(f"Unsupported method spec: {method_item!r}")
+                raise TypeError(f"Unsupported method spec: {item!r}")
 
             if not name:
-                raise ValueError(f"Invalid method name in spec: {method_item!r}")
+                raise ValueError(f"Invalid method name in spec: {item!r}")
 
             func = getattr(self, name, None)
             if func is None or not callable(func):
                 raise AttributeError(f"No callable '{name}' found on {self.__class__.__name__}")
             return name, func, dict(kwargs)
 
-        # de-dupe by method name (last wins)
-        seen = {nm: (fn, kw) for nm, (fn, kw) in zip(self._after_hvac_names, self._after_hvac_specs)}
+        # dedupe (last wins)
+        seen = {nm: (fn, kw) for nm, (fn, kw) in zip(reg["names"], reg["specs"])}
         for item in methods:
             nm, fn, kw = _extract(item)
             seen[nm] = (fn, kw)
 
-        # rebuild ordered list: keep existing order, then append any new ones
+        # ordered names: keep existing order for kept names, then append new
         ordered = []
-        for nm in self._after_hvac_names:
+        for nm in reg["names"]:
             if nm in seen and nm not in ordered:
                 ordered.append(nm)
         for item in methods:
@@ -479,42 +449,223 @@ class EPlusUtil:
             if nm and nm not in ordered:
                 ordered.append(nm)
 
-        self._after_hvac_names = ordered
-        self._after_hvac_specs = [seen[nm] for nm in ordered]
+        reg["names"] = ordered
+        reg["specs"] = [seen[nm] for nm in ordered]
 
-        self._after_hvac_enabled = bool(enable)
+        reg["enabled"] = bool(enable)
         if run_during_warmup is not None:
-            self._after_hvac_run_during_warmup = bool(run_during_warmup)
+            reg["run_during_warmup"] = bool(run_during_warmup)
 
-        self._ensure_after_hvac_registered()
-        return list(self._after_hvac_names)
+        self._ensure_hook_registered(hook_key)
+        return list(reg["names"])
 
-    def unregister_after_hvac_reporting(self, method_names: list[str] | None = None) -> list[str]:
-        """Remove one/more handlers by name. If None, remove all."""
-        self._init_after_hvac_registry()
-        if method_names is None:
-            self._after_hvac_names, self._after_hvac_specs = [], []
-            return []
-        remove = {str(n).strip() for n in method_names}
-        # map current -> specs to preserve kwargs
-        current = {nm: spec for nm, spec in zip(self._after_hvac_names, self._after_hvac_specs)}
-        new_names = [nm for nm in self._after_hvac_names if nm not in remove]
-        self._after_hvac_names = new_names
-        self._after_hvac_specs = [current[nm] for nm in new_names]
-        return list(self._after_hvac_names)
+    def list_handlers(self, hook) -> list[str]:
+        """
+        Return the **ordered list of method names** registered for a given
+        EnergyPlus runtime hook.
 
-    def enable_after_hvac_reporting(self):  self._init_after_hvac_registry(); self._after_hvac_enabled = True
-    def disable_after_hvac_reporting(self): self._init_after_hvac_registry(); self._after_hvac_enabled = False
+        Parameters
+        ----------
+        hook : str | callable
+            The hook to inspect. Accepts the same identifiers as
+            `register_handlers`:
+            - Alias: "begin", "before_hvac", "inside_iter", "after_hvac",
+            "after_zone", "after_warmup", "after_get_input"
+            - Full runtime callback attribute name (str), e.g.
+            "callback_end_system_timestep_after_hvac_reporting"
+            - The registration callable itself, e.g.
+            `api.runtime.callback_begin_system_timestep_before_predictor`
 
-    def list_after_hvac_reporting(self) -> list[dict]:
-        """Return the ordered list of registered handlers with kwargs."""
-        self._init_after_hvac_registry()
-        out = []
-        for nm, (fn, kw) in zip(self._after_hvac_names, self._after_hvac_specs):
-            out.append({"method_name": nm, "kwargs": dict(kw)})
-        return out
+        Returns
+        -------
+        list[str]
+            The handlers registered **for that hook**, in dispatch order.
 
-    # ---------- common SQL helpers ----------
+        Examples
+        --------
+        >>> util.list_handlers("begin")
+        ['occupancy_handler', 'co2_set_outdoor_ppm']
+
+        >>> util.list_handlers("callback_end_system_timestep_after_hvac_reporting")
+        ['probe_zone_air_and_supply_with_kf']
+
+        >>> util.list_handlers(util.api.runtime.callback_inside_system_iteration_loop)
+        ['zone_pid_controller']
+        """
+        hook_key, reg = self._get_or_init_hook_registry(hook)
+        return list(reg["names"])
+
+    def unregister_handlers(self, hook, names: list[str]) -> list[str]:
+        """
+        Unregister (by name) one or more handlers for a given EnergyPlus runtime hook.
+
+        This removes matching method names from the internal registry for `hook`
+        but does **not** detach the underlying EnergyPlus callback itself; any
+        remaining handlers for that hook will still be dispatched.
+
+        Parameters
+        ----------
+        hook : str | callable
+            The hook to modify. Accepts the same identifiers as `register_handlers`:
+            - Alias: "begin", "before_hvac", "inside_iter", "after_hvac",
+            "after_zone", "after_warmup", "after_get_input"
+            - Full runtime attribute name (str), e.g.
+            "callback_end_system_timestep_after_hvac_reporting"
+            - The registration callable itself, e.g.
+            `api.runtime.callback_begin_system_timestep_before_predictor`
+        names : list[str]
+            Method names to remove (e.g., ["co2_set_outdoor_ppm", "occupancy_handler"]).
+            Names that are not currently registered are ignored.
+
+        Returns
+        -------
+        list[str]
+            The **remaining handlers** registered for this hook, in dispatch order.
+
+        Notes
+        -----
+        - Matching is done by **method name** (string equality).
+        - If a handler name appeared multiple times (should not under normal use),
+        **all occurrences** will be removed.
+        - Passing an empty list leaves the registry unchanged.
+
+        Examples
+        --------
+        Remove a single handler from the "begin" (before predictor) hook:
+
+        >>> util.unregister_handlers("begin", ["co2_set_outdoor_ppm"])
+        ['occupancy_handler', 'probe_zone_air_and_supply_with_kf']
+
+        Remove two handlers using the explicit runtime attribute name:
+
+        >>> util.unregister_handlers(
+        ...     "callback_end_system_timestep_after_hvac_reporting",
+        ...     ["probe_zone_air_and_supply_with_kf", "my_logger"]
+        ... )
+        []
+
+        Use the registration callable directly:
+
+        >>> util.unregister_handlers(util.api.runtime.callback_inside_system_iteration_loop,
+        ...                          ["zone_pid_controller"])
+        []
+        """
+        hook_key, reg = self._get_or_init_hook_registry(hook)
+        keep = [(nm, spec) for nm, spec in zip(reg["names"], reg["specs"]) if nm not in set(names)]
+        reg["names"] = [nm for nm, _ in keep]
+        reg["specs"] = [sp for _, sp in keep]
+        return list(reg["names"])
+
+    def enable_hook(self, hook):
+        """
+        Enable dispatch for a specific EnergyPlus runtime hook without altering the
+        registered handlers.
+
+        This flips the per-hook "enabled" flag to **True** so that, on the next
+        simulation step where EnergyPlus invokes that hook, the currently
+        registered handlers (if any) will be dispatched. It does **not** add,
+        remove, or re-order handlers, and it does **not** attach the underlying
+        EnergyPlus callback if it was never registered.
+
+        Parameters
+        ----------
+        hook : str | callable
+            Identifies the hook to enable. Accepts the same forms as `register_handlers`:
+            - Alias string: "begin", "before_hvac", "inside_iter", "after_hvac",
+            "after_zone", "after_warmup", "after_get_input"
+            - Full runtime attribute name (str), e.g.
+            "callback_begin_system_timestep_before_predictor"
+            - The registration callable itself, e.g.
+            `api.runtime.callback_begin_system_timestep_before_predictor`
+
+        Notes
+        -----
+        - If the hook’s EnergyPlus callback has **never** been attached to the
+        current `state`, enabling here won’t attach it. Use `register_handlers(...)`
+        at least once for that hook to ensure the callback is bound.
+        - This does not change the hook’s **warmup** policy. If the hook is set to
+        skip warmup (default), enabling it will still skip dispatch during warmup.
+
+        Returns
+        -------
+        None
+
+        Examples
+        --------
+        Enable the “before predictor” (begin system timestep) hook by alias:
+
+        >>> util.enable_hook("begin")
+
+        Enable by passing the runtime registration function:
+
+        >>> util.enable_hook(util.api.runtime.callback_begin_system_timestep_before_predictor)
+        """
+        _, reg = self._get_or_init_hook_registry(hook)
+        reg["enabled"] = True
+
+    def disable_hook(self, hook):
+        """
+        Disable dispatch for a specific EnergyPlus runtime hook without changing
+        which handlers are registered.
+
+        This flips the per-hook "enabled" flag to **False** so that, even if the
+        underlying EnergyPlus callback fires, the utility’s dispatcher will **skip**
+        invoking your handlers for that hook. It does **not** add, remove, or
+        re-order handlers, and it does **not** detach the underlying EnergyPlus
+        callback from the current state.
+
+        Parameters
+        ----------
+        hook : str | callable
+            Identifies the hook to disable. Accepts the same forms as `register_handlers`:
+            - Alias string: "begin", "before_hvac", "inside_iter", "after_hvac",
+            "after_zone", "after_warmup", "after_get_input"
+            - Full runtime attribute name (string), e.g.
+            "callback_begin_system_timestep_before_predictor"
+            - The registration callable itself, e.g.
+            `api.runtime.callback_inside_system_iteration_loop`
+
+        Notes
+        -----
+        - Disabling a hook keeps its handlers in the registry. Use
+        `unregister_handlers(hook, [...])` or `register_handlers(hook, [], clear=True)`
+        if you want to actually remove them.
+        - Disabling does not affect the hook’s **warmup** policy. If you need to change
+        whether handlers run during warmup, call `register_handlers(...)` with the
+        `run_during_warmup` argument.
+        - To re-enable dispatch, call `enable_hook(hook)`.
+
+        Returns
+        -------
+        None
+
+        Examples
+        --------
+        Temporarily pause “begin system timestep (before predictor)” dispatch:
+
+        >>> util.disable_hook("begin")
+        >>> util.run_design_day()  # handlers for "begin" will not run
+        >>> util.enable_hook("begin")  # resume dispatch later
+
+        Disable by passing the runtime registration function:
+
+        >>> util.disable_hook(util.api.runtime.callback_inside_system_iteration_loop)
+        """
+        _, reg = self._get_or_init_hook_registry(hook)
+        reg["enabled"] = False
+
+    # --- back-compat thin shims (optional) ---
+    def register_begin_iteration(self, methods, **kw):
+        """Back-compat wrapper: runs at the beginning of each system timestep (before predictor)."""
+        return self.register_handlers("begin", methods, **kw)
+
+    def register_after_hvac_reporting(self, methods, **kw):
+        """Back-compat wrapper: runs after HVAC reporting each system timestep."""
+        return self.register_handlers("after_hvac", methods, **kw)    
+
+
+   # ---------- common SQL helpers ----------
+
     def _sql_minute_col(self, conn) -> str:
         """Detect the minute column name in the Time table ('Minute' vs 'Minutes')."""
         try:
@@ -979,999 +1130,276 @@ class EPlusUtil:
         self._co2_per_zone_schedules = {}  # numeric approach
         return str(out_path)
 
-    # ---------- catalog/RDD helpers ----------
-    @staticmethod
-    def _parse_sectioned_catalog(raw) -> Dict[str, List[List[str]]]:
-        text = raw.decode("utf-8", errors="ignore") if isinstance(raw, (bytes, bytearray)) else raw
-        rows = list(_csv.reader(io.StringIO(text)))
-        sections, cur = {}, None
-        for r in rows:
-            if not r: continue
-            left = (r[0] or "").strip()
-            right = r[1] if len(r) > 1 else ""
-            if left.startswith("**") and left.endswith("**"):
-                cur = left.strip("* ").upper()
-                sections.setdefault(cur, [])
-                continue
-            if cur and right:
-                try:
-                    fields = ast.literal_eval(str(right))
-                    if not isinstance(fields, (list, tuple)):
-                        fields = [str(right)]
-                except Exception:
-                    fields = [str(right)]
-                sections[cur].append(list(fields))
-        return sections
+    # ---------- catalog ----------
 
-    def _variables_from_catalog(self, state, *, discover_zone_keys=True,
-                                discover_environment_keys=True, verify_handles=True) -> List[Dict]:
-        secs = self._parse_sectioned_catalog(self.api.exchange.list_available_api_data_csv(state))
-        base = []
-        for f in secs.get("VARIABLES", []):
-            name  = (f[0] if len(f) > 0 else "").strip()
-            key   = (f[1] if len(f) > 1 else "").strip()
-            units = (f[2] if len(f) > 2 else "").strip()
-            desc  = (f[3] if len(f) > 3 else "").strip()
-            if name:
-                base.append({"name": name, "key": key, "units": units, "desc": desc, "handle": -1})
-
-        if not base:
-            return []
-
-        out = []
-        for row in base:
-            h = -1
-            if verify_handles and row["key"]:
-                h = self.api.exchange.get_variable_handle(state, row["name"], row["key"])
-            row["handle"] = h
-            if (not verify_handles) or (h != -1) or (row["key"] == ""):
-                row["source"] = "api"
-                out.append(row)
-
-        if discover_zone_keys:
-            zones = self.api.exchange.get_object_names(state, "Zone") or []
-            zoneish = [r for r in base if "zone" in r["name"].lower()]
-            for r in zoneish:
-                for z in zones:
-                    h = self.api.exchange.get_variable_handle(state, r["name"], z)
-                    if h != -1:
-                        out.append({"name": r["name"], "key": z, "units": r["units"],
-                                    "desc": r["desc"], "handle": h, "source": "api"})
-
-        if discover_environment_keys:
-            envish = [r for r in base if any(tok in r["name"].lower() for tok in ("site", "weather", "outdoor"))]
-            for r in envish:
-                h = self.api.exchange.get_variable_handle(state, r["name"], "Environment")
-                if h != -1:
-                    out.append({"name": r["name"], "key": "Environment", "units": r["units"],
-                                "desc": r["desc"], "handle": h, "source": "api"})
-
-        seen, dedup = set(), []
-        for r in out:
-            k = (r["name"], r["key"])
-            if k in seen:
-                continue
-            seen.add(k)
-            dedup.append(r)
-        return dedup
-
-    def _parse_units_label(self, s: str) -> tuple[str, str]:
-        """Split 'Some Name [kWh]' -> ('Some Name', 'kWh'); tolerates missing units."""
-        s = (s or "").strip()
-        if not s:
-            return "", ""
-        lb = s.rfind('[')
-        rb = s.rfind(']')
-        if lb != -1 and rb != -1 and rb > lb:
-            return s[:lb].strip(), s[lb+1:rb].strip()
-        return s, ""
-
-    def _variables_from_rdd(self, dir_path: str) -> list[dict]:
+    def api_catalog_df(self, *, save_csv: bool = False) -> dict[str, "pd.DataFrame"]:
         """
-        Parse variables from eplusout.rdd.
+        Discover **runtime API–exposed catalogs** from EnergyPlus and return them as
+        pandas DataFrames, grouped by section.
 
-        Supports BOTH:
-        A) Newer 3-column style (no frequency, no key):
-        VarType, VarReportType, Variable Name [Units]
-        e.g. "Zone,Average,Zone People Convective Heating Energy [J]"
+        Under the hood this wraps:
+            self.api.exchange.list_available_api_data_csv(self.state)
 
-        B) Legacy dictionary-like styles with frequency tokens:
-        <Key>, <Name [Units]>, <Frequency>
-        <ObjType>, <Key>, <Name [Units]>, <Frequency>
+        What you get
+        ------------
+        A dict mapping **section name → DataFrame**, for *all* sections present in
+        the current model / E+ build. Typical keys you may see:
+        - "ACTUATORS"
+        - "INTERNAL_VARIABLES"
+        - "PLUGIN_GLOBAL_VARIABLES"
+        - "TRENDS"
+        - "METERS"
+        - "VARIABLES"
 
-        Returns rows with fields:
-        kind='var', name, key='', freq='', units, desc=VarReportType (if present), handle=-1, source='rdd'
-        """
-        import os, re, pathlib
-
-        rdd_path = os.path.join(dir_path, "eplusout.rdd")
-        if not os.path.exists(rdd_path):
-            return []
-
-        text = pathlib.Path(rdd_path).read_text(errors="ignore")
-
-        # Normalize + filter lines
-        lines = []
-        for ln in text.splitlines():
-            ln = ln.strip()
-            if not ln or ln.startswith('!'):
-                continue
-            if ln.endswith(';'):
-                ln = ln[:-1].rstrip()
-            # Skip header-ish lines
-            if ln.startswith("Program Version") or "Var Type" in ln and "Variable Name" in ln:
-                continue
-            lines.append(ln)
-
-        # Frequency tokens used in older formats; if present → legacy branch
-        freq_tokens = {
-            'DETAILED','TIMESTEP','ZONE TIMESTEP','ZONETIMESTEP','SYSTEM TIMESTEP',
-            'SYSTEMTIMESTEP','HOURLY','DAILY','MONTHLY','RUNPERIOD','RUN PERIOD'
-        }
-
-        def _split_units(label: str) -> tuple[str, str]:
-            s = (label or "").strip()
-            lb = s.rfind('['); rb = s.rfind(']')
-            if lb != -1 and rb != -1 and rb > lb:
-                return s[:lb].strip(), s[lb+1:rb].strip()
-            return s, ""
-
-        rows, seen = [], set()
-
-        for ln in lines:
-            parts = [p.strip() for p in ln.split(',')]
-
-            # --- Legacy: last token is a known frequency ---
-            if len(parts) >= 3 and parts[-1].upper().replace('_', ' ') in freq_tokens:
-                freq = parts[-1].strip()
-                label = parts[-2].strip()
-                # key is token before label; works for 3- or 4-field legacy lines
-                key = parts[-3].strip() if len(parts) >= 3 else ""
-                name, units = _split_units(label)
-                if not name:
-                    continue
-                sig = ("legacy", name, key, freq)
-                if sig in seen:
-                    continue
-                seen.add(sig)
-                rows.append({
-                    "kind": "var",
-                    "name": name,
-                    "key": key,
-                    "freq": freq,
-                    "units": units,
-                    "desc": "",          # legacy lines don’t carry VarReportType
-                    "handle": -1,
-                    "source": "rdd",
-                })
-                continue
-
-            # --- New: 3-column "VarType, VarReportType, Name [Units]" ---
-            if len(parts) >= 3:
-                var_type = parts[0]            # e.g., "Zone", "Site", ...
-                report_type = parts[1]         # "Average", "Sum", "Minimum", ...
-                # Variable name may contain commas in rare cases → join the rest back
-                label = ",".join(parts[2:]).strip()
-                name, units = _split_units(label)
-                if not name:
-                    continue
-                sig = ("new", name, report_type)
-                if sig in seen:
-                    continue
-                seen.add(sig)
-                rows.append({
-                    "kind": "var",
-                    "name": name,
-                    "key": "",                  # RDD new style does not list keys
-                    "freq": "",                 # RDD does not encode reporting frequency
-                    "units": units,
-                    "desc": report_type,        # keep the Var Report Type for reference
-                    "handle": -1,
-                    "source": "rdd",
-                })
-                continue
-
-            # Otherwise: ignore unrecognized line
-            continue
-
-        return rows
-
-    def _meters_from_dictionary(self, dir_path: str) -> list[dict]:
-        """
-        Parse meters from eplusout.mdd if present; otherwise, parse category/stat style
-        lines directly from eplusout.rdd (e.g., 'HVAC, Sum, Meter Name [hr]').
-        """
-        import os, re, pathlib
-        rows, seen = [], set()
-
-        # 1) Prefer .mdd if it exists
-        mdd_path = os.path.join(dir_path, "eplusout.mdd")
-        if os.path.exists(mdd_path):
-            text = pathlib.Path(mdd_path).read_text(errors="ignore")
-            # Pattern: "Category, <Stat>, <Name [Units]>"
-            rx = re.compile(r'(?im)^\s*(?P<cat>[^,;\n]+)\s*,\s*(?P<stat>[^,;\n]+)\s*,\s*(?P<label>[^\n]+?)\s*$')
-            for m in rx.finditer(text):
-                cat = (m.group("cat") or "").strip()
-                stat = (m.group("stat") or "").strip()
-                label = (m.group("label") or "").strip()
-                nm, units = self._parse_units_label(label)
-                # Require units to reduce accidental captures
-                if not nm or not units:
-                    continue
-                sig = (nm, units, cat, stat)
-                if sig in seen:
-                    continue
-                seen.add(sig)
-                rows.append({
-                    "kind": "meter",
-                    "name": nm,
-                    "key": cat,      # store category (HVAC, InteriorLights, etc.)
-                    "freq": "",      # meters don't have a fixed freq in dict
-                    "units": units,
-                    "desc": stat,    # Sum, Average, etc.
-                    "handle": -1,
-                    "source": "mdd",
-                })
-
-        # 2) Also scan .rdd for the same pattern (some builds print meters there)
-        rdd_path = os.path.join(dir_path, "eplusout.rdd")
-        if os.path.exists(rdd_path):
-            text = pathlib.Path(rdd_path).read_text(errors="ignore")
-            rx = re.compile(r'(?im)^\s*(?P<cat>[^,;\n]+)\s*,\s*(?P<stat>[^,;\n]+)\s*,\s*(?P<label>[^\n]+?)\s*$')
-
-            # 1) Tokens that clearly denote variable "VarType" rows → exclude as meters
-            var_type_tokens = {
-                "ZONE","SITE","SYSTEM","PLANT","NODE","SURFACE","SPACE","PEOPLE","ENVIRONMENT",
-                "AIRLOOP","AIR LOOP","BRANCH","OUTDOORAIR","OUTDOOR AIR","COIL","FAN","PUMP"
-            }
-            # 2) Variable-name prefixes to exclude (avoid classifying them as meters)
-            var_name_prefixes = (
-                "Site ", "Zone ", "Space ", "People ", "System ", "Surface ", "Zone HVAC ", "System Node "
-            )
-
-            freq_tokens = {"DETAILED","TIMESTEP","ZONE TIMESTEP","SYSTEM TIMESTEP","HOURLY","DAILY","MONTHLY","RUNPERIOD","RUN PERIOD"}
-
-            for m in rx.finditer(text):
-                cat = (m.group("cat") or "").strip()
-                stat = (m.group("stat") or "").strip()
-                label = (m.group("label") or "").strip()
-
-                # skip if this looks like a variable row (new 3-col RDD)
-                if cat.upper() in var_type_tokens:
-                    continue
-                if any(label.startswith(pfx) for pfx in var_name_prefixes):
-                    continue
-
-                # Skip if the tail token looks like a variable frequency (legacy)
-                tail = label.split(",")[-1].strip().upper()
-                if tail in freq_tokens:
-                    continue
-
-                nm, units = self._parse_units_label(label)
-                if not nm or not units:
-                    continue
-                sig = (nm, units, cat, stat)
-                if sig in seen:
-                    continue
-                seen.add(sig)
-                rows.append({
-                    "kind": "meter",
-                    "name": nm,
-                    "key": cat,
-                    "freq": "",
-                    "units": units,
-                    "desc": stat,
-                    "handle": -1,
-                    "source": "rdd",
-                })
-        return rows
-
-    def _collect_dictionary_from_dir(self, dir_path: str, want: set[str]) -> list[dict]:
-        """Try to parse dictionary files already in dir_path. Returns requested kinds only."""
-        out = []
-        if "var" in want:
-            out.extend(self._variables_from_rdd(dir_path))
-        if "meter" in want:
-            out.extend(self._meters_from_dictionary(dir_path))
-        return out
-
-    def _enrich_freq_from_sql_and_idf(self, rows: list[dict]) -> list[dict]:
-        """
-        Fill 'freq' for variables when RDD lacked it, using:
-        - eplusout.sql ReportDataDictionary (preferred if present)
-        - else Output:Variable blocks in the current IDF.
-        Leaves existing non-empty 'freq' as-is.
-        """
-        import os, sqlite3, pathlib
-
-        # Build (key,name) -> freq map from SQL if available (prefer the most-populated freq)
-        freq_map: dict[tuple[str,str], tuple[str,int]] = {}
-        sql_path = os.path.join(self.out_dir or "", "eplusout.sql")
-        if os.path.exists(sql_path):
-            conn = sqlite3.connect(sql_path)
-            try:
-                for kv, nm, fq, n in conn.execute("""
-                    SELECT COALESCE(d.KeyValue,''), d.Name, COALESCE(d.ReportingFrequency,''), COUNT(*) AS n
-                    FROM ReportData r
-                    JOIN ReportDataDictionary d ON r.ReportDataDictionaryIndex = d.ReportDataDictionaryIndex
-                    GROUP BY d.Name, d.KeyValue, d.ReportingFrequency
-                """):
-                    if not fq:
-                        continue
-                    k = (str(kv).strip(), str(nm).strip())
-                    prev = freq_map.get(k)
-                    if not prev or n > prev[1]:
-                        freq_map[k] = (fq, n)
-            finally:
-                conn.close()
-
-        # Fallback: scan Output:Variable in the active IDF
-        if not freq_map:
-            src = pathlib.Path(self.idf)
-            text = src.read_text(errors="ignore")
-            # you already have a scanner:
-            for key, name, fq in self._scan_output_variables(text):  # returns (key,name,freq)
-                freq_map[(key, name)] = (fq, 1)
-
-        # Apply to rows that have blank freq
-        def _apply_one(r: dict):
-            if r.get("kind") != "var" or r.get("freq"):
-                return
-            nm = (r.get("name") or "").strip()
-            ky = (r.get("key") or "").strip()
-            # exact key
-            m = freq_map.get((ky, nm))
-            if not m and ky not in ("", "*"):
-                # wildcard/blank variants
-                m = freq_map.get(("*", nm)) or freq_map.get(("", nm))
-            if m:
-                r["freq"] = m[0]
-
-        for r in rows:
-            _apply_one(r)
-        return rows
-
-    def list_variables_safely(
-        self,
-        *,
-        kinds=("var", "meter"),
-        discover_zone_keys=True,
-        discover_environment_keys=True,
-        verify_handles=True,
-        save_csv=True
-    ) -> list[dict]:
-        """
-        Discover reportable **variables** and/or **meters** for the active model using a
-        robust, fallback-heavy strategy that avoids fragile dependencies on any single
-        artifact.
-
-        Discovery order
-        ---------------
-        1) **Existing dictionary files in `out_dir`** (fast; comprehensive):
-        - Parses `eplusout.rdd` for variables and (when present) meters,
-        - Parses `eplusout.mdd` for meters.
-        Returns rows with `source` set to `"rdd"` / `"mdd"`.
-        2) **Generate dictionaries in a temporary directory** (no writes to `out_dir`):
-        - If not already present, patches a temporary IDF with:
-            `Output:VariableDictionary, IDF;`
-        - Runs EnergyPlus once (design-day not required here) to emit RDD/MDD,
-            then parses those.
-        3) **Live API catalog fallback (variables only)**:
-        - Runs a tiny **design-day** in a temp dir, then queries the runtime API
-            catalog after warmup.
-        - Can optionally auto-discover per-zone keys and environment keys and
-            (optionally) verify handles.
-        - Meters are **not** available from this path.
+        Notes & scope
+        -------------
+        • This catalog comes **directly from the runtime API** (no IDF parsing, no RDD/MDD/EDD).
+        • Availability depends on when you call it; best after inputs are parsed or API data are ready.
+        Use one of:
+            - inside `callback_after_get_input`, or
+            - after warmup via `callback_after_new_environment_warmup_complete`, or
+            - when `self.api.exchange.api_data_fully_ready(self.state)` is True.
+        • Column shapes vary slightly across sections / versions. This function assigns
+        sensible headers per known section and pads/truncates rows as needed.
 
         Parameters
         ----------
-        kinds : Sequence[str], default ("var", "meter")
-            What to return: `"var"`, `"meter"`, or both. The alias `"both"` is also
-            accepted. Order is ignored.
-        discover_zone_keys : bool, default True
-            (API fallback only) Expand zone-like variables by enumerating **Zone**
-            object keys when possible.
-        discover_environment_keys : bool, default True
-            (API fallback only) Add environment-keyed variables (e.g., *Site…* with
-            key `"Environment"`).
-        verify_handles : bool, default True
-            (API fallback only) Attempt to resolve a `handle` for each (name, key)
-            via `get_variable_handle`; unresolved items may be dropped.
-            Dictionary-derived rows have `handle=-1`.
-        save_csv : bool, default True
-            Write a CSV summary to `out_dir` when rows are found:
-            - `"variables_only.csv"`   if only variables,
-            - `"meters_only.csv"`      if only meters,
-            - `"dictionary_combined.csv"` if RDD/MDD were used,
-            - `"variables_with_desc.csv"` if API fallback was used.
+        save_csv : bool, default False
+            If True, writes the **raw** CSV from EnergyPlus to `<out_dir>/api_catalog.csv`.
 
         Returns
         -------
-        list[dict]
-            Each record contains:
-            `{"kind": "var"|"meter", "name": str, "key": str, "units": str,
-            "desc": str, "handle": int, "source": "rdd"|"mdd"|"api"}`
-
-            Notes:
-            - The legacy `'freq'` field (when present in some sources) is **removed**.
-            - Dictionary-derived rows usually have `handle=-1`.
-
-        Raises
-        ------
-        AssertionError
-            If `set_model(idf, epw, out_dir)` has not been called.
-        (Otherwise, errors during probing are caught; when all fallbacks fail,
-        the function returns an empty list after logging a warning.)
-
-        Notes
-        -----
-        - The dictionary probe is preferred because it lists **all** variables/meters
-        that would be reportable from the current IDF, regardless of whether they
-        appear in Output objects yet.
-        - The API fallback only includes variables that the runtime catalog exposes;
-        it cannot list meters, and availability may differ by EnergyPlus version.
-        - Temporary runs use a **fresh state** and a temp directory; they do not touch
-        `out_dir` or the active state.
+        dict[str, pandas.DataFrame]
+            A dictionary of DataFrames keyed by section name. Missing sections simply won't appear.
 
         Examples
         --------
-        Get everything from whatever source is available (and save CSV):
+        >>> # Get everything the runtime reports
+        >>> sections = util.api_catalog_df()
+        >>> list(sections.keys())
+        ['ACTUATORS', 'INTERNAL_VARIABLES', 'PLUGIN_GLOBAL_VARIABLES', 'TRENDS', 'METERS', 'VARIABLES']
 
-        >>> rows = util.list_variables_safely()
-        >>> rows[0]
-        {'kind': 'var', 'name': 'Zone Air Temperature', 'key': 'SPACE1-1',
-        'units': 'C', 'desc': 'Average', 'handle': -1, 'source': 'rdd'}
+        >>> # Inspect schedule-based actuators you can set via get_actuator_handle(...)
+        >>> acts = sections.get("ACTUATORS", pd.DataFrame())
+        >>> acts.query("ComponentType == 'Schedule:Compact' and ControlType == 'Schedule Value'").head()
 
-        Variables only, forcing API behavior (if no RDD/MDD exist), and ensuring
-        zone/environment expansions with handle verification:
+        >>> # See available report variables (names/keys/units) the API knows about
+        >>> vars_df = sections.get("VARIABLES", pd.DataFrame())
+        >>> vars_df.head()
 
-        >>> rows = util.list_variables_safely(
-        ...     kinds=('var',),
-        ...     discover_zone_keys=True,
-        ...     discover_environment_keys=True,
-        ...     verify_handles=True
-        ... )
-
-        Meters only (requires RDD/MDD path to succeed):
-
-        >>> meters = util.list_variables_safely(kinds=('meter',))
-        >>> [m['name'] for m in meters[:5]]
-        ['Electricity:Facility', 'Cooling:Electricity', 'Heating:Electricity', ...]
+        >>> # Save the raw catalog for auditing
+        >>> util.api_catalog_df(save_csv=True)
         """
-        import tempfile, re, os, shutil, subprocess, pathlib
+        import os
+        import pandas as pd
 
-        def _norm_kinds(k):
-            if isinstance(k, str):
-                k = (k,)
-            s = {x.strip().lower() for x in k}
-            if "both" in s:
-                s = {"var", "meter"}
-            return s & {"var", "meter"}
+        ex = self.api.exchange
+        csv_bytes = ex.list_available_api_data_csv(self.state)
 
-        want = _norm_kinds(kinds)
-        assert self.idf and self.epw and self.out_dir, "Call set_model(idf, epw, out_dir) first."
-
-        # 1) Use dictionaries already present in main out_dir
-        direct = self._collect_dictionary_from_dir(self.out_dir, want)
-        if direct:
-            rows = direct
-            used_rdd = True
-        else:
-            rows = []
-            used_rdd = False
-            rdd_error = None
-            # 2) Temp-dir probe to generate dictionaries
+        # Optionally persist the raw CSV
+        if save_csv:
             try:
-                with tempfile.TemporaryDirectory() as tdir:
-                    src_path = pathlib.Path(self.idf)
-                    txt = src_path.read_text(errors="ignore")
-                    if not re.search(r'^\s*Output\s*:\s*VariableDictionary\s*,', txt, flags=re.I | re.M):
-                        txt = txt.rstrip() + "\n\nOutput:VariableDictionary,\n  IDF;\n"
-                    tmp_idf = os.path.join(tdir, src_path.stem + "_with_rdd.idf")
-                    pathlib.Path(tmp_idf).write_text(txt)
-                    eplus_bin = shutil.which("energyplus") or "energyplus"
-                    subprocess.run([eplus_bin, "-w", self.epw, "-d", tdir, tmp_idf], check=True)
-
-                    rows = self._collect_dictionary_from_dir(tdir, want)
-                    used_rdd = True
-            except Exception as e:
-                rdd_error = e
-                rows = []
-
-            # 3) Fallback to API catalog (variables only)
-            if not rows and "var" in want:
+                out_path = os.path.join(self.out_dir, "api_catalog.csv")
+                with open(out_path, "wb") as f:
+                    f.write(csv_bytes)
                 try:
-                    state = self.api.state_manager.new_state()
-                    bucket = {"vars": []}
-                    def after_warmup(s):
-                        vars_live = self._variables_from_catalog(
-                            s,
-                            discover_zone_keys=discover_zone_keys,
-                            discover_environment_keys=discover_environment_keys,
-                            verify_handles=verify_handles,
-                        ) or []
-                        for r in vars_live:
-                            r["kind"] = "var"
-                            # do NOT set any default freq
-                            r.setdefault("source", "api")
-                        bucket["vars"] = vars_live
-                        try:
-                            self.api.runtime.stop_simulation(s)
-                        except Exception:
-                            pass
-
-                    with tempfile.TemporaryDirectory() as tdir2:
-                        self.api.runtime.callback_after_new_environment_warmup_complete(state, after_warmup)
-                        self.api.runtime.run_energyplus(state, ['-w', self.epw, '-d', tdir2, '--design-day', self.idf])
-                        self.api.state_manager.reset_state(state)
-
-                    rows = bucket["vars"]
-                    used_rdd = False
-                    if "meter" in want:
-                        try:
-                            self._log(1, "[list_variables_safely] Catalog fallback cannot provide meters; dictionary probe failed.")
-                        except Exception:
-                            print("[list_variables_safely] Catalog fallback cannot provide meters; dictionary probe failed.")
-                except Exception as e2:
-                    try:
-                        self._log(1, f"[list_variables_safely] Failed. Dictionary error={rdd_error!r}, catalog error={e2!r}")
-                    except Exception:
-                        print(f"[list_variables_safely] Failed. Dictionary error={rdd_error!r}, catalog error={e2!r}")
-                    return []
-
-        # 🔻 Remove 'freq' key from all rows (if present from legacy paths)
-        for r in rows:
-            r.pop("freq", None)
-
-        # Save CSV (no 'freq' column)
-        if save_csv and rows:
-            if want == {"var"}:
-                fname = "variables_only.csv"
-            elif want == {"meter"}:
-                fname = "meters_only.csv"
-            else:
-                fname = "dictionary_combined.csv" if used_rdd else "variables_with_desc.csv"
-            path = os.path.join(self.out_dir, fname)
-            fieldnames = ["kind","name","key","units","desc","handle","source"]  # <-- no 'freq'
-            with open(path, "w", newline="") as f:
-                w = _csv.DictWriter(f, fieldnames=fieldnames)
-                w.writeheader()
-                for r in rows:
-                    w.writerow({k: r.get(k, "") for k in fieldnames})
-            try:
-                self._log(1, f"Saved dictionary → {path} (n={len(rows)})")
-            except Exception:
-                print(f"Saved dictionary → {path} (n={len(rows)})")
-
-        return rows
-
-    def _list_actuators_in_run(self, state, *, save_dir=None, verify_handles=True) -> List[Dict]:
-        secs = self._parse_sectioned_catalog(self.api.exchange.list_available_api_data_csv(state))
-        acts = []
-        if "ACTUATORS" in secs and secs["ACTUATORS"]:
-            for f in secs["ACTUATORS"]:
-                comp = (f[0] if len(f)>0 else "").strip()
-                ctrl = (f[1] if len(f)>1 else "").strip()
-                key  = (f[2] if len(f)>2 else "").strip()
-                unit = (f[3] if len(f)>3 else "").strip()
-                acts.append({"component_type": comp, "control_type": ctrl, "actuator_key": key, "units": unit})
-        # Also consider schedules
-        for typ in self._SCHEDULE_TYPES:
-            for name in (self.api.exchange.get_object_names(state, typ) or []):
-                acts.append({"component_type": typ, "control_type": "Schedule Value", "actuator_key": name, "units": ""})
-        # Dedup + optional verify
-        seen, out = set(), []
-        for a in acts:
-            key3 = (a["component_type"], a["control_type"], a["actuator_key"])
-            if key3 in seen: continue
-            seen.add(key3)
-            h = self.api.exchange.get_actuator_handle(state, *key3)
-            a["handle"] = h
-            if (not verify_handles) or (h != -1):
-                out.append(a)
-        if save_dir:
-            path = os.path.join(save_dir, "actuators.csv")
-            with open(path, "w", newline="") as f:
-                w = _csv.DictWriter(f, fieldnames=["component_type","control_type","actuator_key","units","handle"])
-                w.writeheader(); w.writerows(out)
-            self._log(1, f"Saved actuators → {path} (n={len(out)})")
-        return out
-
-    def _list_controllables_api_only(
-        self,
-        *,
-        verify_handles: bool = True,
-        expand_people: bool = True,
-        include_schedules: bool = True,
-        save_csv: bool = True
-    ) -> list[dict]:
-        """
-        Enumerate controllable variables (actuators) WITHOUT relying on eplusout.edd.
-        Uses the runtime API catalog + object names.
-
-        Returns rows with:
-        component_type, control_type, actuator_key, units, handle, source
-
-        Notes:
-        - 'handle' values are resolved in a temp state and are NOT reusable across runs.
-        - People expansion targets control types exactly as listed by the API for 'People'
-        (commonly 'Number of People', sometimes 'Activity Level').
-        """
-        assert self.idf and self.epw and self.out_dir, "Call set_model(idf, epw, out_dir) first."
-
-        import tempfile, pathlib, re, os
-
-        # 1) First tiny run: pull catalog + live object names
-        bucket = {"acts": [], "people_names": [], "sched_names": {}}
-
-        def _after_warmup(s):
-            # base list from API (no verification at this stage)
-            base = self._list_actuators_in_run(s, save_dir=None, verify_handles=False)  # uses catalog + schedule scan
-            bucket["acts"] = base or []
-            try:
-                bucket["people_names"] = self.api.exchange.get_object_names(s, "People") or []
-            except Exception:
-                bucket["people_names"] = []
-
-            if include_schedules:
-                scheds = {}
-                for typ in self._SCHEDULE_TYPES:
-                    try:
-                        scheds[typ] = list(self.api.exchange.get_object_names(s, typ) or [])
-                    except Exception:
-                        scheds[typ] = []
-                bucket["sched_names"] = scheds
-
-            # stop asap
-            try:
-                self.api.runtime.stop_simulation(s)
+                    self._log(1, f"[api_catalog] Saved → {out_path} ({len(csv_bytes)} bytes)")
+                except Exception:
+                    print(f"[api_catalog] Saved → {out_path} ({len(csv_bytes)} bytes)")
             except Exception:
                 pass
 
-        state = self.api.state_manager.new_state()
-        with tempfile.TemporaryDirectory() as tdir:
-            self.api.runtime.callback_after_new_environment_warmup_complete(state, _after_warmup)
-            self.api.runtime.run_energyplus(state, ['-w', self.epw, '-d', tdir, '--design-day', self.idf])
-            self.api.state_manager.reset_state(state)
-
-        base_rows = bucket["acts"][:]
-        people_names = bucket["people_names"][:]
-
-        # 2) Expand People actuators with wildcard/blank keys → concrete People objects
-        expanded: list[dict] = []
-        for a in base_rows:
-            comp = (a.get("component_type") or "").strip()
-            ctrl = (a.get("control_type") or "").strip()
-            key  = (a.get("actuator_key") or "").strip()
-            units = (a.get("units") or "").strip()
-            src = a.get("source") or "api"
-
-            if expand_people and comp.lower() == "people" and (key in ("", "*", "ALL")):
-                # common controllables: "Number of People", sometimes "Activity Level"
-                for pname in people_names:
-                    expanded.append({
-                        "component_type": comp,
-                        "control_type": ctrl,
-                        "actuator_key": pname,
-                        "units": units,
-                        "handle": -1,
-                        "source": src + "-expanded"
-                    })
-            else:
-                expanded.append({
-                    "component_type": comp,
-                    "control_type": ctrl,
-                    "actuator_key": key,
-                    "units": units,
-                    "handle": -1,
-                    "source": src
-                })
-
-        # 3) (Optional) add Schedule Value actuators explicitly (in case catalog omitted any)
-        if include_schedules:
-            for typ, names in (bucket.get("sched_names") or {}).items():
-                for nm in names:
-                    expanded.append({
-                        "component_type": typ,
-                        "control_type": "Schedule Value",
-                        "actuator_key": nm,
-                        "units": "",
-                        "handle": -1,
-                        "source": "api-schedule"
-                    })
-
-        # 4) Deduplicate triplets (component_type, control_type, actuator_key)
-        seen, dedup = set(), []
-        for r in expanded:
-            t = (r["component_type"], r["control_type"], r["actuator_key"])
-            if t in seen:
+        # Parse the catalog: the file is a sequence of sections, each starting with "**NAME**"
+        lines = csv_bytes.decode("utf-8", errors="replace").splitlines()
+        sections_raw: dict[str, list[list[str]]] = {}
+        current = None
+        for raw in lines:
+            line = raw.strip()
+            if not line:
                 continue
-            seen.add(t); dedup.append(r)
+            if line.startswith("**") and line.endswith("**"):
+                current = line.strip("*").strip().upper().replace(" ", "_")
+                sections_raw.setdefault(current, [])
+                continue
+            # Catalog rows are simple CSV without quoted commas → split on ','
+            row = [c.strip() for c in line.split(",")]
+            if current:
+                sections_raw[current].append(row)
 
-        # 5) Verify handles in a fresh state (and optionally filter)
-        if verify_handles:
-            vstate = self.api.state_manager.new_state()
-            def _after_input(vs):
-                for r in dedup:
-                    try:
-                        h = self.api.exchange.get_actuator_handle(
-                            vs, r["component_type"], r["control_type"], r["actuator_key"]
-                        )
-                    except Exception:
-                        h = -1
-                    r["handle"] = h
-                try:
-                    self.api.runtime.stop_simulation(vs)
-                except Exception:
-                    pass
+        # Known schemas per section (fallbacks are applied when row lengths differ)
+        SCHEMAS: dict[str, list[str]] = {
+            # Example row: Actuator,Schedule:Compact,Schedule Value,OCCUPY-1,[ ]
+            "ACTUATORS": ["Kind", "ComponentType", "ControlType", "ActuatorKey", "Units"],
+            # Example row: Internal Variable,Zone,Zone Floor Area,LIVING ZONE,[m2]
+            "INTERNAL_VARIABLES": ["Kind", "VariableType", "VariableName", "KeyValue", "Units"],
+            # Example row: Plugin Global Variable,<name>
+            "PLUGIN_GLOBAL_VARIABLES": ["Kind", "Name"],
+            # Example row: Trend,<name>,<length> (varies)
+            "TRENDS": ["Kind", "Name", "Length"],
+            # Example row: Meter,Electricity:Facility,[J] (varies)
+            "METERS": ["Kind", "MeterName", "Units"],
+            # Example row: Variable,Zone Mean Air Temperature,LIVING ZONE,[C] (varies)
+            "VARIABLES": ["Kind", "VariableName", "KeyValue", "Units"],
+        }
 
-            with tempfile.TemporaryDirectory() as tdir2:
-                self.api.runtime.callback_after_component_get_input(vstate, _after_input)
-                self.api.runtime.run_energyplus(vstate, ['-w', self.epw, '-d', tdir2, '--design-day', self.idf])
-                self.api.state_manager.reset_state(vstate)
+        dfs: dict[str, pd.DataFrame] = {}
+        for sec, rows in sections_raw.items():
+            # Choose schema or a generic fallback wide enough for the observed rows
+            cols = SCHEMAS.get(sec)
+            if cols is None:
+                max_cols = max([len(r) for r in rows] + [5])
+                cols = [f"col{i+1}" for i in range(max_cols)]
 
-            dedup = [r for r in dedup if r.get("handle", -1) != -1]
+            # Normalize rows to the column count
+            width = len(cols)
+            norm = [(r + [""] * (width - len(r)))[:width] for r in rows]
+            df = pd.DataFrame(norm, columns=cols)
 
-        # 6) Save CSV
-        if save_csv and dedup:
-            path = os.path.join(self.out_dir, "controllables_api_only.csv")
-            with open(path, "w", newline="") as f:
-                w = _csv.DictWriter(f, fieldnames=["component_type","control_type","actuator_key","units","handle","source"])
-                w.writeheader(); w.writerows(dedup)
-            self._log(1, f"Saved controllables → {path} (n={len(dedup)})")
+            # Light cleanup
+            if "Kind" in df.columns:
+                df["Kind"] = df["Kind"].astype(str).str.strip().str.title()
+            for c in df.columns:
+                df[c] = df[c].astype(str).str.strip()
 
-        return dedup
+            dfs[sec] = df
 
-    def list_actuators_safely(self, *, verify_handles=True) -> List[Dict]:
+        return dfs
+
+    def list_available_variables(self, *, save_csv: bool = False):
         """
-        Enumerate controllable **actuators** for the active model using a safe,
-        API-only workflow (no dependency on `eplusout.edd`). This is a thin,
-        backward-compatible wrapper around `_list_controllables_api_only(...)`.
+        Return the **runtime API catalog of report variables** as a pandas DataFrame.
 
-        What it does
+        What this is
         ------------
-        - Runs a tiny **design-day** in a temporary directory to query the runtime
-        actuator catalog and live object names.
-        - Expands wildcard/blank **People** actuators (e.g., `"Number of People"`)
-        into concrete `People` object keys.
-        - Includes **Schedule Value** actuators for common schedule types
-        (`Schedule:Compact`, `Schedule:Constant`, `Schedule:File`, `Schedule:Year`).
-        - (Optional) **verifies** handles in a fresh state so returned items are
-        actually controllable for this IDF/EPW.
-        - Writes a CSV summary to `<out_dir>/controllables_api_only.csv`.
+        A thin wrapper around `self.api_catalog_df()` that extracts the "VARIABLES"
+        section reported by the EnergyPlus runtime API (via
+        `exchange.list_available_api_data_csv`). It does **not** parse your IDF and
+        does **not** require RDD/MDD/SQL — it’s whatever the API exposes at runtime.
+
+        When to call
+        ------------
+        Call after inputs are parsed (e.g., in/after `callback_after_get_input`) or
+        once `exchange.api_data_fully_ready(self.state)` is True. Calling earlier may
+        yield an empty frame.
+
+        Columns (typical)
+        -----------------
+        ["Kind", "VariableName", "KeyValue", "Units"]
+        (Column names are normalized by `api_catalog_df`; may vary slightly by E+ version.)
 
         Parameters
         ----------
-        verify_handles : bool, default True
-            Resolve a `handle` for each `(component_type, control_type, actuator_key)`
-            via `get_actuator_handle`. When `True`, rows without a valid handle are
-            filtered out. (Note: these handles are resolved in a **temporary state**
-            and are **not reusable** across runs.)
+        save_csv : bool, default False
+            If True, also saves the **raw** API catalog CSV to `<out_dir>/api_catalog.csv`.
 
         Returns
         -------
-        List[Dict]
-            Each record has:
-            `{"component_type": str,
-            "control_type": str,
-            "actuator_key": str,
-            "units": str,
-            "handle": int,        # -1 if not verified or unavailable
-            "source": str}`       # e.g., "api", "api-expanded", "api-schedule"
-
-        Requirements
-        ------------
-        Call `set_model(idf, epw, out_dir)` first; this method asserts that `idf`,
-        `epw`, and `out_dir` are configured.
-
-        Notes
-        -----
-        - This approach does **not** require `eplusout.edd` and is resilient across
-        EnergyPlus versions.
-        - CSV output is only written when at least one actuator is discovered.
+        pandas.DataFrame
+            The "VARIABLES" section; empty DataFrame if the section is absent.
 
         Examples
         --------
-        Discover and verify all controllables; save CSV:
+        >>> df = util.list_available_variables()
+        >>> df.head()
 
-        >>> acts = util.list_actuators_safely()
-        >>> acts[0]
-        {'component_type': 'People', 'control_type': 'Number of People',
-        'actuator_key': 'OPEN OFFICE PEOPLE', 'units': '', 'handle': 12345,
-        'source': 'api-expanded'}
-
-        Skip handle verification (keep all catalog entries):
-
-        >>> acts = util.list_actuators_safely(verify_handles=False)
+        >>> # What zone-style variables are available?
+        >>> df[df["VariableName"].str.contains("Zone ", case=False, na=False)].head()
         """
-        return self._list_controllables_api_only(
-            verify_handles=verify_handles,
-            expand_people=True,
-            include_schedules=True,
-            save_csv=True
-        )
+        import pandas as pd
+        sections = self.api_catalog_df(save_csv=save_csv)
+        df = sections.get("VARIABLES", pd.DataFrame(columns=["Kind","VariableName","KeyValue","Units"]))
+        return df
 
-    def flatten_mtd(
-        self,
-        *,
-        dir_path: str | None = None,
-        generate_if_missing: bool = False,
-        save_csv: bool = True,
-    ) -> list[dict]:
+
+    def list_available_meters(self, *, save_csv: bool = False):
         """
-        Flatten eplusout.mtd into pairwise mappings (variable ↔ meter).
+        Return the **runtime API catalog of meters** as a pandas DataFrame.
 
-        Returns list of dict records with fields:
-        - kind: "mtd_map"
-        - direction: "var_on_meter" (from “Meters for … OnMeter = …”)
-                        or "meter_contains" (from “For Meter = … contents are:”)
-        - meter, meter_units
-        - variable, variable_key, variable_units
-        - var_index (int or None)  # from "Meters for <index>, ..."
-        - resource_type (only when provided in the file)
-        - source: "mtd"
+        What this is
+        ------------
+        A convenience accessor for the "METERS" section from
+        `exchange.list_available_api_data_csv`. Unlike RDD/MDD parsing, this is
+        **purely runtime** — no dependency on dictionary files.
 
-        If generate_if_missing=True and eplusout.mtd is absent, runs a tiny
-        design-day in a temp dir to try producing it.
+        When to call
+        ------------
+        After API data are available (post input parsing / warmup). Earlier calls may
+        return an empty frame depending on the model & E+ version.
 
-        Notes on format: see EnergyPlus docs for eplusout.mtd examples.  [oai_citation:1‡Big Ladder Software](https://bigladdersoftware.com/epx/docs/8-7/output-details-and-examples/eplusout-mtd.html)
+        Columns (typical)
+        -----------------
+        ["Kind", "MeterName", "Units"]
+
+        Parameters
+        ----------
+        save_csv : bool, default False
+            If True, also saves the raw API catalog CSV to `<out_dir>/api_catalog.csv`.
+
+        Returns
+        -------
+        pandas.DataFrame
+            The "METERS" section; empty DataFrame if the section is absent.
+
+        Examples
+        --------
+        >>> meters = util.list_available_meters()
+        >>> meters.query("MeterName.str.contains('Electricity', case=False)", engine='python').head()
         """
-        assert self.out_dir, "Call set_model(idf, epw, out_dir) first."
-        import os, re, pathlib, tempfile, subprocess, shutil
+        import pandas as pd
+        sections = self.api_catalog_df(save_csv=save_csv)
+        df = sections.get("METERS", pd.DataFrame(columns=["Kind","MeterName","Units"]))
+        return df
 
-        def _parse_units_label(s: str) -> tuple[str, str]:
-            s = (s or "").strip()
-            lb = s.rfind('['); rb = s.rfind(']')
-            if lb != -1 and rb != -1 and rb > lb:
-                return s[:lb].strip(), s[lb+1:rb].strip()
-            return s, ""
 
-        def _split_key_and_name(label: str) -> tuple[str, str]:
-            # "SPACE1-1:Lights Electric Energy" -> ("SPACE1-1", "Lights Electric Energy")
-            if ":" in label:
-                left, right = label.split(":", 1)
-                return left.strip(), right.strip()
-            return "", label.strip()
+    def list_available_actuators(self, *, save_csv: bool = False):
+        """
+        Return the **runtime API catalog of actuators** as a pandas DataFrame.
 
-        def _read_or_generate_mtd(path_out: str) -> tuple[str, bool]:
-            """Return path to an mtd (either in out_dir or a temp dir). (path, is_temp)"""
-            if os.path.exists(path_out):
-                return path_out, False
-            if not generate_if_missing:
-                raise FileNotFoundError(path_out)
-            # try to generate via a tiny design-day run
-            assert self.idf and self.epw, "Need idf/epw to generate .mtd"
-            with tempfile.TemporaryDirectory() as tdir:
-                # Run EnergyPlus; .mtd is produced alongside other outputs
-                eplus_bin = shutil.which("energyplus") or "energyplus"
-                subprocess.run([eplus_bin, "-w", self.epw, "-d", tdir, self.idf], check=True)
-                alt = os.path.join(tdir, "eplusout.mtd")
-                if not os.path.exists(alt):
-                    raise FileNotFoundError("eplusout.mtd was not produced during the temp run.")
-                # Copy to out_dir (optional); here we parse directly from temp
-                return alt, True
+        What this is
+        ------------
+        A small wrapper that extracts the "ACTUATORS" section from the runtime API
+        catalog (`exchange.list_available_api_data_csv`). Use these rows to look up
+        actuator **handles** during a run.
 
-        outdir = dir_path or self.out_dir
-        mtd_path = os.path.join(outdir, "eplusout.mtd")
-        mtd_path, is_temp = _read_or_generate_mtd(mtd_path)
-        text = pathlib.Path(mtd_path).read_text(errors="ignore")
+        When to call
+        ------------
+        After inputs are parsed / API data are ready (e.g., inside
+        `callback_after_component_get_input` or after warmup). Earlier calls can be empty.
 
-        records: list[dict] = []
-        seen_pairs: set[tuple[str, str, str, str]] = set()  # (direction, meter, vkey, vname)
+        Columns (typical)
+        -----------------
+        ["Kind", "ComponentType", "ControlType", "ActuatorKey", "Units"]
 
-        # --- Regexes for the two sections ---
-        rx_meters_for = re.compile(
-            r'(?im)^\s*Meters\s+for\s+(?P<idx>\d+)\s*,\s*(?P<label>.+?)\s*$'
-        )
-        rx_onmeter = re.compile(
-            r'(?im)^\s*OnMeter\s*=\s*(?P<meter>[^\[\n]+?)\s*(?:\[(?P<munits>[^\]]+)\])?\s*$'
-        )
-        rx_meter_header = re.compile(
-            r'(?im)^\s*For\s+Meter\s*=\s*(?P<meter>[^\[,]+?)\s*'
-            r'(?:\[(?P<munits>[^\]]+)\])?\s*'
-            r'(?:,\s*ResourceType\s*=\s*(?P<rtype>[^,]+?)\s*)?'
-            r',?\s*contents\s+are\s*:\s*$'
-        )
+        Getting handles
+        ---------------
+        At an appropriate callback (when data are ready), resolve a handle with:
+            `h = ex.get_actuator_handle(state, ComponentType, ControlType, ActuatorKey)`
+        Then set values each timestep via:
+            `ex.set_actuator_value(state, h, value)`
 
-        lines = text.splitlines()
-        i, n = 0, len(lines)
+        Parameters
+        ----------
+        save_csv : bool, default False
+            If True, also saves the raw API catalog CSV to `<out_dir>/api_catalog.csv`.
 
-        while i < n:
-            ln = lines[i].rstrip()
-            m_head_var = rx_meters_for.match(ln)
-            m_head_meter = rx_meter_header.match(ln)
+        Returns
+        -------
+        pandas.DataFrame
+            The "ACTUATORS" section; empty DataFrame if the section is absent.
 
-            # Section 1: "Meters for <index>, <variable label [units]>"
-            if m_head_var:
-                idx = int(m_head_var.group("idx"))
-                var_label_raw = m_head_var.group("label").strip()
-                # The sample shows the variable label ending with [units] on the same line.
-                var_label, v_units_line = _parse_units_label(var_label_raw)
-                v_key, v_name = _split_key_and_name(var_label)
+        Examples
+        --------
+        >>> acts = util.list_available_actuators()
+        >>> # All schedule knobs you can drive
+        >>> acts.query("ComponentType == 'Schedule:Compact' and ControlType == 'Schedule Value'").head()
 
-                # consume subsequent "OnMeter = ..." lines
-                i += 1
-                while i < n:
-                    ln2 = lines[i].rstrip()
-                    if not ln2 or rx_meters_for.match(ln2) or rx_meter_header.match(ln2):
-                        # next section or blank → stop this block
-                        break
-                    m_on = rx_onmeter.match(ln2)
-                    if m_on:
-                        meter = (m_on.group("meter") or "").strip()
-                        m_units = (m_on.group("munits") or "").strip()
-                        sig = ("var_on_meter", meter, v_key.lower(), v_name.lower())
-                        if sig not in seen_pairs:
-                            seen_pairs.add(sig)
-                            records.append({
-                                "kind": "mtd_map",
-                                "direction": "var_on_meter",
-                                "meter": meter,
-                                "meter_units": m_units,
-                                "variable": v_name,
-                                "variable_key": v_key,
-                                "variable_units": v_units_line,
-                                "var_index": idx,
-                                "resource_type": "",
-                                "source": "mtd",
-                            })
-                    i += 1
-                continue
-
-            # Section 2: "For Meter = <meter> [units], (optional ResourceType=...), contents are:"
-            if m_head_meter:
-                meter = (m_head_meter.group("meter") or "").strip()
-                m_units = (m_head_meter.group("munits") or "").strip()
-                rtype = (m_head_meter.group("rtype") or "").strip()
-
-                i += 1
-                while i < n:
-                    ln2 = lines[i].rstrip()
-                    if not ln2 or rx_meters_for.match(ln2) or rx_meter_header.match(ln2):
-                        break
-                    # component line; typically "<key>:<Variable Name>"
-                    comp = ln2.strip().lstrip("-").strip()
-                    if not comp:
-                        i += 1
-                        continue
-                    v_key, v_name = _split_key_and_name(comp)
-                    # units not shown on these lines; leave blank
-                    sig = ("meter_contains", meter, v_key.lower(), v_name.lower())
-                    if sig not in seen_pairs:
-                        seen_pairs.add(sig)
-                        records.append({
-                            "kind": "mtd_map",
-                            "direction": "meter_contains",
-                            "meter": meter,
-                            "meter_units": m_units,
-                            "variable": v_name,
-                            "variable_key": v_key,
-                            "variable_units": "",
-                            "var_index": None,
-                            "resource_type": rtype,
-                            "source": "mtd",
-                        })
-                    i += 1
-                continue
-
-            i += 1
-
-        # Optional CSV
-        if save_csv and records:
-            path = os.path.join(self.out_dir, "meter_details_flat.csv")
-            fieldnames = [
-                "kind","direction","meter","meter_units",
-                "variable","variable_key","variable_units",
-                "var_index","resource_type","source"
-            ]
-            with open(path, "w", newline="") as f:
-                w = _csv.DictWriter(f, fieldnames=fieldnames)
-                w.writeheader()
-                for r in records:
-                    w.writerow({k: r.get(k, "") for k in fieldnames})
-            self._log(1, f"[mtd] Wrote {path} (n={len(records)})")
-
-        return records
+        >>> # Example: find a specific fan/coil actuator family
+        >>> acts[acts["ComponentType"].str.contains("Fan|Coil", case=False, na=False)].head()
+        """
+        import pandas as pd
+        sections = self.api_catalog_df(save_csv=save_csv)
+        df = sections.get("ACTUATORS", pd.DataFrame(columns=["Kind","ComponentType","ControlType","ActuatorKey","Units"]))
+        return df
 
     # ---------- occupancy (People actuators) ----------
 
