@@ -5816,3 +5816,254 @@ class EPlusUtil:
         # 5) Update last and return
         d["_actlog_last"][key] = v
         return v
+
+    def tick_set_actuator(
+        self,
+        s,
+        *,
+        component_type: str | None = None,
+        control_type: str | None = None,
+        actuator_key: str | None = None,
+        handle: int | None = None,
+        value=0.0,                         # number or callable -> (self,s) | (s) | ()
+        allow_warmup: bool = False,
+        clamp: tuple[float, float] | None = None,
+        cache_handle: bool = True,
+        label: str | None = None,
+        precision: int = 6,
+        level: int = 1,
+        when: str = "success",             # "always" | "success" | "on_change"
+        eps: float = 1e-9,                 # change threshold for "on_change"
+        read_back: bool = False,           # optionally read & log the actual actuator value after setting
+        include_timestamp: bool = True,    # include model timestamp in log line
+    ) -> bool:
+        """
+        Set & log an EnergyPlus actuator value at runtime (designed to be *registered* as a handler).
+
+        This helper wraps `runtime_set_actuator(...)` and adds flexible logging:
+        - **always**   : log every invocation (regardless of success)
+        - **success**  : log only if the set call succeeds (default)
+        - **on_change**: log only when the *requested* value changes (|Δ| > `eps`) since last set
+                        for this actuator (per run). The set still executes; only logging is gated.
+
+        It accepts a numeric `value` or a callable. If callable, it will be invoked each tick as
+        `fn(self, s)`, or `fn(s)`, or `fn()` (first signature that works). You may also provide
+        `clamp=(lo, hi)` to bound the final value before it is applied.
+
+        Parameters
+        ----------
+        s : pyenergyplus State
+            Runtime state passed by EnergyPlus to your callback.
+        component_type, control_type, actuator_key : str, optional
+            Actuator triple (e.g., "Schedule:Compact", "Schedule Value", "FanAvailSched").
+            Required if `handle` is not supplied.
+        handle : int, optional
+            Pre-resolved actuator handle (fast path). Handles are NOT reusable across runs.
+        value : float | int | callable, default 0.0
+            The value to apply, or a function to compute it dynamically.
+        allow_warmup : bool, default False
+            If False, the setter is skipped during warmup/sizing periods.
+        clamp : (float, float) | None
+            Inclusive [lo, hi] clamp on the final value (after evaluating a callable).
+        cache_handle : bool, default True
+            Cache the resolved handle for this (state_id, component, control, key).
+        label : str | None
+            Optional custom label for logs; otherwise derived from the triple/handle.
+        precision : int, default 6
+            Decimal precision in log output.
+        level : int, default 1
+            Log level passed to `self._log(level, ...)` (falls back to `print` if `_log` missing).
+        when : {"always","success","on_change"}, default "success"
+            Logging policy (see above).
+        eps : float, default 1e-9
+            Change threshold for `when="on_change"`.
+        read_back : bool, default False
+            If True, attempts to read the actuator back (via `runtime_get_actuator`) and includes
+            that in the log message (useful when E+ clamps or rewrites values internally).
+        include_timestamp : bool, default True
+            If True, prefixes the log line with the current model timestamp if available.
+
+        Returns
+        -------
+        bool
+            True if a value was applied (setter call succeeded), False otherwise.
+
+        Notes
+        -----
+        - Register it with your hook registry, e.g.:
+        `register_handlers("begin", [{"method_name": "tick_set_actuator", "kwargs": {...}}])`
+        - This method **always attempts to set** the value. The `when` policy only affects logging.
+        - For per-zone occupancy, prefer `People` → `Number of People` actuators with each zone's
+        People object name as the `actuator_key`, rather than a shared occupancy schedule.
+
+        Examples
+        --------
+        Force fan availability schedule to 0 each system timestep, logging only on success:
+
+        >>> util.register_handlers(
+        ...   "begin",
+        ...   [{"method_name": "tick_set_actuator",
+        ...     "kwargs": {
+        ...       "component_type": "Schedule:Compact",
+        ...       "control_type": "Schedule Value",
+        ...       "actuator_key": "FanAvailSched",
+        ...       "value": 0.0,
+        ...       "when": "success",
+        ...       "precision": 3
+        ...     }}],
+        ...   run_during_warmup=False
+        ... )
+
+        Drive a zone's People actuator from a callable, clamp to [0,100], log on change:
+
+        >>> def occ_profile(self, s):
+        ...     # return a float per tick
+        ...     minute = int(self.api.exchange.minute(s))
+        ...     return 50.0 if 9*60 <= minute <= 17*60 else 0.0
+        ...
+        >>> util.register_handlers(
+        ...   "begin",
+        ...   [{"method_name": "tick_set_actuator",
+        ...     "kwargs": {
+        ...       "component_type": "People",
+        ...       "control_type": "Number of People",
+        ...       "actuator_key": "OpenOffice People",
+        ...       "value": occ_profile,
+        ...       "clamp": (0.0, 100.0),
+        ...       "when": "on_change",
+        ...       "read_back": True
+        ...     }}],
+        ...   run_during_warmup=False
+        ... )
+        """
+        import math
+
+        # ---------- evaluate intended value (supports callables) ----------
+        v_req = value
+        if callable(v_req):
+            try:
+                try:
+                    v_req = value(self, s)
+                except TypeError:
+                    try:
+                        v_req = value(s)
+                    except TypeError:
+                        v_req = value()
+            except Exception:
+                # don't log here yet; we'll log outcome after attempting set
+                v_req = None
+
+        try:
+            v_req = float(v_req) if v_req is not None else None
+        except Exception:
+            v_req = None
+
+        # optional clamp on the requested value
+        if v_req is not None and clamp is not None and len(clamp) == 2:
+            lo, hi = float(clamp[0]), float(clamp[1])
+            if lo > hi: lo, hi = hi, lo
+            v_req = max(lo, min(hi, v_req))
+
+        # ---------- build key + human label ----------
+        if isinstance(handle, int) and handle >= 0:
+            key = ("h", int(handle))
+            human = label or f"handle={handle}"
+        else:
+            ct = (component_type or "").strip()
+            tt = (control_type or "").strip()
+            ak = "" if actuator_key is None else str(actuator_key).strip()
+            key = ("t", ct, tt, ak)
+            human = label or f"{ct} | {tt} | {ak}"
+
+        # ---------- per-run last-request store (for on_change) ----------
+        d = self.__dict__
+        if d.get("_actset_state_id") != id(self.state):
+            d["_actset_state_id"] = id(self.state)
+            d["_actset_last_req"] = {}  # key -> last requested numeric value (float or None)
+
+        last_req = d["_actset_last_req"].get(key, None)
+
+        # change test for logging policy (we still *apply*; this only gates logging)
+        def _num(x):
+            try:
+                xf = float(x)
+                return xf if math.isfinite(xf) else None
+            except Exception:
+                return None
+
+        changed = False
+        if v_req is None or last_req is None:
+            changed = (v_req is not None) != (last_req is not None)  # one side numeric, the other not
+        else:
+            changed = abs(float(v_req) - float(last_req)) > float(eps)
+
+        # ---------- apply via reusable setter ----------
+        ok = False
+        if v_req is not None:
+            ok = self.runtime_set_actuator(
+                s,
+                component_type=component_type,
+                control_type=control_type,
+                actuator_key=actuator_key,
+                handle=handle,
+                value=v_req,                 # already evaluated (and clamped)
+                allow_warmup=allow_warmup,
+                clamp=None,                  # (already clamped above)
+                cache_handle=cache_handle,
+                log=False,                   # logging handled here
+            )
+
+        # ---------- optional read-back ----------
+        v_read = None
+        if read_back:
+            v_read = self.runtime_get_actuator(
+                s,
+                component_type=component_type,
+                control_type=control_type,
+                actuator_key=actuator_key,
+                handle=handle,
+                allow_warmup=allow_warmup,
+                cache_handle=cache_handle,
+                default=None,
+                log=False,
+            )
+
+        # ---------- timestamp (optional) ----------
+        ts = ""
+        if include_timestamp:
+            try:
+                # prefer user helper if available
+                if hasattr(self, "_occ_current_timestamp"):
+                    ts_val = self._occ_current_timestamp(s)
+                    ts = f"{ts_val} | "
+                else:
+                    ex = self.api.exchange
+                    yr = int(ex.year(s)); mo = int(ex.month(s)); dy = int(ex.day_of_month(s))
+                    hh = int(ex.hour(s));  mm = int(ex.minute(s))
+                    ts = f"{yr:04d}-{mo:02d}-{dy:02d} {hh:02d}:{mm:02d} | "
+            except Exception:
+                ts = ""
+
+        # ---------- logging per policy ----------
+        do_log = (when == "always") or (when == "success" and ok) or (when == "on_change" and changed)
+        if do_log:
+            if ok:
+                msg = f"[act:set] {ts}{human} <- {v_req:.{int(precision)}g}"
+                if read_back and (v_read is not None):
+                    try:
+                        msg += f" | readback={float(v_read):.{int(precision)}g}"
+                    except Exception:
+                        msg += f" | readback={v_read!r}"
+            else:
+                # include reason-ish context
+                detail = "no value" if v_req is None else "set failed"
+                msg = f"[act:set] {ts}{human} ({detail})"
+            try:
+                self._log(int(level), msg)  # type: ignore[attr-defined]
+            except Exception:
+                print(msg)
+
+        # ---------- remember last requested value (per run) ----------
+        d["_actset_last_req"][key] = v_req
+
+        return bool(ok)        
