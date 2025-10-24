@@ -6066,4 +6066,347 @@ class EPlusUtil:
         # ---------- remember last requested value (per run) ----------
         d["_actset_last_req"][key] = v_req
 
-        return bool(ok)        
+        return bool(ok)
+
+    def runtime_get_variable(
+        self,
+        s,
+        *,
+        name: str | None = None,
+        key: str | None = None,
+        handle: int | None = None,
+        allow_warmup: bool = True,
+        cache_handle: bool = True,
+        default: float | None = None,
+        log: bool = False,
+    ) -> float | None:
+        """
+        Lightweight getter for an EnergyPlus **runtime variable** value.
+
+        Use this inside your own runtime handlers (registered via `register_handlers(...)`).
+        It safely resolves a variable handle once the API is ready, caches it *per run*,
+        and returns the current numeric value. If the variable is not available yet
+        (e.g., before inputs are parsed or during warmup—if disallowed), it returns
+        `default` (None by default).
+
+        You can identify a variable either by:
+        • a pre-resolved integer `handle`, **or**
+        • the pair `(name, key)` (e.g., `"Zone Mean Air Temperature"`, `"SPACE1-1"`).
+            Handles are resolved once `exchange.api_data_fully_ready(s)` is True.
+
+        Parameters
+        ----------
+        s : pyenergyplus State
+            Runtime state passed into your callback.
+        name : str, optional
+            Variable name (e.g., "Zone Mean Air Temperature", "System Node Mass Flow Rate",
+            "Site Outdoor Air Drybulb Temperature"). Required if `handle` is not provided.
+        key : str, optional
+            Variable KeyValue (e.g., a zone name, node name, or "Environment" for site vars).
+            Many site/weather variables use the key `"Environment"`. Blank `""` is valid
+            for some variables. Required if `handle` is not provided.
+        handle : int, optional
+            Pre-resolved variable handle (fast path).
+        allow_warmup : bool, default True
+            If False, returns `default` during warmup/sizing periods.
+        cache_handle : bool, default True
+            Cache the resolved (name, key) handle for the current run. Handles are *not*
+            reusable across runs/states.
+        default : float | None, default None
+            Value to return when the variable isn't available yet / not resolved.
+        log : bool, default False
+            Emit minimal diagnostics via `self._log` (or `print` fallback).
+
+        Returns
+        -------
+        float | None
+            Current variable value (float) when available; otherwise `default`.
+
+        Notes
+        -----
+        • Resolution is attempted only after `exchange.api_data_fully_ready(s)` is True.  
+        • For **site/weather** variables, the key is typically `"Environment"`.  
+        • If you need units, retrieve them from RDD/MDD or `eplusout.sql`—the runtime
+        variable API does not return units.
+
+        Examples
+        --------
+        Read a zone temperature inside your controller:
+
+        >>> def my_controller(self, s, **_):
+        ...     tz = self.runtime_get_variable(
+        ...         s, name="Zone Mean Air Temperature", key="SPACE1-1"
+        ...     )
+        ...     if tz is None:
+        ...         return  # not ready yet
+        ...     # use tz...
+
+        Read a node flow rate:
+
+        >>> m = self.runtime_get_variable(
+        ...     s, name="System Node Mass Flow Rate", key="SPACE4-1 ZONE COIL AIR IN NODE"
+        ... )
+
+        Read outdoor drybulb:
+
+        >>> to = self.runtime_get_variable(
+        ...     s, name="Site Outdoor Air Drybulb Temperature", key="Environment"
+        ... )
+        """
+        ex = self.api.exchange
+
+        # Respect warmup preference
+        try:
+            if not allow_warmup and ex.warmup_flag(s):
+                return default
+        except Exception:
+            pass
+
+        # Per-run cache (tied to active state id)
+        d = self.__dict__
+        if d.get("_var_cache_state_id") != id(self.state):
+            d["_var_cache_state_id"] = id(self.state)
+            d["_var_handle_cache"] = {}  # (name, key) -> handle
+
+        # Resolve handle if needed
+        h = handle if (isinstance(handle, int) and handle >= 0) else -1
+        if h == -1:
+            if not name:
+                if log:
+                    try: self._log(1, "[var:get] missing variable name and no valid handle.")
+                    except Exception: pass
+                return default
+
+            # Key normalization
+            k0 = "" if key is None else str(key).strip()
+            cache_key = (str(name).strip(), k0)
+
+            h = d["_var_handle_cache"].get(cache_key, -1) if cache_handle else -1
+            if h == -1:
+                # Only safe to resolve after API data are ready
+                try:
+                    if not ex.api_data_fully_ready(s):
+                        return default
+                except Exception:
+                    return default
+
+                # Try the provided key first
+                try:
+                    h = ex.get_variable_handle(s, cache_key[0], cache_key[1])
+                except Exception:
+                    h = -1
+
+                # Helpful fallback for site/weather vars: also try "Environment" if user
+                # passed blank and name looks site-like.
+                if h == -1 and (not k0 or k0 == "*"):
+                    nm_low = cache_key[0].lower()
+                    if any(tok in nm_low for tok in ("site ", "weather", "outdoor", "environment")):
+                        try:
+                            h = ex.get_variable_handle(s, cache_key[0], "Environment")
+                            if h != -1:
+                                cache_key = (cache_key[0], "Environment")
+                        except Exception:
+                            h = -1
+
+                if h == -1:
+                    if log:
+                        try: self._log(1, f"[var:get] handle not found for: {(cache_key[0], cache_key[1])}")
+                        except Exception: pass
+                    return default
+
+                if cache_handle:
+                    d["_var_handle_cache"][cache_key] = h
+
+        # Read current value
+        try:
+            v = ex.get_variable_value(s, h)
+            try:
+                return float(v)
+            except Exception:
+                # In practice variable values are numeric; if not, return default
+                return default
+        except Exception as e:
+            if log:
+                try: self._log(1, f"[var:get] read failed: {e}")
+                except Exception: pass
+            return default    
+
+    def tick_log_variable(
+        self,
+        s,
+        *,
+        name: str | None = None,
+        key: str | None = None,
+        handle: int | None = None,
+        allow_warmup: bool = False,
+        cache_handle: bool = True,
+        default: float | None = float("nan"),
+        label: str | None = None,
+        precision: int = 6,
+        level: int = 1,
+        when: str = "always",          # "always" | "on_change" | "on_resolve"
+        eps: float = 1e-9,             # change threshold for "on_change"
+        include_timestamp: bool = False,
+    ) -> float | None:
+        """
+        Read & log an EnergyPlus **runtime variable** value (to be *registered* as a handler).
+
+        This helper wraps `runtime_get_variable(...)` and adds flexible logging policies:
+        • **always**     → log every tick  
+        • **on_change**  → log only when the value changes by more than `eps`  
+        • **on_resolve** → log the first time a valid value is obtained (e.g., after
+            handles become available / API data are ready)
+
+        Parameters
+        ----------
+        s : pyenergyplus State
+            Runtime state passed by EnergyPlus to your callback.
+        name, key : str, optional
+            Variable identifier pair (e.g., name="Zone Mean Air Temperature", key="SPACE1-1").
+            Required if `handle` is not supplied. For site/weather variables the key is
+            typically "Environment".
+        handle : int, optional
+            Pre-resolved variable handle (fast path).
+        allow_warmup : bool, default False
+            If False, the read is skipped during warmup/sizing periods.
+        cache_handle : bool, default True
+            Cache the resolved handle for this (run, name, key).
+        default : float | None, default NaN
+            Value to return when not available (API not ready / warmup / handle missing).
+        label : str | None, default None
+            Optional custom label for logs; if omitted a label is built from the pair/handle.
+        precision : int, default 6
+            Decimal precision for the logged value.
+        level : int, default 1
+            Log level passed to `self._log(level, ...)` (falls back to `print` if `_log` missing).
+        when : {"always","on_change","on_resolve"}, default "always"
+            Logging strategy.
+        eps : float, default 1e-9
+            Threshold for detecting a change under `when="on_change"`.
+        include_timestamp : bool, default False
+            If True, prepend the current simulation timestamp (YYYY-MM-DD HH:MM).
+
+        Returns
+        -------
+        float | None
+            The variable value (or `default`), same as `runtime_get_variable(...)`.
+
+        Notes
+        -----
+        • Intended to be registered via your hook registry, e.g.:
+        `register_handlers("begin", [{"method_name":"tick_log_variable", ...}])`.  
+        • Uses per-run memory to detect changes/resolution events; values are tracked
+        separately per variable handle or `(name, key)` pair.
+
+        Examples
+        --------
+        Log a zone temperature each system timestep (only when it changes):
+
+        >>> util.register_handlers(
+        ...   "begin",
+        ...   [{"method_name": "tick_log_variable",
+        ...     "kwargs": {
+        ...       "name": "Zone Mean Air Temperature",
+        ...       "key": "SPACE1-1",
+        ...       "when": "on_change",
+        ...       "precision": 3,
+        ...       "include_timestamp": True
+        ...     }}],
+        ...   run_during_warmup=False
+        ... )
+
+        Log outdoor drybulb (first resolve only):
+
+        >>> util.register_handlers(
+        ...   "begin",
+        ...   [{"method_name": "tick_log_variable",
+        ...     "kwargs": {
+        ...       "name": "Site Outdoor Air Drybulb Temperature",
+        ...       "key": "Environment",
+        ...       "when": "on_resolve",
+        ...       "label": "Toa (Environment)"
+        ...     }}]
+        ... )
+        """
+        import math
+
+        # 1) Resolve/read via reusable getter (no side effects)
+        v = self.runtime_get_variable(
+            s,
+            name=name,
+            key=key,
+            handle=handle,
+            allow_warmup=allow_warmup,
+            cache_handle=cache_handle,
+            default=default,
+            log=False,  # logging handled here
+        )
+
+        # 2) Stable identifier + human label for logging
+        if isinstance(handle, int) and handle >= 0:
+            ident = ("vh", int(handle))
+            human = label or f"var_handle={handle}"
+        else:
+            nm = (name or "").strip()
+            ky = "" if key is None else str(key).strip()
+            ident = ("vk", nm, ky)
+            human = label or f"{nm} | {ky}"
+
+        # 3) Per-run last-value store (for on_change/on_resolve)
+        d = self.__dict__
+        if d.get("_varlog_state_id") != id(self.state):
+            d["_varlog_state_id"] = id(self.state)
+            d["_varlog_last"] = {}  # map: ident -> last_value (float or None)
+
+        last = d["_varlog_last"].get(ident, None)
+
+        def _is_num(x):
+            try:
+                xf = float(x)
+                return math.isfinite(xf)
+            except Exception:
+                return False
+
+        should_log = False
+        if when == "always":
+            should_log = True
+        elif when == "on_change":
+            if _is_num(v) and _is_num(last):
+                should_log = abs(float(v) - float(last)) > float(eps)
+            elif _is_num(v) != _is_num(last):
+                should_log = True
+        elif when == "on_resolve":
+            should_log = (not _is_num(last)) and _is_num(v)
+        else:
+            should_log = True
+
+        # Optional timestamp (best-effort)
+        ts_prefix = ""
+        if include_timestamp:
+            try:
+                # prefer your class helper if present
+                if hasattr(self, "_occ_current_timestamp"):
+                    ts = self._occ_current_timestamp(s)  # type: ignore[attr-defined]
+                    ts_prefix = f"{ts} | "
+                else:
+                    ex = self.api.exchange
+                    yr = int(ex.year(s)); mo = int(ex.month(s)); dy = int(ex.day_of_month(s))
+                    hh = int(ex.hour(s)); mm = int(ex.minute(s))
+                    ts_prefix = f"{yr:04d}-{mo:02d}-{dy:02d} {hh:02d}:{mm:02d} | "
+            except Exception:
+                ts_prefix = ""
+
+        # 4) Log
+        if should_log:
+            if _is_num(v):
+                msg = f"{ts_prefix}[var:get] {human} = {float(v):.{int(precision)}g}"
+            else:
+                msg = f"{ts_prefix}[var:get] {human} = {v!r}"
+            try:
+                self._log(int(level), msg)  # type: ignore[attr-defined]
+            except Exception:
+                print(msg)
+
+        # 5) Update last and return
+        d["_varlog_last"][ident] = v
+        return v                
