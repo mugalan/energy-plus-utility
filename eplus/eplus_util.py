@@ -6409,4 +6409,290 @@ class EPlusUtil:
 
         # 5) Update last and return
         d["_varlog_last"][ident] = v
-        return v                
+        return v   
+
+    def runtime_get_meter(
+        self,
+        s,
+        *,
+        name: str | None = None,
+        index: int | None = None,
+        which: str = "value",        # "value" | "last" | "accum"
+        allow_warmup: bool = True,
+        cache_index: bool = True,
+        default: float | None = None,
+        log: bool = False,
+    ) -> float | None:
+        """
+        Lightweight getter for an EnergyPlus **meter** value (for use *inside* runtime callbacks).
+
+        Identify the meter by either:
+        • `index` (pre-resolved meter index), or
+        • `name` (e.g., "Electricity:Facility"). Names are case-insensitive in E+.
+
+        The `which` selector attempts, in order of availability:
+        - "value":      ex.get_meter_value(state, index)                   ← current/tick value
+        - "last":       ex.get_meter_value_last_timestep(state, index)     ← previous tick (if supported)
+                        (falls back to "value" if unavailable)
+        - "accum":      ex.get_meter_accumulated_value(state, index)       ← cumulative since env start (if supported)
+                        (falls back to "value" if unavailable)
+
+        Parameters
+        ----------
+        s : pyenergyplus State
+            Runtime state provided to your callback.
+        name : str, optional
+            Meter name (e.g., "Electricity:Facility"). Required if `index` not provided.
+        index : int, optional
+            Pre-resolved meter index (fast path).
+        which : {"value","last","accum"}, default "value"
+            Which value to fetch (see above).
+        allow_warmup : bool, default True
+            If False, return `default` during warmup/sizing.
+        cache_index : bool, default True
+            Cache (name -> index) for this run; indexes are NOT reusable across runs/states.
+        default : float | None, default None
+            Returned when the meter is not yet available or resolution fails.
+        log : bool, default False
+            Emit minimal diagnostics via `self._log`.
+
+        Returns
+        -------
+        float | None
+            The meter value (usually Joules for energy meters) or `default`.
+
+        Notes
+        -----
+        • Safe to call repeatedly every timestep; uses a per-run cache.
+        • Doesn’t raise if API data aren’t ready; simply returns `default` until ready.
+        • No unit conversion here (e.g., to kWh) — log raw, convert elsewhere if needed.
+        """
+        ex = self.api.exchange
+
+        # Warmup?
+        try:
+            if not allow_warmup and ex.warmup_flag(s):
+                return default
+        except Exception:
+            pass
+
+        # Per-run cache (by active state id)
+        d = self.__dict__
+        if d.get("_meter_cache_state_id") != id(self.state):
+            d["_meter_cache_state_id"] = id(self.state)
+            d["_meter_index_cache"] = {}  # name(lower) -> index
+
+        # Resolve index if needed
+        idx = index if (isinstance(index, int) and index >= 0) else -1
+        if idx < 0:
+            if not name:
+                if log:
+                    try: self._log(1, "[meter:get] missing meter name and index.")
+                    except Exception: pass
+                return default
+
+            key = str(name).strip().lower()
+            idx = d["_meter_index_cache"].get(key, -1) if cache_index else -1
+
+            if idx < 0:
+                # Only resolve after API data are ready
+                try:
+                    if not ex.api_data_fully_ready(s):
+                        return default
+                except Exception:
+                    return default
+                try:
+                    # Primary API
+                    idx = ex.get_meter_index(s, name)
+                except Exception:
+                    idx = -1
+                if idx < 0:
+                    if log:
+                        try: self._log(1, f"[meter:get] index not found for: {name!r}")
+                        except Exception: pass
+                    return default
+                if cache_index:
+                    d["_meter_index_cache"][key] = idx
+
+        # Read value per selection
+        try:
+            if which == "last":
+                # Try "last timestep" if available; fall back to current value
+                try:
+                    v = ex.get_meter_value_last_timestep(s, idx)
+                except Exception:
+                    v = ex.get_meter_value(s, idx)
+            elif which == "accum":
+                # Try "accumulated" if available; fall back to current value
+                try:
+                    v = ex.get_meter_accumulated_value(s, idx)
+                except Exception:
+                    v = ex.get_meter_value(s, idx)
+            else:
+                v = ex.get_meter_value(s, idx)
+
+            try:
+                return float(v)
+            except Exception:
+                return default if v is None else float(v)
+        except Exception as e:
+            if log:
+                try: self._log(1, f"[meter:get] read failed ({which}): {e}")
+                except Exception: pass
+            return default  
+
+    def tick_log_meter(
+        self,
+        s,
+        *,
+        name: str | None = None,
+        index: int | None = None,
+        which: str = "value",          # "value" | "last" | "accum"
+        allow_warmup: bool = False,
+        cache_index: bool = True,
+        default: float | None = float("nan"),
+        label: str | None = None,
+        precision: int = 6,
+        level: int = 1,
+        when: str = "always",          # "always" | "on_change" | "on_resolve"
+        eps: float = 1e-9,             # change threshold for "on_change"
+        include_timestamp: bool = False,
+    ) -> float | None:
+        """
+        Read & log an EnergyPlus **meter** value at runtime (register this as a handler).
+
+        Wraps `runtime_get_meter(...)` and supports flexible logging policies:
+        • **always**     – log every tick
+        • **on_change**  – log only when the value changes by > `eps`
+        • **on_resolve** – log the first time a valid value is obtained
+
+        Parameters
+        ----------
+        s : pyenergyplus State
+            Runtime state passed by EnergyPlus to your callback.
+        name : str, optional
+            Meter name (e.g., "Electricity:Facility"). Required if `index` not supplied.
+        index : int, optional
+            Pre-resolved meter index.
+        which : {"value","last","accum"}, default "value"
+            Which meter value to fetch (current / last timestep / accumulated if available).
+        allow_warmup : bool, default False
+            If False, skip logging during warmup/sizing periods.
+        cache_index : bool, default True
+            Cache name→index during this run.
+        default : float | None, default NaN
+            Returned (and optionally logged) when not available yet.
+        label : str | None, default None
+            Custom label for logs; default builds from name/index + `which`.
+        precision : int, default 6
+            Decimal precision for numeric log output.
+        level : int, default 1
+            Log level for `self._log(level, ...)` (falls back to `print`).
+        when : {"always","on_change","on_resolve"}, default "always"
+            Logging policy.
+        eps : float, default 1e-9
+            Change threshold used with `when="on_change"`.
+        include_timestamp : bool, default False
+            Prepend the simulation timestamp (best-effort).
+
+        Returns
+        -------
+        float | None
+            The meter value (or `default`) — same as `runtime_get_meter(...)`.
+
+        Examples
+        --------
+        Log Facility electricity each tick (on change only), with timestamps:
+
+        >>> util.register_handlers(
+        ...   "begin",
+        ...   [{"method_name": "tick_log_meter",
+        ...     "kwargs": {
+        ...       "name": "Electricity:Facility",
+        ...       "which": "value",
+        ...       "when": "on_change",
+        ...       "precision": 3,
+        ...       "include_timestamp": True
+        ...     }}]
+        ... )
+        """
+        import math
+
+        # 1) Resolve/read
+        v = self.runtime_get_meter(
+            s,
+            name=name,
+            index=index,
+            which=which,
+            allow_warmup=allow_warmup,
+            cache_index=cache_index,
+            default=default,
+            log=False,  # logging handled here
+        )
+
+        # 2) Build identifier + human label
+        if isinstance(index, int) and index >= 0:
+            ident = ("mi", int(index), which)
+            human = label or f"meter_index={index} ({which})"
+        else:
+            nm = (name or "").strip()
+            ident = ("mn", nm.lower(), which)
+            human = label or f"{nm} ({which})"
+
+        # 3) Per-run last-value store
+        d = self.__dict__
+        if d.get("_meterlog_state_id") != id(self.state):
+            d["_meterlog_state_id"] = id(self.state)
+            d["_meterlog_last"] = {}  # ident -> last_value
+
+        last = d["_meterlog_last"].get(ident, None)
+
+        def _is_num(x):
+            try:
+                xf = float(x)
+                return math.isfinite(xf)
+            except Exception:
+                return False
+
+        should_log = False
+        if when == "always":
+            should_log = True
+        elif when == "on_change":
+            if _is_num(v) and _is_num(last):
+                should_log = abs(float(v) - float(last)) > float(eps)
+            elif _is_num(v) != _is_num(last):
+                should_log = True
+        elif when == "on_resolve":
+            should_log = (not _is_num(last)) and _is_num(v)
+        else:
+            should_log = True
+
+        # Optional timestamp
+        ts_prefix = ""
+        if include_timestamp:
+            try:
+                if hasattr(self, "_occ_current_timestamp"):
+                    ts = self._occ_current_timestamp(s)  # type: ignore[attr-defined]
+                    ts_prefix = f"{ts} | "
+                else:
+                    ex = self.api.exchange
+                    yr = int(ex.year(s)); mo = int(ex.month(s)); dy = int(ex.day_of_month(s))
+                    hh = int(ex.hour(s)); mm = int(ex.minute(s))
+                    ts_prefix = f"{yr:04d}-{mo:02d}-{dy:02d} {hh:02d}:{mm:02d} | "
+            except Exception:
+                ts_prefix = ""
+
+        # 4) Log
+        if should_log:
+            if _is_num(v):
+                msg = f"{ts_prefix}[meter:get] {human} = {float(v):.{int(precision)}g}"
+            else:
+                msg = f"{ts_prefix}[meter:get] {human} = {v!r}"
+            try:
+                self._log(int(level), msg)  # type: ignore[attr-defined]
+            except Exception:
+                print(msg)
+
+        # 5) Update last + return
+        d["_meterlog_last"][ident] = v
+        return v           
