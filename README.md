@@ -14,13 +14,14 @@ Includes a **silent Colab bootstrapper** that installs system libraries, fetches
 5. [Local (non-Colab) Setup](#-local-non-colab-setup)
 6. [Quick Usage](#-quick-usage)
 7. [Unified Runtime Hooks (Register at Runtime)](#-unified-runtime-hooks-register-at-runtime)
-8. [Kalman/EKF: Persistent Per-Zone Estimation](#-kalmaneqkf-persistent-per-zone-estimation-pluggable)
-9. [Minimal Run Sequence (with Callbacks & EKF)](#-minimal-run-sequence-with-callbacks--ekf)
-10. [API Highlights](#-api-highlights-eplusutil)
-11. [Troubleshooting](#-Troubleshooting)
-12. [SQL Explorer](#-sql-explorer-inspect--extract-from-eplusoutsql)
-13. [License](#-license)
-14. [Acknowledgements](#-acknowledgements)
+8. [Live Control & Monitoring Helpers](#-live-control--monitoring-helpers-actuators-variables-meters)
+9. [Kalman/EKF: Persistent Per-Zone Estimation](#-kalmaneqkf-persistent-per-zone-estimation-pluggable)
+10. [Minimal Run Sequence (with Callbacks & EKF)](#-minimal-run-sequence-with-callbacks--ekf)
+11. [API Highlights](#-api-highlights-eplusutil)
+12. [Troubleshooting](#-troubleshooting)
+13. [SQL Explorer](#-sql-explorer-inspect--extract-from-eplusoutsql)
+14. [License](#-license)
+15. [Acknowledgements](#-acknowledgements)
 
 ---
 
@@ -104,7 +105,7 @@ export LD_LIBRARY_PATH="$ENERGYPLUSDIR:$LD_LIBRARY_PATH"
 
 Then:
 
-```bash
+```python
 pip install "energy-plus-utility @ git+https://github.com/mugalan/energy-plus-utility.git@dev"
 ```
 
@@ -142,9 +143,10 @@ util.run_annual()
 ### 3) Explore what’s available
 
 ```python
-vars_and_meters = util.list_available_variables()  # robust, with dictionary/API fallbacks
-acts = util.list_available_actuators_safely()
-mtrs = util.list_available_meters()
+# Variables + meters (dictionary/API fallbacks; writes CSVs)
+rows = util.list_variables_safely(kinds=("var","meter"))
+# Actuators discovered via API-only catalog path (handles verified)
+acts = util.list_actuators_safely()
 zones = util.list_zone_names(save_csv=True)     # writes zones.csv into out_dir
 ```
 
@@ -216,15 +218,15 @@ disable_hook(hook) -> None
 
 ### Hook alias map
 
-| Alias          | EnergyPlus runtime registration method                                | Typical phase                                      |
-|----------------|------------------------------------------------------------------------|----------------------------------------------------|
-| `begin`        | `callback_begin_system_timestep_before_predictor`                      | Start of each system timestep (“before predictor”) |
-| `before_hvac`  | `callback_after_predictor_before_hvac_managers`                        | After predictor, before HVAC managers              |
-| `inside_iter`  | `callback_inside_system_iteration_loop`                                | Inside system iteration loop                       |
-| `after_hvac`   | `callback_end_system_timestep_after_hvac_reporting`                    | End of system timestep (after HVAC reporting)      |
-| `after_zone`   | `callback_end_zone_timestep_after_zone_reporting`                      | End of zone timestep                               |
-| `after_warmup` | `callback_after_new_environment_warmup_complete`                       | After warmup complete                              |
-| `after_get_input` | `callback_after_component_get_input`                                | After component input is read                      |
+| Alias             | EnergyPlus runtime registration method                         | Typical phase                                      |
+|-------------------|----------------------------------------------------------------|----------------------------------------------------|
+| `begin`           | `callback_begin_system_timestep_before_predictor`              | Start of each system timestep (“before predictor”) |
+| `before_hvac`     | `callback_after_predictor_before_hvac_managers`                | After predictor, before HVAC managers              |
+| `inside_iter`     | `callback_inside_system_iteration_loop`                        | Inside system iteration loop                       |
+| `after_hvac`      | `callback_end_system_timestep_after_hvac_reporting`            | End of system timestep (after HVAC reporting)      |
+| `after_zone`      | `callback_end_zone_timestep_after_zone_reporting`              | End of zone timestep                               |
+| `after_warmup`    | `callback_after_new_environment_warmup_complete`               | After warmup complete                              |
+| `after_get_input` | `callback_after_component_get_input`                           | After component input is read                      |
 
 > You can also pass the **exact** `api.runtime.callback_*` function or its **string name**.
 
@@ -275,6 +277,116 @@ util.enable_hook("begin")
 ```python
 util.unregister_handlers("begin", ["co2_set_outdoor_ppm"])
 util.list_handlers("begin")
+```
+
+---
+
+## 🔧 Live Control & Monitoring Helpers (Actuators, Variables, Meters)
+
+These helpers are designed to be **re-usable** in your own controllers (the functions you register with `register_handlers(...)`). They resolve and cache handles **per run**, are warmup-aware, and can optionally log with timestamps.
+
+### Actuators
+
+**Get at runtime**
+```python
+val = util.runtime_get_actuator(
+    s,
+    component_type="Schedule:Compact",
+    control_type="Schedule Value",
+    actuator_key="FanAvailSched",
+    allow_warmup=False,         # skip during warmup
+    default=None                # return None if not available yet
+)
+```
+
+**Set at runtime (returns True/False)**
+```python
+ok = util.runtime_set_actuator(
+    s,
+    component_type="People",
+    control_type="Number of People",
+    actuator_key="OpenOffice People",
+    value=10.0,                 # or a callable: value=lambda self,s: ...
+    clamp=(0.0, 100.0),         # optional
+    allow_warmup=False,
+    log=True
+)
+```
+
+**Log an actuator each tick**  
+(Use as a registered handler; supports `when="always"|"on_change"|"on_resolve"` and `include_timestamp=True`)
+```python
+util.register_handlers("begin", [{
+  "method_name": "tick_log_actuator",
+  "kwargs": {
+    "component_type": "Weather Data",
+    "control_type": "Outdoor Dry Bulb",
+    "actuator_key": "Environment",
+    "when": "on_resolve",
+    "include_timestamp": True,
+    "precision": 2
+  }
+}])
+```
+
+> **Mass flow setpoint example:** If your model exposes an actuator like  
+> `ComponentType="System Node Setpoint", ControlType="Mass Flow Rate Setpoint", ActuatorKey="<inlet node>"`,  
+> you can drive supply flow per zone by setting that actuator every timestep.
+
+### Variables
+
+**Get at runtime**
+```python
+tz = util.runtime_get_variable(
+    s,
+    name="Zone Air Temperature",
+    key="SPACE1-1",
+    allow_warmup=False,
+    default=None
+)
+```
+
+**Log a Zone People count (only on change)**
+```python
+util.register_handlers("begin", [{
+  "method_name": "tick_log_variable",
+  "kwargs": {
+    "name": "Zone People Occupant Count",
+    "key": "SPACE1-1",
+    "when": "on_change",
+    "precision": 0,
+    "include_timestamp": True,
+    "allow_warmup": False
+  }
+}])
+```
+
+> Register for many zones by creating one handler per zone key.
+
+### Meters
+
+**Get at runtime**
+```python
+p_el = util.runtime_get_meter(
+    s,
+    name="Electricity:Facility",
+    allow_warmup=False,
+    default=None
+)
+```
+
+**Log a meter value each tick**
+```python
+util.register_handlers("after_hvac", [{
+  "method_name": "tick_log_meter",
+  "kwargs": {
+    "name": "Electricity:Facility",
+    "when": "on_change",            # or "always" / "on_resolve"
+    "precision": 3,
+    "include_timestamp": True,
+    "allow_warmup": False
+  }
+}])
 ```
 
 ---
@@ -461,7 +573,6 @@ They let you inject logic **during** the simulation:
 - `register_handlers(hook, methods, *, clear=False, enable=True, run_during_warmup=None)`
 - `list_handlers(hook)`, `unregister_handlers(hook, names)`
 - `enable_hook(hook)`, `disable_hook(hook)`
-- (Thin wrappers may exist for common hooks for convenience.)
 
 **Discovery**
 - `list_variables_safely(...)`, `list_actuators_safely(...)`, `list_zone_names(...)`
@@ -481,6 +592,11 @@ They let you inject logic **during** the simulation:
 
 **Probes & EKF**
 - `probe_zone_air_and_supply(...)`, `probe_zone_air_and_supply_with_kf(...)`
+
+**Live Control & Monitoring**
+- `runtime_get_actuator(...)`, `runtime_set_actuator(...)`, `tick_log_actuator(...)`
+- `runtime_get_variable(...)`, `tick_log_variable(...)`
+- `runtime_get_meter(...)`, `tick_log_meter(...)`
 
 ---
 
@@ -555,3 +671,4 @@ MIT © Mugalan. See `LICENSE`.
 ## ❤️ Acknowledgements
 
 Built on the excellent [EnergyPlus](https://energyplus.net/) simulation engine and its Python API (`pyenergyplus`).
+
