@@ -655,13 +655,14 @@ class EPlusUtil:
         reg["enabled"] = False
 
     # --- back-compat thin shims (optional) ---
-    def register_begin_iteration(self, methods, **kw):
-        """Back-compat wrapper: runs at the beginning of each system timestep (before predictor)."""
-        return self.register_handlers("begin", methods, **kw)
 
-    def register_after_hvac_reporting(self, methods, **kw):
-        """Back-compat wrapper: runs after HVAC reporting each system timestep."""
-        return self.register_handlers("after_hvac", methods, **kw)    
+    # def register_begin_iteration(self, methods, **kw):
+    #     """Back-compat wrapper: runs at the beginning of each system timestep (before predictor)."""
+    #     return self.register_handlers("begin", methods, **kw)
+
+    # def register_after_hvac_reporting(self, methods, **kw):
+    #     """Back-compat wrapper: runs after HVAC reporting each system timestep."""
+    #     return self.register_handlers("after_hvac", methods, **kw)    
 
 
    # ---------- common SQL helpers ----------
@@ -5320,52 +5321,58 @@ class EPlusUtil:
         handle: int | None = None,
         allow_warmup: bool = True,
         cache_handle: bool = True,
-        default: float | None = float("nan"),
+        default: float | None = None,
         log: bool = False,
     ) -> float | None:
         """
-        Read an EnergyPlus actuator value during the simulation (use inside a runtime callback).
+        Lightweight getter for an EnergyPlus actuator value.
 
-        You can specify either:
-        • a pre-resolved `handle`, OR
-        • the actuator triple `(component_type, control_type, actuator_key)` which will be
-            resolved once API data are ready. Handles are cached per run (per active state).
+        This is a *pure helper* meant to be called from your own runtime handlers
+        (i.e., functions you register via `register_handlers(...)`). It performs
+        handle resolution and returns the **current actuator value** as a float when
+        available, otherwise **None** (or the `default` you provide).
+
+        You may identify an actuator by either:
+        - a pre-resolved integer `handle`, **or**
+        - the actuator triple `(component_type, control_type, actuator_key)`.
+            Handles are resolved once `api_data_fully_ready(s)` is true, and are
+            cached **per run (per active state)** if `cache_handle=True`.
 
         Parameters
         ----------
         s : pyenergyplus State
-            The runtime state provided to your callback.
+            The runtime state passed into your callback.
         component_type : str, optional
-            E+ component type, e.g. "Schedule:Compact", "People", "Weather Data".
+            E+ component type (e.g., "Schedule:Compact", "People", "Weather Data").
             Required if `handle` is not provided.
         control_type : str, optional
-            E+ control type, e.g. "Schedule Value", "Number of People", "Outdoor Dry Bulb".
+            E+ control type (e.g., "Schedule Value", "Number of People", "Outdoor Dry Bulb").
             Required if `handle` is not provided.
         actuator_key : str, optional
-            Object/key name for the actuator. May be "" or "*" for wildcard actuators,
-            depending on actuator type. Required if `handle` is not provided.
+            Object/key for the actuator. May be "" or "*" for wildcard actuators,
+            depending on the actuator type. Required if `handle` is not provided.
         handle : int, optional
-            A pre-resolved actuator handle (fast path).
+            Pre-resolved actuator handle (fast path).
         allow_warmup : bool, default True
             If False, returns `default` during warmup/sizing periods.
         cache_handle : bool, default True
-            Cache the resolved handle for (component_type, control_type, key) for the
-            current run. Handles are NOT reusable across runs.
-        default : float | None, default NaN
-            Value to return when the actuator isn't available yet (e.g., before inputs
-            are parsed / API data not ready / handle not found).
+            Cache resolved handles for the current run. Handles are NOT reusable
+            across runs or states.
+        default : float | None, default None
+            Value to return when the actuator is not available yet (e.g., before
+            inputs are parsed / API data not ready / handle not found).
         log : bool, default False
-            Emit a one-line log via `self._log` when handle resolution fails.
+            If True, emits minimal diagnostics via `self._log`.
 
         Returns
         -------
         float | None
-            The current actuator value if available; otherwise `default`.
+            The current actuator value, or `default` (None by default) if not available.
 
         Notes
         -----
-        - Resolution requires `exchange.api_data_fully_ready(s)` to be True. Before then,
-        the function returns `default` without error.
+        - This function avoids raising when the API isn’t ready; it simply returns
+        `default` until `exchange.api_data_fully_ready(s)` is true.
         - Typical schedule read:
             component_type="Schedule:Compact", control_type="Schedule Value", actuator_key="<SchedName>"
         - People example:
@@ -5373,28 +5380,29 @@ class EPlusUtil:
 
         Examples
         --------
-        Read a schedule value each timestep:
+        Use *inside your own handler* (which you will register):
 
-        >>> util.register_begin_iteration([
-        ...   {"method_name": "runtime_get_actuator",
-        ...    "kwargs": {
-        ...      "component_type": "Schedule:Compact",
-        ...      "control_type": "Schedule Value",
-        ...      "actuator_key": "FanAvailSched",
-        ...      "log": True
-        ...    }}
-        ... ])
+        >>> def my_controller(self, s, **_):
+        ...     v = self.runtime_get_actuator(
+        ...         s,
+        ...         component_type="Schedule:Compact",
+        ...         control_type="Schedule Value",
+        ...         actuator_key="FanAvailSched",
+        ...         log=False
+        ...     )
+        ...     if v is None:
+        ...         return  # not ready yet
+        ...     # use v to make a decision, set other actuators, etc.
 
-        Read weather override (if present):
+        Ad-hoc call (only safe if you are already inside a runtime hook or otherwise
+        know the API data are ready):
 
-        >>> util.register_begin_iteration([
-        ...   {"method_name": "runtime_get_actuator",
-        ...    "kwargs": {
-        ...      "component_type": "Weather Data",
-        ...      "control_type": "Outdoor Dry Bulb",
-        ...      "actuator_key": "Environment"
-        ...    }}
-        ... ])
+        >>> val = util.runtime_get_actuator(
+        ...     util.state,
+        ...     component_type="Weather Data",
+        ...     control_type="Outdoor Dry Bulb",
+        ...     actuator_key="Environment"
+        ... )
         """
         ex = self.api.exchange
 
@@ -5405,7 +5413,7 @@ class EPlusUtil:
         except Exception:
             pass
 
-        # Prepare per-run cache
+        # Per-run cache (tied to active state id)
         d = self.__dict__
         if d.get("_act_cache_state_id") != id(self.state):
             d["_act_cache_state_id"] = id(self.state)
@@ -5424,7 +5432,6 @@ class EPlusUtil:
             h = d["_act_handle_cache"].get(key, -1) if cache_handle else -1
 
             if h == -1:
-                # Only safe to resolve after API data are ready
                 try:
                     if not ex.api_data_fully_ready(s):
                         return default
@@ -5442,14 +5449,14 @@ class EPlusUtil:
                 if cache_handle:
                     d["_act_handle_cache"][key] = h
 
-        # Read value
+        # Read current value
         try:
             v = ex.get_actuator_value(s, h)
             try:
-                v = float(v)
+                return float(v)
             except Exception:
-                pass
-            return v
+                # If it’s not strictly numeric, just return as-is if truthy, else default
+                return default if v is None else float(v)
         except Exception as e:
             if log:
                 try: self._log(1, f"[act:get] read failed: {e}")
@@ -5471,124 +5478,94 @@ class EPlusUtil:
         log: bool = False,
     ) -> bool:
         """
-        Set an EnergyPlus actuator value during the simulation (use inside a runtime callback).
+        Set an EnergyPlus actuator during a simulation step (to be called from your own
+        runtime handlers). Returns **True** if a value was applied, else **False**.
 
-        This is a small, generic helper designed to be registered via your hook registry
-        (e.g., `register_begin_iteration([...])`). It supports *either*:
-        - a pre-resolved actuator `handle`, or
-        - the actuator triple `(component_type, control_type, actuator_key)` which will be
-            resolved to a handle once API data are ready.
-
-        Features
-        --------
-        - **Per-run handle cache:** Handles are resolved once per (state, triple) and cached
-        for the current run (handles are *not* reusable across runs).
-        - **Callable values:** `value` may be a number or a function. If a function, it will be
-        invoked as `fn(self, s)` or `fn(s)` or `fn()` (first match) to compute the value
-        *each timestep*.
-        - **Warmup control:** Skip during sizing/warmup by default; set `allow_warmup=True` to run.
-        - **Optional clamping:** Clamp the final value via `clamp=(lo, hi)` before applying.
+        Identify the actuator by either:
+        • a pre-resolved integer `handle`, OR
+        • the actuator triple `(component_type, control_type, actuator_key)`.
+            When using the triple, the handle is resolved once `api_data_fully_ready(s)` is true
+            and cached **per run/per state** if `cache_handle=True`.
 
         Parameters
         ----------
         s : pyenergyplus State
-            The runtime state passed by EnergyPlus to your callback.
-        component_type : str, optional
-            E+ component type, e.g. `"Schedule:Compact"`, `"People"`, `"Weather Data"`.
-            Required if `handle` is not provided.
-        control_type : str, optional
-            E+ control type, e.g. `"Schedule Value"`, `"Number of People"`.
-            Required if `handle` is not provided.
-        actuator_key : str, optional
-            The key/name for the actuator (e.g. schedule or object name). Often a concrete
-            object name, but may be `""` or `"*"` for wildcard-style actuators.
-            Required if `handle` is not provided.
+            Runtime state passed by EnergyPlus to your callback.
+        component_type, control_type, actuator_key : str, optional
+            Actuator triple (e.g., "Schedule:Compact", "Schedule Value", "FanAvailSched").
+            Required if `handle` is not supplied.
         handle : int, optional
-            Pre-resolved actuator handle. If provided (and non-negative), it is used directly.
+            Pre-resolved actuator handle (fast path).
         value : float | int | callable, default 0.0
-            The value to set. If callable, it will be called as `fn(self, s)` (or `fn(s)`,
-            `fn()`) to obtain the numeric value at runtime.
+            Number to set, or a callable returning the number. If callable, it is invoked as
+            `fn(self, s)` → `fn(s)` → `fn()` (first that works) each timestep.
         allow_warmup : bool, default False
-            If False, the setter is skipped during E+ warmup/sizing periods.
+            If False, skip setting during warmup/sizing.
         clamp : (float, float) | None, default None
-            If provided, the value is clamped to this inclusive range before setting.
+            Inclusive bounds; final value is clamped to this range if provided.
         cache_handle : bool, default True
-            Cache the resolved handle for this (state_id, component_type, control_type, key).
+            Cache the resolved handle for (component_type, control_type, key) for this run.
         log : bool, default False
-            Emit a one-line log on success/failure via `self._log` (if available).
+            Emit one-line diagnostics via `self._log`.
 
         Returns
         -------
         bool
-            True if a value was applied, False otherwise (e.g., handle not available yet).
+            True if set succeeded, False otherwise (e.g., API not ready, warmup disallowed,
+            handle not found, non-numeric value, or API error).
 
         Notes
         -----
-        - Handles are only reliable **after inputs are parsed** and API data are ready.
-        This method will auto-resolve when `exchange.api_data_fully_ready(s)` is True.
-        - For schedule actuators, you typically use:
+        - Handles are valid only after inputs are parsed and **only for the current run**.
+        - Typical schedule actuator:
             component_type="Schedule:Compact", control_type="Schedule Value", actuator_key="<SchedName>"
-        - For People, a common triplet is:
+        - People count example:
             component_type="People", control_type="Number of People", actuator_key="<People Object Name>"
 
         Examples
         --------
-        Register to force a fan availability schedule to 0 during runtime:
+        Inside your controller handler (registered via `register_handlers(...)`):
 
-        >>> util.register_begin_iteration([
-        ...   {"method_name": "runtime_set_actuator",
-        ...    "kwargs": {
-        ...      "component_type": "Schedule:Compact",
-        ...      "control_type": "Schedule Value",
-        ...      "actuator_key": "FanAvailSched",
-        ...      "value": 0.0
-        ...    }}
-        ... ])
+        >>> def my_controller(self, s, **_):
+        ...     # Force fan availability schedule to 0
+        ...     ok = self.runtime_set_actuator(
+        ...         s,
+        ...         component_type="Schedule:Compact",
+        ...         control_type="Schedule Value",
+        ...         actuator_key="FanAvailSched",
+        ...         value=0.0,
+        ...         log=False
+        ...     )
+        ...     # optionally branch on 'ok'
 
-        Set People counts dynamically each step from a callable:
-
-        >>> def occ_profile(self, s):
-        ...     # your logic here; return a float
+        With a callable value + clamping:
+        >>> def occ_profile(self, s):  # returns a float
         ...     minute = int(self.api.exchange.minute(s))
         ...     return 5.0 if 9*60 <= minute <= 17*60 else 0.0
         ...
-        >>> util.register_begin_iteration([
-        ...   {"method_name": "runtime_set_actuator",
-        ...    "kwargs": {
-        ...      "component_type": "People",
-        ...      "control_type": "Number of People",
-        ...      "actuator_key": "OpenOffice People",
-        ...      "value": occ_profile,
-        ...      "clamp": (0.0, 100.0)
-        ...    }}
-        ... ])
-
-        Drive outdoor air drybulb (Weather Data) for what-if scenarios:
-
-        >>> util.register_begin_iteration([
-        ...   {"method_name": "runtime_set_actuator",
-        ...    "kwargs": {
-        ...      "component_type": "Weather Data",
-        ...      "control_type": "Outdoor Dry Bulb",
-        ...      "actuator_key": "Environment",
-        ...      "value": 35.0
-        ...    }}
-        ... ])
+        >>> def set_people(self, s, **_):
+        ...     self.runtime_set_actuator(
+        ...         s,
+        ...         component_type="People",
+        ...         control_type="Number of People",
+        ...         actuator_key="OpenOffice People",
+        ...         value=occ_profile,
+        ...         clamp=(0.0, 100.0)
+        ...     )
         """
         ex = self.api.exchange
 
-        # Skip during warmup unless explicitly allowed
+        # 1) Skip during warmup unless allowed
         try:
             if not allow_warmup and ex.warmup_flag(s):
                 return False
         except Exception:
             pass
 
-        # Evaluate value (support callable)
+        # 2) Evaluate value (supports callable)
         v = value
         if callable(v):
             try:
-                # try (self, s) → (s) → ()
                 try:
                     v = value(self, s)
                 except TypeError:
@@ -5598,39 +5575,38 @@ class EPlusUtil:
                         v = value()
             except Exception:
                 if log:
-                    try: self._log(1, "[act] value function failed; skipping set.")
+                    try: self._log(1, "[act:set] value function failed; skipping.")
                     except Exception: pass
                 return False
 
-        # Numeric check
+        # Must be numeric
         try:
             v = float(v)
         except Exception:
             if log:
-                try: self._log(1, f"[act] non-numeric value={v!r}; skipping set.")
+                try: self._log(1, f"[act:set] non-numeric value={v!r}; skipping.")
                 except Exception: pass
             return False
 
-        # Optional clamp
+        # 3) Optional clamp
         if clamp is not None and len(clamp) == 2:
             lo, hi = float(clamp[0]), float(clamp[1])
             if lo > hi:
                 lo, hi = hi, lo
             v = max(lo, min(hi, v))
 
-        # Initialize per-run cache
+        # 4) Per-run handle cache
         d = self.__dict__
-        state_id = id(self.state)
-        if d.get("_act_cache_state_id") != state_id:
-            d["_act_cache_state_id"] = state_id
+        if d.get("_act_cache_state_id") != id(self.state):
+            d["_act_cache_state_id"] = id(self.state)
             d["_act_handle_cache"] = {}  # (comp, ctrl, key) -> handle
 
-        # Resolve handle if needed
+        # 5) Resolve handle
         h = handle if (isinstance(handle, int) and handle >= 0) else -1
         if h == -1:
             if not all([component_type, control_type]) or actuator_key is None:
                 if log:
-                    try: self._log(1, "[act] missing actuator triple and no valid handle; skipping set.")
+                    try: self._log(1, "[act:set] missing actuator triple and no valid handle.")
                     except Exception: pass
                 return False
 
@@ -5638,12 +5614,10 @@ class EPlusUtil:
             h = d["_act_handle_cache"].get(key, -1) if cache_handle else -1
 
             if h == -1:
-                # Only safe to resolve after API data are ready
                 try:
                     if not ex.api_data_fully_ready(s):
                         return False
                 except Exception:
-                    # If the call isn't supported yet, bail out quietly
                     return False
                 try:
                     h = ex.get_actuator_handle(s, key[0], key[1], key[2])
@@ -5651,26 +5625,194 @@ class EPlusUtil:
                     h = -1
                 if h == -1:
                     if log:
-                        try: self._log(1, f"[act] handle not found for: {key}")
+                        try: self._log(1, f"[act:set] handle not found for: {key}")
                         except Exception: pass
                     return False
                 if cache_handle:
                     d["_act_handle_cache"][key] = h
 
-        # Apply
+        # 6) Apply
         try:
             ex.set_actuator_value(s, h, v)
             if log:
                 try:
                     if handle is not None and handle >= 0:
-                        self._log(1, f"[act] set handle={h} value={v:.6g}")
+                        self._log(1, f"[act:set] handle={h} -> {v:.6g}")
                     else:
-                        self._log(1, f"[act] set ({component_type} | {control_type} | {actuator_key}) -> {v:.6g}")
+                        self._log(1, f"[act:set] ({component_type} | {control_type} | {actuator_key}) -> {v:.6g}")
                 except Exception:
                     pass
             return True
         except Exception as e:
             if log:
-                try: self._log(1, f"[act] set failed: {e}")
+                try: self._log(1, f"[act:set] failed: {e}")
                 except Exception: pass
             return False
+
+    def tick_log_actuator(
+        self,
+        s,
+        *,
+        component_type: str | None = None,
+        control_type: str | None = None,
+        actuator_key: str | None = None,
+        handle: int | None = None,
+        allow_warmup: bool = False,
+        cache_handle: bool = True,
+        default: float | None = float("nan"),
+        label: str | None = None,
+        precision: int = 6,
+        level: int = 1,
+        when: str = "always",         # "always" | "on_change" | "on_resolve"
+        eps: float = 1e-9,            # change threshold for "on_change"
+    ) -> float | None:
+        """
+        Read & log an EnergyPlus actuator value at runtime (to be *registered* as a handler).
+
+        This helper simply wraps `runtime_get_actuator(...)` and adds flexible logging:
+        - **always**: log every time it runs,
+        - **on_change**: log only when the value changes by more than `eps`,
+        - **on_resolve**: log only the first time a valid value is obtained (e.g., after handles
+        become available / API is ready).
+
+        Parameters
+        ----------
+        s : pyenergyplus State
+            Runtime state passed by EnergyPlus to your callback.
+        component_type, control_type, actuator_key : str, optional
+            Actuator triple (e.g., "Schedule:Compact", "Schedule Value", "FanAvailSched").
+            Required if `handle` is not supplied.
+        handle : int, optional
+            Pre-resolved actuator handle (fast path).
+        allow_warmup : bool, default False
+            If False, the read is skipped during warmup/sizing periods.
+        cache_handle : bool, default True
+            Cache the resolved handle for this (run, triple).
+        default : float | None, default NaN
+            Value to return when not available (API not ready / warmup / handle missing).
+        label : str | None, default None
+            Optional custom label for logs; if omitted a label is built from the triple/handle.
+        precision : int, default 6
+            Decimal precision for the logged value.
+        level : int, default 1
+            Log level passed to `self._log(level, ...)` (falls back to `print` if `_log` missing).
+        when : {"always","on_change","on_resolve"}, default "always"
+            Logging strategy.
+        eps : float, default 1e-9
+            Threshold for detecting a change under `when="on_change"`.
+
+        Returns
+        -------
+        float | None
+            The actuator value (or `default`), same as `runtime_get_actuator(...)`.
+
+        Notes
+        -----
+        - Intended to be registered via your hook registry, e.g.:
+        `register_handlers("begin", [{"method_name":"tick_log_actuator", ...}])`.
+        - Uses per-run memory to detect changes/resolution events; values are tracked
+        separately per actuator handle or (component, control, key) triple.
+
+        Examples
+        --------
+        Log a schedule value each system timestep (begin hook):
+
+        >>> util.register_handlers(
+        ...   "begin",
+        ...   [{"method_name": "tick_log_actuator",
+        ...     "kwargs": {
+        ...       "component_type": "Schedule:Compact",
+        ...       "control_type": "Schedule Value",
+        ...       "actuator_key": "FanAvailSched",
+        ...       "when": "on_change",         # only when value changes
+        ...       "precision": 3
+        ...     }}],
+        ...   run_during_warmup=False
+        ... )
+
+        Log weather override (first resolve only):
+
+        >>> util.register_handlers(
+        ...   "begin",
+        ...   [{"method_name": "tick_log_actuator",
+        ...     "kwargs": {
+        ...       "component_type": "Weather Data",
+        ...       "control_type": "Outdoor Dry Bulb",
+        ...       "actuator_key": "Environment",
+        ...       "when": "on_resolve",
+        ...       "label": "Outdoor Dry Bulb (override)"
+        ...     }}]
+        ... )
+        """
+        import math
+
+        # 1) Resolve/read via your reusable getter (no side effects)
+        v = self.runtime_get_actuator(
+            s,
+            component_type=component_type,
+            control_type=control_type,
+            actuator_key=actuator_key,
+            handle=handle,
+            allow_warmup=allow_warmup,
+            cache_handle=cache_handle,
+            default=default,
+            log=False,  # logging handled here
+        )
+
+        # 2) Build a stable identifier + human label for logging
+        if isinstance(handle, int) and handle >= 0:
+            key = ("h", int(handle))
+            human = label or f"handle={handle}"
+        else:
+            ct = (component_type or "").strip()
+            tt = (control_type or "").strip()
+            ak = "" if actuator_key is None else str(actuator_key).strip()
+            key = ("t", ct, tt, ak)
+            human = label or f"{ct} | {tt} | {ak}"
+
+        # 3) Per-run last-value store (for on_change/on_resolve)
+        d = self.__dict__
+        if d.get("_actlog_state_id") != id(self.state):
+            d["_actlog_state_id"] = id(self.state)
+            d["_actlog_last"] = {}  # map: key -> last_value (float or None)
+
+        last = d["_actlog_last"].get(key, None)
+
+        # helper to check "is valid number"
+        def _is_num(x):
+            try:
+                xf = float(x)
+                return math.isfinite(xf)
+            except Exception:
+                return False
+
+        should_log = False
+        if when == "always":
+            should_log = True
+        elif when == "on_change":
+            if _is_num(v) and _is_num(last):
+                should_log = abs(float(v) - float(last)) > float(eps)
+            elif _is_num(v) != _is_num(last):
+                # one side was NaN/None, the other is numeric → treat as change
+                should_log = True
+        elif when == "on_resolve":
+            # previously invalid → now valid
+            should_log = (not _is_num(last)) and _is_num(v)
+        else:
+            # unknown policy → default to always
+            should_log = True
+
+        # 4) Log
+        if should_log:
+            if _is_num(v):
+                msg = f"[act:get] {human} = {float(v):.{int(precision)}g}"
+            else:
+                msg = f"[act:get] {human} = {v!r}"  # e.g., None/NaN/default
+            try:
+                self._log(int(level), msg)  # type: ignore[attr-defined]
+            except Exception:
+                print(msg)
+
+        # 5) Update last and return
+        d["_actlog_last"][key] = v
+        return v
