@@ -664,7 +664,9 @@ xp.auto_extract_series("Electricity:Facility", to_kwh=True, csv_out="facility_kW
 
 ## 📄 License
 
-MIT © Mugalan. See `LICENSE`.
+MIT License
+
+Copyright (c) 2025 Mugalan
 
 ---
 
