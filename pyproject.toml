@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "energy-plus-utility"
-dynamic = ["version"]
+version = "0.2.1+2"
 requires-python = ">=3.9"
 description = "EnergyPlus utilities with a Colab bootstrapper (silent)."
 readme = "README.md"
@@ -24,6 +24,3 @@ eplus-prepare-colab = "eplus.colab_bootstrap:main"   # optional CLI
 [tool.hatch.build]
 packages = ["eplus"]
 include  = ["README.md", "LICENSE"]
-
-[tool.setuptools.dynamic]
-version = {attr = "eplus.__version__"}
