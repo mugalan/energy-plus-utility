@@ -3,6 +3,7 @@ import shutil
 from typing import Optional
 import os, io, csv as _csv, ast, shutil, pathlib, subprocess, re, tempfile, contextlib
 import pandas as pd
+from collections import Counter
 
 class IDFMixin:
     def __init__(self):
@@ -291,3 +292,50 @@ class IDFMixin:
         sections = self.api_catalog_df(save_csv=save_csv)
         df = sections.get("ACTUATORS", pd.DataFrame(columns=["Kind","ComponentType","ControlType","ActuatorKey","Units"]))
         return df
+
+    def get_idf_object_types(self):
+        """
+        Scans an IDF file and returns a list of all Object Types present,
+        sorted by how often they appear.
+        """
+        with open(self.idf, 'r', errors="ignore") as f:
+            text = f.read()
+
+        # 1. Remove comments (everything after !)
+        text_no_comments = re.sub(r'!.*$', '', text, flags=re.MULTILINE)
+
+        # 2. Find the start of every object
+        # Pattern: Start of line, some text, then a comma or semicolon
+        # This captures "Zone," or "Schedule:Compact,"
+        pattern = r'^\s*([A-Za-z:\-]+)\s*[,;]'
+        
+        matches = re.findall(pattern, text_no_comments, flags=re.MULTILINE)
+        
+        # 3. Clean up and count
+        types = [m.strip() for m in matches]
+        counts = Counter(types)
+        
+        # Return as a list of tuples: [('Zone', 5), ('Schedule:Compact', 3)...]
+        return counts.most_common()
+
+    def extract_idf_objects(self, object_type):
+        """
+        Scans the IDF text for a specific object type and returns the names.
+        Fast, no simulation required.
+        """
+        with open(self.idf, 'r', errors="ignore") as f:
+            text = f.read()
+
+        # Remove comments (!)
+        text = re.sub(r'!.*$', '', text, flags=re.MULTILINE)
+
+        # Regex to find objects like "Schedule:Compact,"
+        # This is a simple parser; for complex IDFs, consider using the 'eppy' library.
+        pattern = fr'(?i)^\s*{re.escape(object_type)}\s*,\s*(.*?)[,;]'
+        
+        matches = re.findall(pattern, text, flags=re.MULTILINE)
+        
+        # Clean up whitespace
+        names = [m.strip() for m in matches]
+        return names
+
