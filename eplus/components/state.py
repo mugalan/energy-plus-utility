@@ -24,7 +24,7 @@ class StateMixin(EnergyPlusAPI):
 
         # Create the new state using the inherited state_manager
         self.state = self.state_manager.new_state()
-        self._log(2, "Initialized new EnergyPlus state.")
+        self._log(2, "Initialized EnergyPlus State.")
 
     def reset_state(self) -> None:
         """

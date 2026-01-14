@@ -15,6 +15,7 @@ class EPlusUtil(StateMixin, IDFMixin, LoggingMixin, SimulationMixin, UtilsMixin)
     def __init__(self, *, verbose: int = 1, out_dir: str | None = None):
         # Initialize attributes specifically for this class
         self.verbose = int(verbose)
+        self.out_dir = str(out_dir)
         
         # Initialize Mixins manually to ensure all attributes are set up.
         StateMixin.__init__(self)

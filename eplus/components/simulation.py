@@ -63,7 +63,7 @@ class SimulationMixin:
         self.reset_state()
         # TODO:Add this Register Thing
         # self._register_callbacks()
-        return self.api.runtime.run_energyplus(
+        return self.runtime.run_energyplus(
             self.state, ['-w', self.epw, '-d', self.out_dir, self.idf]
         )
 
@@ -125,7 +125,7 @@ class SimulationMixin:
         self.reset_state()
         # TODO:Add this Register Thing
         # self._register_callbacks()
-        return self.api.runtime.run_energyplus(
+        return self.runtime.run_energyplus(
             self.state, ['-w', self.epw, '-d', self.out_dir, '--design-day', self.idf]
         )
 
@@ -244,4 +244,4 @@ class SimulationMixin:
         if design_day:
             args.append('--design-day')
         args.append(str(patched))
-        return self.api.runtime.run_energyplus(self.state, args)
+        return self.runtime.run_energyplus(self.state, args)
