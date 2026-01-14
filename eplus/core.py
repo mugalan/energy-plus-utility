@@ -6,7 +6,7 @@ from .components.state import StateMixin
 from .components.idf import IDFMixin
 from .components.logging import LoggingMixin
 
-class BaseEPlusUtil(StateMixin, IDFMixin, LoggingMixin):
+class EPlusUtil(StateMixin, IDFMixin, LoggingMixin):
     """
     Main class that combines State, IDF, and Logging functionalities.
     Inheritance order matters: Methods in StateMixin are checked before IOMixin, etc.

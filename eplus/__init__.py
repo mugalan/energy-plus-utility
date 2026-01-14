@@ -12,9 +12,9 @@ __all__ = ["prepare_colab_eplus", "__version__"]
 # isn't installed yet. We catch the error so 'prepare_colab_eplus' 
 # remains accessible.
 try:
-    from .core import BaseEPlusUtil
+    from .core import EPlusUtil
 
-    class EPlusUtil(BaseEPlusUtil):
+    class EPlusUtil(EPlusUtil):
         """
         Utility wrapper around pyenergyplus EnergyPlusAPI.
         
