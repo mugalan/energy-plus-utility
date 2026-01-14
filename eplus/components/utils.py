@@ -2,8 +2,8 @@ import os, tempfile, pathlib
 
 class UtilsMixin:
     def __init__(self):
-        print("UtilsMixin initialized.")
-    
+        self._log(2, "Initialized UtilsMixin")
+        
     def _assert_out_dir_writable(self):
         assert self.out_dir, "set_model(...) first."
         os.makedirs(self.out_dir, exist_ok=True)

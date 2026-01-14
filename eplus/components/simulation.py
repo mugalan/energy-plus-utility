@@ -2,7 +2,7 @@ import pathlib, re
 
 class SimulationMixin:
     def __init__(self):
-        print("SimulationMixin initialized.")
+        self._log(2, "Initialized SimulationMixin")
 
     def run_annual(self) -> int:
         """

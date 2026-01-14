@@ -13,6 +13,7 @@ class StateMixin(EnergyPlusAPI):
     to API sub-modules like self.exchange, self.runtime, etc.
     """
     def __init__(self):
+        self._log(2, "Initialized StateMixin")
         # Initialize the parent EnergyPlusAPI
         # This sets up self.state_manager, self.runtime, self.exchange, etc.
         super().__init__()

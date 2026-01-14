@@ -1,6 +1,4 @@
 # eplus/core.py
-from typing import Optional
-
 # Import your mixins
 from .components.state import StateMixin
 from .components.idf import IDFMixin
