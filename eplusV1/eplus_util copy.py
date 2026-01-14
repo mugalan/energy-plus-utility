@@ -13,25 +13,7 @@ from pyenergyplus.api import EnergyPlusAPI
 # ---------- CSV logger specs ----------
 
 class EPlusUtil:
-    """
-    Utility wrapper around pyenergyplus EnergyPlusAPI.
 
-    • State is created at init and is resettable.
-    • set_model(idf, epw, out_dir)
-    • run_design_day() / run_annual() with centralized callback registration
-    • list_variables_safely() / list_actuators_safely() via tiny design-day runs
-    • set_simulation_params() patches timestep/runperiod (writes ...__patched.idf)
-
-    SQL-focused plotting/IO:
-      - plot_sql_series(...)
-      - plot_sql_meters(...)
-      - plot_sql_zone_variable(...)
-      - plot_sql_net_purchased_electricity(...)
-      - export_weather_sql_to_csv(...)
-
-    Notes:
-      - reporting_freq=None in plotters means "no frequency filter" (passes through any freq present).
-    """
 
     # ---- Schedule types we probe for actuators ----
     _SCHEDULE_TYPES = (
@@ -43,17 +25,9 @@ class EPlusUtil:
 
     # ----- lifecycle -----
     def __init__(self, *, verbose: int = 1, out_dir: str | None =None):
-        # self.api = EnergyPlusAPI()
-        # self.state = self.api.state_manager.new_state()
-
-        # # model paths
-        # self.idf: Optional[str] = None
-        # self.epw: Optional[str] = None
-        # self.out_dir: Optional[str] = out_dir
-
-        # # patched idf (if any)
-        # self._patched_idf_path: Optional[str] = None
-        # self._orig_idf_path: Optional[str] = None
+        # patched idf (if any)
+        self._patched_idf_path: Optional[str] = None
+        self._orig_idf_path: Optional[str] = None
 
         # occupancy (lazy-init fields)
         self._occ_enabled: bool = False
@@ -63,14 +37,6 @@ class EPlusUtil:
         self._occ_fill: str = "ffill"
         self._occ_verbose: bool = True
         self._occ_ready: bool = False
-
-        #  optional: user-added callbacks (registrar, func) pairs
-        # self._extra_callbacks: List[Tuple[callable, callable]] = []
-
-        # logging + verbosity
-        # self.verbose: int = int(verbose)
-        # self._runtime_log_enabled: bool = False
-        # self._runtime_log_func = None
 
         self.callback_aliases = {
             "begin":        "callback_begin_system_timestep_before_predictor",
@@ -82,46 +48,8 @@ class EPlusUtil:
             "after_get_input": "callback_after_component_get_input",
         }
 
-    def _assert_out_dir_writable(self):
-        import os, tempfile, pathlib
-        assert self.out_dir, "set_model(...) first."
-        os.makedirs(self.out_dir, exist_ok=True)
-        # quick write test
-        tmp = pathlib.Path(self.out_dir) / ".write_test.tmp"
-        with open(tmp, "wb") as f:
-            f.write(b"ok")
-        tmp.unlink(missing_ok=True)
 
-    def clear_eplus_outputs(self, patterns: tuple[str, ...] = ("eplusout.*",)) -> None:
-        """
-        Remove common EnergyPlus outputs in out_dir, especially a stale/locked eplusout.sql.
-        Safe to call before runs.
-        """
-        import glob, os
-        assert self.out_dir, "set_model(...) first."
-        for pat in patterns:
-            for p in glob.glob(os.path.join(self.out_dir, pat)):
-                try: os.remove(p)
-                except IsADirectoryError: pass
-                except FileNotFoundError: pass
-                except PermissionError: pass  # leave it if OS blocks; at least we tried
 
-    def delete_out_dir(self):
-        """
-        Delete the output directory (`self.out_dir`) and all of its contents, if it exists.
-
-        The directory is removed recursively via `shutil.rmtree(..., ignore_errors=True)`.
-        Missing directories or removal errors are silently ignored. This only affects the
-        on-disk folder; the `self.out_dir` attribute is not modified.
-        """        
-        import shutil, os
-        if self.out_dir and os.path.exists(self.out_dir):
-            shutil.rmtree(self.out_dir, ignore_errors=True)
-
-    # --- tiny logger ---
-    def _log(self, level: int, msg: str):
-        if self.verbose >= level:
-            print(msg)
 
     # --- Generi Callback registering hub ---
 
@@ -737,93 +665,6 @@ class EPlusUtil:
         if getattr(self, "_runtime_log_enabled", False) and getattr(self, "_runtime_log_func", None):
             self.api.runtime.callback_message(self.state, self._runtime_log_func)
 
-    def reset_state(self) -> None:
-        try:
-            if getattr(self, "state", None):
-                self.api.state_manager.reset_state(self.state)
-        except Exception:
-            pass
-        self.state = self.api.state_manager.new_state()
-        # occupancy runtime only
-        self._people_handles = {}
-        self._occ_ready = False
-        # keep logger alive across resets
-        if getattr(self, "_runtime_log_enabled", False) and getattr(self, "_runtime_log_func", None):
-            self.api.runtime.callback_message(self.state, self._runtime_log_func)
-
-    def set_model(self, idf: str, epw: str, out_dir: Optional[str] = None, *, reset: bool = True, add_co2: bool = True, outdoor_co2_ppm: float = 420.0,per_person_m3ps_per_W: float = 3.82e-8) -> None:
-        """
-        Configure the active EnergyPlus model paths and (optionally) inject a minimal
-        CO₂ setup, ready for subsequent runs.
-
-        This sets `self.idf`, `self.epw`, and `self.out_dir` (creating the output
-        directory if needed). If `reset=True`, the EnergyPlus state is reset so that
-        subsequent runs start clean.
-
-        If `add_co2=True`, this calls `prepare_run_with_co2(...)` to:
-        - enable zone CO₂ accounting via `ZoneAirContaminantBalance`,
-        - create/bind an **outdoor CO₂ schedule** seeded to `outdoor_co2_ppm`,
-        - patch each `People` object with a **CO₂ generation rate coefficient**
-            (`per_person_m3ps_per_W`, in m³·s⁻¹ per W per person),
-        - write a patched IDF in `out_dir` and switch `self.idf` to that file.
-        (That helper also resets state by default, so the model will be ready to run
-        with the CO₂ features active.)
-
-        Parameters
-        ----------
-        idf : str
-            Path to the IDF model to load.
-        epw : str
-            Path to the EPW weather file to use.
-        out_dir : Optional[str], default None
-            Directory for EnergyPlus outputs; created if missing. Defaults to
-            ``"eplus_out"`` when not provided.
-        reset : bool, default True
-            If True, reset the EnergyPlus API state immediately after setting paths.
-        add_co2 : bool, default True
-            If True, inject the minimal CO₂ workflow via `prepare_run_with_co2(...)`
-            and switch `self.idf` to the patched file.
-        outdoor_co2_ppm : float, default 420.0
-            Initial value for the outdoor CO₂ schedule (ppm) when `add_co2=True`.
-        per_person_m3ps_per_W : float, default 3.82e-8
-            People CO₂ generation coefficient (m³/s per W per person). EnergyPlus’s
-            default is 3.82e-8; values are clamped to the model’s allowed range
-            inside the helper.
-
-        Notes
-        -----
-        - This method **does not run** a simulation; it only configures paths/state.
-        - When `add_co2=True`, `self._orig_idf_path` is remembered and `self.idf`
-        points to the newly written CO₂-patched IDF in `out_dir`.
-
-        Returns
-        -------
-        None
-
-        Examples
-        --------
-        Basic setup with CO₂ enabled (default):
-        >>> util.set_model("models/small_office.idf", "weather/USA_CA_San-Francisco.epw",
-        ...                out_dir="runs/run1")
-
-        Custom outdoor CO₂ and generation rate:
-        >>> util.set_model("bldg.idf", "site.epw", out_dir="out",
-        ...                add_co2=True, outdoor_co2_ppm=450.0,
-        ...                per_person_m3ps_per_W=3.5e-8)
-
-        Skip CO₂ patching entirely:
-        >>> util.set_model("bldg.idf", "site.epw", out_dir="out", add_co2=False)
-        """
-
-        self.idf = str(idf)
-        self.epw = str(epw)
-        self.out_dir = str(out_dir or "eplus_out")
-        os.makedirs(self.out_dir, exist_ok=True)
-        if reset:
-            self.reset_state()
-                
-        if add_co2:
-            self.prepare_run_with_co2(outdoor_co2_ppm=outdoor_co2_ppm,per_person_m3ps_per_W=per_person_m3ps_per_W)
 
     def list_zone_names(
         self,
@@ -1495,247 +1336,6 @@ class EPlusUtil:
             for h in handles:
                 self.api.exchange.set_actuator_value(s, h, per)
 
-    # ---------- run methods (single, non-duplicated) ----------
-
-    def run_annual(self) -> int:
-        """
-        Run a full **annual** EnergyPlus simulation with the currently configured
-        `idf`, `epw`, and `out_dir`.
-
-        What this method does
-        ---------------------
-        1) Verifies that `set_model(idf, epw, out_dir)` has been called and that
-        `out_dir` is writable.
-        2) Proactively removes common stale outputs
-        (`eplusout.sql`, `eplusout.err`, `eplusout.audit`) to avoid locked/dirty
-        files causing SQLite/open errors.
-        3) Resets the EnergyPlus API **state** (clean run).
-        4) Re-registers any queued callbacks (e.g., those added via
-        `register_begin_iteration(...)`, `register_after_hvac_reporting(...)`,
-        `enable_runtime_logging()`, or CSV occupancy handlers).
-        5) Executes EnergyPlus with arguments:
-        `['-w', self.epw, '-d', self.out_dir, self.idf]`.
-
-        Returns
-        -------
-        int
-            EnergyPlus process exit code (0 indicates success).
-
-        Raises
-        ------
-        AssertionError
-            If `idf`, `epw`, or `out_dir` is not set (call `set_model(...)` first).
-
-        Side effects
-        ------------
-        - Writes standard EnergyPlus outputs into `out_dir` (e.g., `eplusout.err`,
-        `eplusout.eso`, `eplusout.mtr`, etc.).
-        - If your active IDF includes `Output:SQLite`, also writes `eplusout.sql`.
-
-        Tips
-        ----
-        - If you need the SQLite database, ensure your active IDF includes
-        `Output:SQLite` or call `ensure_output_sqlite(activate=True)` before running.
-        - For a quick probe that only runs sizing/design days, use `run_design_day()`.
-
-        Examples
-        --------
-        Basic annual run:
-        >>> util.set_model("models/bldg.idf", "weather/site.epw", out_dir="runs/annual")
-        >>> code = util.run_annual()
-        >>> assert code == 0
-
-        Ensure SQL is produced, then run:
-        >>> util.ensure_output_sqlite()  # appends Output:SQLite and activates patched IDF
-        >>> util.run_annual()
-        """
-        assert self.idf and self.epw and self.out_dir, "Call set_model(idf, epw, out_dir) first."
-        self._assert_out_dir_writable()
-        # prevent SQLite open errors from a stale file
-        self.clear_eplus_outputs(("eplusout.sql", "eplusout.err", "eplusout.audit"))
-        self.reset_state()
-        self._register_callbacks()
-        return self.api.runtime.run_energyplus(
-            self.state, ['-w', self.epw, '-d', self.out_dir, self.idf]
-        )
-
-    def run_design_day(self) -> int:
-        """
-        Run a **design-day–only** EnergyPlus simulation for the active `idf`/`epw`
-        into `out_dir`. This is a fast probe run (sizing periods only), useful for
-        validating inputs, generating dictionaries, or triggering lightweight
-        callbacks without simulating the full year.
-
-        What this does
-        --------------
-        1) Verifies `set_model(idf, epw, out_dir)` has been called and that `out_dir`
-        is writable.
-        2) Removes common stale outputs (`eplusout.sql`, `eplusout.err`,
-        `eplusout.audit`) to avoid file locks/SQLite open errors.
-        3) Resets the EnergyPlus API **state** (clean run).
-        4) Re-registers any queued callbacks (e.g., from
-        `register_begin_iteration(...)`, `register_after_hvac_reporting(...)`,
-        CSV occupancy, or `enable_runtime_logging()`).
-        5) Executes EnergyPlus with:
-        `['-w', self.epw, '-d', self.out_dir, '--design-day', self.idf]`.
-
-        Returns
-        -------
-        int
-            EnergyPlus process exit code (0 means success).
-
-        Raises
-        ------
-        AssertionError
-            If `idf`, `epw`, or `out_dir` is missing (call `set_model(...)` first).
-
-        Notes
-        -----
-        - If your active IDF includes `Output:VariableDictionary, IDF;`, this run can
-        emit `eplusout.rdd/.mdd` quickly.
-        - If your active IDF includes `Output:SQLite`, `eplusout.sql` (for sizing
-        periods) will be produced; downstream readers should set
-        `include_design_days=True` if they want to query those data.
-        - Handles registered during this method are attached to the fresh state used
-        for this run.
-
-        Examples
-        --------
-        Quick sizing-period check:
-        >>> util.set_model("models/bldg.idf", "weather/site.epw", out_dir="runs/dd")
-        >>> code = util.run_design_day()
-        >>> assert code == 0
-
-        Generate dictionaries fast, then parse:
-        >>> util.ensure_output_sqlite()          # optional, if you also want eplusout.sql
-        >>> util.run_design_day()
-        >>> vars_and_meters = util.list_variables_safely()
-        """
-        assert self.idf and self.epw and self.out_dir, "Call set_model(idf, epw, out_dir) first."
-        self._assert_out_dir_writable()
-        self.clear_eplus_outputs(("eplusout.sql", "eplusout.err", "eplusout.audit"))
-        self.reset_state()
-        self._register_callbacks()
-        return self.api.runtime.run_energyplus(
-            self.state, ['-w', self.epw, '-d', self.out_dir, '--design-day', self.idf]
-        )
-
-    def dry_run_min(self, *, include_ems_edd: bool = False, reset: bool = True, design_day: bool = True) -> int:
-        """
-        Perform a **minimal probe run** that emits dictionary-style files to `out_dir`
-        (fast, no parsing), then exits. Intended for quickly generating:
-        - `eplusout.rdd` (report variables),
-        - `eplusout.mdd` (report meters),
-        - and optionally `eplusout.edd` (EMS diagnostics / actuator listings).
-
-        What this does
-        --------------
-        1) Reads the active IDF and writes a lightweight, **temporary patched** IDF
-        to `<out_dir>/<stem>__dicts.idf` that:
-        - **Removes** any existing `Output:SQLite` block (prevents opening/writing
-            `eplusout.sql` for this probe).
-        - **Removes all EMS objects** (`EnergyManagementSystem:*`) from the temp file
-            to avoid side effects during the dictionary run.
-        - **Ensures** `Output:VariableDictionary, IDF;` so RDD/MDD are produced.
-        - **Optionally** adds `Output:EnergyManagementSystem, Verbose, Verbose;`
-            when `include_ems_edd=True` so `eplusout.edd` is generated.
-        2) (Optional) Resets the EnergyPlus API state (`reset=True`) to guarantee a
-        clean run.
-        3) Runs EnergyPlus with:
-        - `--design-day` when `design_day=True` (fast sizing-period probe),
-        - otherwise a short annual pass using the patched IDF.
-        4) Returns the raw EnergyPlus **exit code**. No parsing is performed here.
-
-        Parameters
-        ----------
-        include_ems_edd : bool, default False
-            If `True`, adds `Output:EnergyManagementSystem` to the patched IDF so
-            `eplusout.edd` is emitted alongside RDD/MDD.
-        reset : bool, default True
-            If `True`, calls `reset_state()` before launching the probe run.
-        design_day : bool, default True
-            If `True`, runs with `--design-day` (much faster). If `False`, runs
-            without it (annual-style invocation).
-
-        Returns
-        -------
-        int
-            EnergyPlus process exit code (0 indicates success).
-
-        Raises
-        ------
-        AssertionError
-            If `idf`, `epw`, or `out_dir` is not configured
-            (call `set_model(idf, epw, out_dir)` first).
-
-        Notes
-        -----
-        - This method **does not** register callbacks and **does not** touch
-        `Output:SQLite`, so no `eplusout.sql` is created during this probe.
-        - The patched IDF lives in `out_dir` and does not modify your original IDF.
-        - Once files are emitted, you can use higher-level helpers (e.g.,
-        `list_variables_safely()` which prefers in-place RDD/MDD in `out_dir`,
-        or custom parsers) to read them.
-
-        Examples
-        --------
-        Generate RDD/MDD quickly, then list variables/meters:
-
-        >>> util.set_model("models/bldg.idf", "weather/site.epw", out_dir="runs/probe")
-        >>> code = util.dry_run_min()          # emits eplusout.rdd/.mdd to runs/probe
-        >>> assert code == 0
-        >>> rows = util.list_variables_safely()  # now picks up RDD/MDD from out_dir
-
-        Also emit EMS diagnostics (EDD):
-
-        >>> util.dry_run_min(include_ems_edd=True)
-
-        Run the probe without design-day (less common, slower):
-
-        >>> util.dry_run_min(design_day=False)
-        """
-        assert self.idf and self.epw and self.out_dir, "Call set_model(idf, epw, out_dir) first."
-        import pathlib, re
-
-        # Patch a lightweight IDF in-place in out_dir
-        src = pathlib.Path(self.idf)
-        text = src.read_text(errors="ignore")
-
-        
-        # Strip Output:SQLite so this probe never opens eplusout.sql
-        text = re.sub(
-            r'(?is)^\s*Output\s*:\s*SQLite\s*,.*?;[ \t]*(?:\r?\n|$)',
-            '',
-            text,
-            flags=re.MULTILINE
-        )
-
-        # Strip ALL EMS objects from the *temporary* file used for the dictionary run
-        text = re.sub(
-            r'(?is)^\s*EnergyManagementSystem\s*:[^;]+?;[ \t]*(?:\r?\n|$)',
-            '',
-            text,
-            flags=re.MULTILINE
-        )
-
-
-        if not re.search(r'^\s*Output\s*:\s*VariableDictionary\s*,', text, flags=re.I | re.M):
-            text = text.rstrip() + "\n\nOutput:VariableDictionary,\n  IDF;\n"
-
-        if include_ems_edd and not re.search(r'^\s*Output\s*:\s*EnergyManagementSystem\s*,', text, flags=re.I | re.M):
-            text = text.rstrip() + "\n\nOutput:EnergyManagementSystem,\n  Verbose,\n  Verbose;\n"
-
-        patched = pathlib.Path(self.out_dir) / f"{src.stem}__dicts.idf"
-        patched.write_text(text)
-
-        if reset:
-            self.reset_state()
-
-        args = ['-w', self.epw, '-d', self.out_dir]
-        if design_day:
-            args.append('--design-day')
-        args.append(str(patched))
-        return self.api.runtime.run_energyplus(self.state, args)
 
     # ---------- set simulation parameters (patch IDF) ----------
 

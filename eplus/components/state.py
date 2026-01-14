@@ -5,6 +5,7 @@ import os
 import shutil
 import urllib.request
 from urllib.parse import urlparse
+import glob
 
 class StateMixin(EnergyPlusAPI):
     """
@@ -18,12 +19,11 @@ class StateMixin(EnergyPlusAPI):
         
         self.idf: Optional[str] = None
         self.epw: Optional[str] = None
-        self.out_dir: Optional[str] = None
+        self.out_dir: Optional[str] = getattr(self, 'out_dir', 1)
 
         # Create the new state using the inherited state_manager
         self.state = self.state_manager.new_state()
         self._log(2, "Initialized new EnergyPlus state.")
-
 
     def reset_state(self) -> None:
         """
@@ -44,6 +44,21 @@ class StateMixin(EnergyPlusAPI):
             # Use self.runtime directly (inherited from EnergyPlusAPI)
             self.runtime.callback_message(self.state, self._runtime_log_func)
         self._log(1, "EnergyPlus state has been reset.")
+
+    def clear_eplus_outputs(self, patterns: tuple[str, ...] = ("eplusout.*",)) -> None:
+        """
+        Remove common EnergyPlus outputs in out_dir, especially a stale/locked eplusout.sql.
+        Safe to call before runs.
+        """
+        assert self.out_dir, "set_model(...) first."
+        for pat in patterns:
+            for p in glob.glob(os.path.join(self.out_dir, pat)):
+                try: 
+                    os.remove(p)
+                    self._log(1, f"Deleted output file: {p}")
+                except IsADirectoryError: pass
+                except FileNotFoundError: pass
+                except PermissionError: pass  # leave it if OS blocks; at least we tried
 
     def delete_out_dir(self):
         """
@@ -122,8 +137,8 @@ class StateMixin(EnergyPlusAPI):
         """
         self.idf = str(idf)
         self.epw = str(epw)
-        self.out_dir = str(out_dir or "eplus_out")
-        
+        if out_dir is not None:
+            self.out_dir = str(out_dir)
         os.makedirs(self.out_dir, exist_ok=True)
         
         # Call reset_state from StateMixin via self
@@ -131,6 +146,7 @@ class StateMixin(EnergyPlusAPI):
             self.reset_state()
         self._log(1, f"Model set: IDF='{self.idf}', EPW='{self.epw}', OUT_DIR='{self.out_dir}'")
 
+        # TODO: handle CO2 mixin logic here
         # Logic for CO2 (Check if the CO2 Mixin is present)
         # if kwargs.get("add_co2", False) and hasattr(self, "prepare_run_with_co2"):
         #     self.prepare_run_with_co2(
@@ -157,8 +173,10 @@ class StateMixin(EnergyPlusAPI):
         **kwargs : 
             Passed directly to `set_model` (e.g. `add_co2=True`).
         """
-        target_dir = str(out_dir or "eplus_out")
-        os.makedirs(target_dir, exist_ok=True)
+        if out_dir is not None:
+            self.out_dir = str(out_dir)
+        os.makedirs(self.out_dir, exist_ok=True)
+        target_dir = self.out_dir
 
         # Helper to get filename from URL
         def download_file(url, directory):
@@ -188,3 +206,11 @@ class StateMixin(EnergyPlusAPI):
             if hasattr(self, '_log'):
                 self._log(1, f"Error downloading model files: {e}")
             raise e
+        
+        # TODO: handle CO2 mixin logic here
+        # Logic for CO2 (Check if the CO2 Mixin is present)
+        # if kwargs.get("add_co2", False) and hasattr(self, "prepare_run_with_co2"):
+        #     self.prepare_run_with_co2(
+        #         outdoor_co2_ppm=kwargs.get("outdoor_co2_ppm", 420.0),
+        #         per_person_m3ps_per_W=kwargs.get("per_person_m3ps_per_W", 3.82e-8)
+        #     )
