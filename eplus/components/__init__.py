@@ -5,6 +5,7 @@ from .idf import IDFMixin
 from .logging import LoggingMixin
 from .simulation import SimulationMixin
 from .utils import UtilsMixin
+from .handlers import HandlersMixin
 
 # This defines what gets imported if someone uses `from eplus.mixins import *`
-__all__ = ["StateMixin", "IDFMixin", "LoggingMixin", "SimulationMixin", "UtilsMixin"]
+__all__ = ["StateMixin", "IDFMixin", "LoggingMixin", "SimulationMixin", "UtilsMixin", "HandlersMixin"]

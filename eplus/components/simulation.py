@@ -61,8 +61,7 @@ class SimulationMixin:
         # prevent SQLite open errors from a stale file
         self.clear_eplus_outputs(("eplusout.sql", "eplusout.err", "eplusout.audit"))
         self.reset_state()
-        # TODO:Add this Register Thing
-        # self._register_callbacks()
+        self._register_callbacks()
         return self.runtime.run_energyplus(
             self.state, ['-w', self.epw, '-d', self.out_dir, self.idf]
         )
@@ -123,8 +122,7 @@ class SimulationMixin:
         self._assert_out_dir_writable()
         self.clear_eplus_outputs(("eplusout.sql", "eplusout.err", "eplusout.audit"))
         self.reset_state()
-        # TODO:Add this Register Thing
-        # self._register_callbacks()
+        self._register_callbacks()
         return self.runtime.run_energyplus(
             self.state, ['-w', self.epw, '-d', self.out_dir, '--design-day', self.idf]
         )
