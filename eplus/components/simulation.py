@@ -129,7 +129,7 @@ class SimulationMixin:
             self.state, ['-w', self.epw, '-d', self.out_dir, '--design-day', self.idf]
         )
 
-    def dry_run_min(self, *, include_ems_edd: bool = False, reset: bool = True, design_day: bool = True) -> int:
+    def run_dry_run(self, *, include_ems_edd: bool = False, reset: bool = True, design_day: bool = True) -> int:
         """
         Perform a **minimal probe run** that emits dictionary-style files to `out_dir`
         (fast, no parsing), then exits. Intended for quickly generating:
