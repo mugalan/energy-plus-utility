@@ -5,8 +5,10 @@ from typing import Optional
 from .components.state import StateMixin
 from .components.idf import IDFMixin
 from .components.logging import LoggingMixin
+from .components.simulation import SimulationMixin
+from .components.utils import UtilsMixin
 
-class EPlusUtil(StateMixin, IDFMixin, LoggingMixin):
+class EPlusUtil(StateMixin, IDFMixin, LoggingMixin, SimulationMixin, UtilsMixin):
     """
     Main class that combines State, IDF, and Logging functionalities.
     Inheritance order matters: Methods in StateMixin are checked before IOMixin, etc.
@@ -20,6 +22,8 @@ class EPlusUtil(StateMixin, IDFMixin, LoggingMixin):
         StateMixin.__init__(self)
         IDFMixin.__init__(self)
         LoggingMixin.__init__(self)
+        SimulationMixin.__init__(self)
+        UtilsMixin.__init__(self)
         
         # Override IO default if provided
         if out_dir:

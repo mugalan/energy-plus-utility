@@ -19,7 +19,7 @@ class StateMixin(EnergyPlusAPI):
         
         self.idf: Optional[str] = None
         self.epw: Optional[str] = None
-        self.out_dir: Optional[str] = getattr(self, 'out_dir', 1)
+        self.out_dir: Optional[str] = getattr(self, 'out_dir', "eplus_out")
 
         # Create the new state using the inherited state_manager
         self.state = self.state_manager.new_state()
@@ -71,6 +71,8 @@ class StateMixin(EnergyPlusAPI):
         if self.out_dir and os.path.exists(self.out_dir):
             shutil.rmtree(self.out_dir, ignore_errors=True)
             self._log(1, f"Deleted output directory: {self.out_dir}")
+        else:
+            self._log(2, f"Output directory does not exist, nothing to delete: {self.out_dir}")
 
     def set_model(self, idf: str, epw: str, out_dir: Optional[str] = None, *, reset: bool = True, **kwargs) -> None:
         """
