@@ -1,28 +1,10 @@
-from __future__ import annotations
-
 import os, io, csv as _csv, ast, shutil, pathlib, subprocess, re, tempfile, contextlib
 from typing import List, Dict, Tuple, Optional, Sequence
-
-import numpy as np
-import pandas as pd
-import plotly.express as px
 import sqlite3
 
-from pyenergyplus.api import EnergyPlusAPI
-
-# ---------- CSV logger specs ----------
-
-class EPlusUtil:
-
-
-
-    # ----- lifecycle -----
-    def __init__(self, *, verbose: int = 1, out_dir: str | None =None):
-        print("sefsf")
-
-  
- 
-    # KF Implementation
+class ZoneObserverMixin:
+    def __init__(self):
+        self._log(2, "Initialized ZoneObserverMixin")
 
     def _kf_random_walk_update(
         self,
@@ -912,5 +894,3 @@ class EPlusUtil:
             f_x=f_x, F=F, H=H, Q=Q, R=R,
             y=y
         )
-
-    # --- Control ----

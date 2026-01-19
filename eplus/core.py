@@ -9,10 +9,11 @@ from .components.handlers import HandlersMixin
 from .components.sql import SQLMixin
 from .components.control import ControlMixin
 from .components.occupancy import OccupancyMixin
+from .components.zone_observer import ZoneObserverMixin
 
 class EPlusUtil(StateMixin, IDFMixin, LoggingMixin, SimulationMixin, 
                 UtilsMixin, HandlersMixin, SQLMixin, ControlMixin,
-                OccupancyMixin):
+                OccupancyMixin, ZoneObserverMixin):
     """
     Main class that combines State, IDF, and Logging functionalities.
     Inheritance order matters: Methods in StateMixin are checked before IOMixin, etc.
@@ -33,6 +34,7 @@ class EPlusUtil(StateMixin, IDFMixin, LoggingMixin, SimulationMixin,
         SQLMixin.__init__(self)
         ControlMixin.__init__(self)
         OccupancyMixin.__init__(self)
+        ZoneObserverMixin.__init__(self)
 
 
         # Override IO default if provided
