@@ -1,12 +1,19 @@
 from typing import List, Tuple, Callable
 
 class HandlersMixin:
+    _SCHEDULE_TYPES = (
+        "Schedule:Compact",
+        "Schedule:Constant",
+        "Schedule:File",
+        "Schedule:Year",
+    )
+    
     def __init__(self):
         self._log(2, "Initialized HandlersMixin")
         self._runtime_log_enabled: bool = False
         self._runtime_log_func: Callable = None
         self._extra_callbacks: List[Tuple[Callable, Callable]] = []
-        
+
         self.callback_aliases = {
             "begin":        "callback_begin_system_timestep_before_predictor",
             "before_hvac":  "callback_after_predictor_before_hvac_managers",
