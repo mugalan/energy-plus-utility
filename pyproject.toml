@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "energy-plus-utility"
-version = "0.2.1+12"
+version = "0.2.1+13"
 requires-python = ">=3.9"
 description = "EnergyPlus utilities with a Colab bootstrapper (silent)."
 readme = "README.md"

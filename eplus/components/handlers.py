@@ -575,7 +575,6 @@ class HandlersMixin:
     #     """Back-compat wrapper: runs after HVAC reporting each system timestep."""
     #     return self.register_handlers("after_hvac", methods, **kw)    
 
-
     def enable_runtime_logging(self):
         def _on_msg(msg):
             s = msg.decode("utf-8", errors="ignore") if isinstance(msg, (bytes, bytearray)) else str(msg)
@@ -588,3 +587,84 @@ class HandlersMixin:
         self._runtime_log_enabled = False
         self._runtime_log_func = None
         # no unregister API; future resets will simply not re-register
+
+
+    def override_hvac_schedules(
+        self,
+        schedule_names: list[str] | None = None,
+        *,
+        autodetect: bool = True,              # if no names given, grab schedules containing "avail" or "hvac"
+        verbose: bool = True
+    ) -> None:
+        """
+        Force selected schedules to 0.0 every system timestep → disables HVAC via availability.
+        Use with schedules like "HVAC Operation Schedule", "System Availability Schedule", etc.
+
+        Example:
+        util.enable_hvac_off_via_schedules(["HVAC Operation Schedule", "Central Fan Avail"])
+        """
+        self._hvac_kill_enabled = True
+        self._hvac_kill_handles: list[int] = []
+        self._hvac_kill_verbose = bool(verbose)
+        wanted = set((schedule_names or []))
+
+        def _after_warmup(s):
+            handles: list[int] = []
+
+            # Collect candidate schedule names if autodetect requested or none provided
+            cand_names = set()
+            if autodetect or not wanted:
+                import re
+                rx = re.compile(r"(avail|hvac)", re.IGNORECASE)
+                for typ in self._SCHEDULE_TYPES:
+                    for nm in (self.api.exchange.get_object_names(s, typ) or []):
+                        if rx.search(nm):
+                            cand_names.add(nm)
+
+            targets = wanted | cand_names
+            if not targets:
+                if self._hvac_kill_verbose:
+                    self._log(1, "[HVAC OFF] No schedule targets found.")
+                return
+
+            # Try each schedule type for each target name until a handle resolves
+            for nm in sorted(targets):
+                got = False
+                for typ in self._SCHEDULE_TYPES:
+                    try:
+                        h = self.api.exchange.get_actuator_handle(s, typ, "Schedule Value", nm)
+                    except Exception:
+                        h = -1
+                    if h != -1:
+                        handles.append(h)
+                        got = True
+                        break
+                if self._hvac_kill_verbose and not got:
+                    self._log(1, f"[HVAC OFF] Could not resolve schedule actuator for '{nm}'.")
+
+            self._hvac_kill_handles = handles
+            if self._hvac_kill_verbose:
+                self._log(1, f"[HVAC OFF] Resolved {len(handles)} schedule handles.")
+
+        def _on_tick(s):
+            if not getattr(self, "_hvac_kill_enabled", False) or self.api.exchange.warmup_flag(s):
+                return
+            for h in getattr(self, "_hvac_kill_handles", []):
+                # Force schedule to zero each timestep
+                self.api.exchange.set_actuator_value(s, h, 0.0)
+
+        # Register with your unified registrar (so runs survive reset_state)
+        pair_warmup = (self.api.runtime.callback_after_new_environment_warmup_complete, _after_warmup)
+        pair_tick   = (self.api.runtime.callback_begin_system_timestep_before_predictor, _on_tick)
+
+        # avoid duplicate registrations if called twice
+        for pair in (pair_warmup, pair_tick):
+            if pair not in self._extra_callbacks:
+                self._extra_callbacks.append(pair)
+
+        # if someone calls this *after* set_model but *before* a run, make sure callbacks are queued
+        # (run_design_day/run_annual call _register_callbacks() after reset_state, so no need to call it here)
+
+    def release_hvac_schedules(self) -> None:
+        self._hvac_kill_enabled = False
+        self._hvac_kill_handles = []
