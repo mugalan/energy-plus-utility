@@ -23,7 +23,7 @@ class HandlersMixin:
         # TODO:Comeback to this when Understand
         # CSV occupancy tick (if enabled)
         # if getattr(self, "_occ_enabled", False) and self._occ_df is not None:
-        #     self.api.runtime.callback_begin_system_timestep_before_predictor(
+        #     self.runtime.callback_begin_system_timestep_before_predictor(
         #         self.state, self._occ_cb_tick
         #     )
 
@@ -46,7 +46,7 @@ class HandlersMixin:
             'names': [str],                # ordered names
             'specs': [(callable, dict)],   # ordered callables + kwargs
             'dispatcher': callable,        # closure(state) -> dispatch
-            'runtime_register': callable,  # api.runtime.callback_*
+            'runtime_register': callable,  # runtime.callback_*
             'registered_once': bool,       # whether we bound dispatcher already
             }
         """
@@ -59,8 +59,8 @@ class HandlersMixin:
         """
         Accepts:
         - a string alias from callback_aliases
-        - a full api.runtime attribute name (string)
-        - a direct callable (api.runtime.callback_*)
+        - a full runtime attribute name (string)
+        - a direct callable (runtime.callback_*)
         Returns (hook_key, runtime_register_callable).
         """
         rt = self.runtime
@@ -184,7 +184,7 @@ class HandlersMixin:
             - **Full attribute name** as a string, e.g.
             ``"callback_after_predictor_before_hvac_managers"``.
             - **The registration callable itself**, e.g.
-            ``api.runtime.callback_inside_system_iteration_loop``.
+            ``runtime.callback_inside_system_iteration_loop``.
         methods : Sequence[str | dict]
             Handler specs. Each handler must be a **method on this instance**
             and is invoked as: ``method(self, state, **kwargs)``.
@@ -268,7 +268,7 @@ class HandlersMixin:
         Pass the **registration callable** directly (no strings involved):
 
         >>> util.register_handlers(
-        ...     util.api.runtime.callback_inside_system_iteration_loop,
+        ...     util.runtime.callback_inside_system_iteration_loop,
         ...     [{"method_name": "my_iterative_controller", "params": {"gain": 0.2}}]
         ... )
 
@@ -385,7 +385,7 @@ class HandlersMixin:
             - Full runtime callback attribute name (str), e.g.
             "callback_end_system_timestep_after_hvac_reporting"
             - The registration callable itself, e.g.
-            `api.runtime.callback_begin_system_timestep_before_predictor`
+            `runtime.callback_begin_system_timestep_before_predictor`
 
         Returns
         -------
@@ -400,7 +400,7 @@ class HandlersMixin:
         >>> util.list_handlers("callback_end_system_timestep_after_hvac_reporting")
         ['probe_zone_air_and_supply_with_kf']
 
-        >>> util.list_handlers(util.api.runtime.callback_inside_system_iteration_loop)
+        >>> util.list_handlers(util.runtime.callback_inside_system_iteration_loop)
         ['zone_pid_controller']
         """
         hook_key, reg = self._get_or_init_hook_registry(hook)
@@ -423,7 +423,7 @@ class HandlersMixin:
             - Full runtime attribute name (str), e.g.
             "callback_end_system_timestep_after_hvac_reporting"
             - The registration callable itself, e.g.
-            `api.runtime.callback_begin_system_timestep_before_predictor`
+            `runtime.callback_begin_system_timestep_before_predictor`
         names : list[str]
             Method names to remove (e.g., ["co2_set_outdoor_ppm", "occupancy_handler"]).
             Names that are not currently registered are ignored.
@@ -457,7 +457,7 @@ class HandlersMixin:
 
         Use the registration callable directly:
 
-        >>> util.unregister_handlers(util.api.runtime.callback_inside_system_iteration_loop,
+        >>> util.unregister_handlers(util.runtime.callback_inside_system_iteration_loop,
         ...                          ["zone_pid_controller"])
         []
         """
@@ -487,7 +487,7 @@ class HandlersMixin:
             - Full runtime attribute name (str), e.g.
             "callback_begin_system_timestep_before_predictor"
             - The registration callable itself, e.g.
-            `api.runtime.callback_begin_system_timestep_before_predictor`
+            `runtime.callback_begin_system_timestep_before_predictor`
 
         Notes
         -----
@@ -509,7 +509,7 @@ class HandlersMixin:
 
         Enable by passing the runtime registration function:
 
-        >>> util.enable_hook(util.api.runtime.callback_begin_system_timestep_before_predictor)
+        >>> util.enable_hook(util.runtime.callback_begin_system_timestep_before_predictor)
         """
         _, reg = self._get_or_init_hook_registry(hook)
         reg["enabled"] = True
@@ -534,7 +534,7 @@ class HandlersMixin:
             - Full runtime attribute name (string), e.g.
             "callback_begin_system_timestep_before_predictor"
             - The registration callable itself, e.g.
-            `api.runtime.callback_inside_system_iteration_loop`
+            `runtime.callback_inside_system_iteration_loop`
 
         Notes
         -----
@@ -560,7 +560,7 @@ class HandlersMixin:
 
         Disable by passing the runtime registration function:
 
-        >>> util.disable_hook(util.api.runtime.callback_inside_system_iteration_loop)
+        >>> util.disable_hook(util.runtime.callback_inside_system_iteration_loop)
         """
         _, reg = self._get_or_init_hook_registry(hook)
         reg["enabled"] = False

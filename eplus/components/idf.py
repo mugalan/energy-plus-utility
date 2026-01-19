@@ -33,7 +33,7 @@ class IDFMixin:
         pandas DataFrames, grouped by section.
 
         Under the hood this wraps:
-            self.api.exchange.list_available_api_data_csv(self.state)
+            self.exchange.list_available_api_data_csv(self.state)
 
         What you get
         ------------
@@ -53,7 +53,7 @@ class IDFMixin:
         Use one of:
             - inside `callback_after_get_input`, or
             - after warmup via `callback_after_new_environment_warmup_complete`, or
-            - when `self.api.exchange.api_data_fully_ready(self.state)` is True.
+            - when `self.exchange.api_data_fully_ready(self.state)` is True.
         • Column shapes vary slightly across sections / versions. This function assigns
         sensible headers per known section and pads/truncates rows as needed.
 

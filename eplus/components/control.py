@@ -100,7 +100,7 @@ class ControlMixin:
         ...     actuator_key="Environment"
         ... )
         """
-        ex = self.api.exchange
+        ex = self.exchange
 
         # Respect warmup preference
         try:
@@ -236,7 +236,7 @@ class ControlMixin:
 
         With a callable value + clamping:
         >>> def occ_profile(self, s):  # returns a float
-        ...     minute = int(self.api.exchange.minute(s))
+        ...     minute = int(self.exchange.minute(s))
         ...     return 5.0 if 9*60 <= minute <= 17*60 else 0.0
         ...
         >>> def set_people(self, s, **_):
@@ -249,7 +249,7 @@ class ControlMixin:
         ...         clamp=(0.0, 100.0)
         ...     )
         """
-        ex = self.api.exchange
+        ex = self.exchange
 
         # 1) Skip during warmup unless allowed
         try:
@@ -614,7 +614,7 @@ class ControlMixin:
 
         >>> def occ_profile(self, s):
         ...     # return a float per tick
-        ...     minute = int(self.api.exchange.minute(s))
+        ...     minute = int(self.exchange.minute(s))
         ...     return 50.0 if 9*60 <= minute <= 17*60 else 0.0
         ...
         >>> util.register_handlers(
@@ -733,7 +733,7 @@ class ControlMixin:
                     ts_val = self._occ_current_timestamp(s)
                     ts = f"{ts_val} | "
                 else:
-                    ex = self.api.exchange
+                    ex = self.exchange
                     yr = int(ex.year(s)); mo = int(ex.month(s)); dy = int(ex.day_of_month(s))
                     hh = int(ex.hour(s));  mm = int(ex.minute(s))
                     ts = f"{yr:04d}-{mo:02d}-{dy:02d} {hh:02d}:{mm:02d} | "
@@ -849,7 +849,7 @@ class ControlMixin:
         ...     s, name="Site Outdoor Air Drybulb Temperature", key="Environment"
         ... )
         """
-        ex = self.api.exchange
+        ex = self.exchange
 
         # Respect warmup preference
         try:
@@ -1085,7 +1085,7 @@ class ControlMixin:
                     ts = self._occ_current_timestamp(s)  # type: ignore[attr-defined]
                     ts_prefix = f"{ts} | "
                 else:
-                    ex = self.api.exchange
+                    ex = self.exchange
                     yr = int(ex.year(s)); mo = int(ex.month(s)); dy = int(ex.day_of_month(s))
                     hh = int(ex.hour(s)); mm = int(ex.minute(s))
                     ts_prefix = f"{yr:04d}-{mo:02d}-{dy:02d} {hh:02d}:{mm:02d} | "
@@ -1163,7 +1163,7 @@ class ControlMixin:
         • Doesn’t raise if API data aren’t ready; simply returns `default` until ready.
         • No unit conversion here (e.g., to kWh) — log raw, convert elsewhere if needed.
         """
-        ex = self.api.exchange
+        ex = self.exchange
 
         # Warmup?
         try:
@@ -1371,7 +1371,7 @@ class ControlMixin:
                     ts = self._occ_current_timestamp(s)  # type: ignore[attr-defined]
                     ts_prefix = f"{ts} | "
                 else:
-                    ex = self.api.exchange
+                    ex = self.exchange
                     yr = int(ex.year(s)); mo = int(ex.month(s)); dy = int(ex.day_of_month(s))
                     hh = int(ex.hour(s)); mm = int(ex.minute(s))
                     ts_prefix = f"{yr:04d}-{mo:02d}-{dy:02d} {hh:02d}:{mm:02d} | "

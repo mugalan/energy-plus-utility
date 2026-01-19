@@ -114,23 +114,23 @@ class UtilsMixin:
                 return []
 
         def _from_api() -> list[str]:
-            tmp_state = self.api.state_manager.new_state()
+            tmp_state = self.state_manager.new_state()
             bucket = {"zones": None}
 
             def after_get_input(s):
-                z = self.api.exchange.get_object_names(s, "Zone") or []
+                z = self.exchange.get_object_names(s, "Zone") or []
                 bucket["zones"] = list(z)
                 try:
-                    self.api.runtime.stop_simulation(s)
+                    self.runtime.stop_simulation(s)
                 except Exception:
                     pass
 
             with tempfile.TemporaryDirectory() as tdir:
                 try:
-                    self.api.runtime.callback_after_component_get_input(tmp_state, after_get_input)
-                    self.api.runtime.run_energyplus(tmp_state, ['-w', self.epw, '-d', tdir, '--design-day', self.idf])
+                    self.runtime.callback_after_component_get_input(tmp_state, after_get_input)
+                    self.runtime.run_energyplus(tmp_state, ['-w', self.epw, '-d', tdir, '--design-day', self.idf])
                 finally:
-                    self.api.state_manager.reset_state(tmp_state)
+                    self.state_manager.reset_state(tmp_state)
             return bucket["zones"] or []
 
         def _from_idf() -> list[str]:
