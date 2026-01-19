@@ -1437,6 +1437,83 @@ class SQLMixin:
             conds.append("(" + " OR ".join(sub_conds) + ")")
         return ("AND (" + " OR ".join(conds) + ")") if conds else "", params
 
+    def _discover_zone_inlet_nodes_from_sql(self) -> dict[str, list[str]]:
+        """
+        Fast discovery of per-zone *air* inlet node keys using a single SQL pass.
+
+        Returns: {zone: [node_key, ...]} with original key casing.
+        """
+        import os, sqlite3
+        assert self.out_dir, "set_model(...) first."
+        sql_path = os.path.join(self.out_dir, "eplusout.sql")
+        if not os.path.exists(sql_path):
+            return {}
+
+        # patterns we prefer/exclude (searched case-insensitively in SQL)
+        include_any = (" IN NODE", " ATU IN NODE", " ZONE COIL AIR IN NODE")
+        exclude_any = (" WATER ", "CONDENSER", " PUMP ", " BOILER ", " CHILLER",
+                    " DEMAND ", " BYPASS ", " PIPE ", " OUT NODE")  # OUT NODE ~ return/exhaust
+
+        zones = self.list_zone_names(preferred_sources=("sql","api","idf"))
+        if not zones:
+            return {}
+
+        # Build LIKE predicate parts
+        inc_like = " OR ".join(["UPPER(k.KeyValue) LIKE ?"] * len(include_any))
+        exc_like = " AND ".join(["UPPER(k.KeyValue) NOT LIKE ?"] * len(exclude_any))
+        z_like   = " OR ".join(["UPPER(k.KeyValue) LIKE ?"] * len(zones))
+
+        # SQL: keys that have BOTH Mass Flow and Temperature (air-node hint),
+        # then filter by include/exclude/name-of-zone patterns.
+        q = f"""
+            WITH air_keys AS (
+                SELECT k.KeyValue
+                FROM ReportDataDictionary k
+                WHERE k.Name IN ('System Node Mass Flow Rate', 'System Node Temperature')
+                AND k.KeyValue IS NOT NULL AND k.KeyValue <> ''
+                GROUP BY k.KeyValue
+                HAVING COUNT(DISTINCT k.Name) = 2
+            )
+            SELECT k.KeyValue
+            FROM air_keys k
+            WHERE ({inc_like})
+            AND {exc_like}
+            AND ({z_like})
+        """
+        params = (
+            [f"%{p}%" for p in include_any] +
+            [f"%{p}%" for p in exclude_any] +
+            [f"%{z.upper()}%" for z in zones]
+        )
+
+        conn = sqlite3.connect(sql_path)
+        try:
+            keys = [r[0] for r in conn.execute(q, params).fetchall()]
+        finally:
+            conn.close()
+
+        if not keys:
+            return {}
+
+        # Group keys by zone (keep order stable: prefer "... IN NODE" first, then ATU, then COIL AIR)
+        zmap: dict[str, list[str]] = {z: [] for z in zones}
+        def rank(z, key):
+            ku = key.upper()
+            zu = z.upper()
+            if f"{zu} IN NODE" in ku: return 0
+            if " ATU IN NODE" in ku:  return 1
+            if " ZONE COIL AIR IN NODE" in ku: return 2
+            return 9
+
+        for z in zones:
+            matches = [k for k in keys if z.upper() in k.upper()]
+            matches.sort(key=lambda k: rank(z, k))
+            if matches:
+                zmap[z] = matches
+
+        # Drop empties
+        return {z: ks for z, ks in zmap.items() if ks}
+
     def export_weather_sql_to_csv(
         self,
         *,
