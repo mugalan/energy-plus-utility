@@ -4,7 +4,7 @@ import warnings
 # 1. Import the bootstrap function (Safe: has no external dependencies)
 from .colab_bootstrap import prepare_colab_eplus
 
-__version__ = "0.2.0+1"
+__version__ = "0.2.2"
 __all__ = ["prepare_colab_eplus", "__version__"]
 
 # 2. Try to import the Core Logic
