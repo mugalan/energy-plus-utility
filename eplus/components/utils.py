@@ -1,5 +1,6 @@
 import os, io, csv as _csv, ast, shutil, pathlib, subprocess, re, tempfile, contextlib
 from typing import List, Dict, Tuple, Optional, Sequence
+import sqlite3
 
 class UtilsMixin:
     def __init__(self):
@@ -13,7 +14,7 @@ class UtilsMixin:
         with open(tmp, "wb") as f:
             f.write(b"ok")
         tmp.unlink(missing_ok=True)
-        
+
     def list_zone_names(
         self,
         *,
