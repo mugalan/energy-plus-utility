@@ -617,7 +617,7 @@ class HandlersMixin:
                 import re
                 rx = re.compile(r"(avail|hvac)", re.IGNORECASE)
                 for typ in self._SCHEDULE_TYPES:
-                    for nm in (self.api.exchange.get_object_names(s, typ) or []):
+                    for nm in (self.exchange.get_object_names(s, typ) or []):
                         if rx.search(nm):
                             cand_names.add(nm)
 
@@ -632,7 +632,7 @@ class HandlersMixin:
                 got = False
                 for typ in self._SCHEDULE_TYPES:
                     try:
-                        h = self.api.exchange.get_actuator_handle(s, typ, "Schedule Value", nm)
+                        h = self.exchange.get_actuator_handle(s, typ, "Schedule Value", nm)
                     except Exception:
                         h = -1
                     if h != -1:
@@ -647,15 +647,15 @@ class HandlersMixin:
                 self._log(1, f"[HVAC OFF] Resolved {len(handles)} schedule handles.")
 
         def _on_tick(s):
-            if not getattr(self, "_hvac_kill_enabled", False) or self.api.exchange.warmup_flag(s):
+            if not getattr(self, "_hvac_kill_enabled", False) or self.exchange.warmup_flag(s):
                 return
             for h in getattr(self, "_hvac_kill_handles", []):
                 # Force schedule to zero each timestep
-                self.api.exchange.set_actuator_value(s, h, 0.0)
+                self.exchange.set_actuator_value(s, h, 0.0)
 
         # Register with your unified registrar (so runs survive reset_state)
-        pair_warmup = (self.api.runtime.callback_after_new_environment_warmup_complete, _after_warmup)
-        pair_tick   = (self.api.runtime.callback_begin_system_timestep_before_predictor, _on_tick)
+        pair_warmup = (self.runtime.callback_after_new_environment_warmup_complete, _after_warmup)
+        pair_tick   = (self.runtime.callback_begin_system_timestep_before_predictor, _on_tick)
 
         # avoid duplicate registrations if called twice
         for pair in (pair_warmup, pair_tick):
